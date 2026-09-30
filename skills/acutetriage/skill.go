@@ -426,7 +426,7 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 		ver.CauseCheck = causeCheck
 	}
 	var reasons []string
-	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix, causeCheck) {
+	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix, causeCheck, ar.metrics, alerts) {
 		reasons = append(reasons, "no check tested this cause")
 		s.logger.Info("acutetriage: cause unconfirmed: no cited check tested this cause", "incident", inc.ID)
 	}

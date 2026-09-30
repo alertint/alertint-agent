@@ -595,7 +595,7 @@ func TestCauseUnconfirmed(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := causeUnconfirmed(tc.ver, tc.hasMetricSource, tc.causeCheck); got != tc.want {
+			if got := causeUnconfirmed(tc.ver, tc.hasMetricSource, tc.causeCheck, nil, nil); got != tc.want {
 				t.Errorf("causeUnconfirmed = %v, want %v", got, tc.want)
 			}
 		})
@@ -838,5 +838,46 @@ func TestRunVerificationWith_PerQueryFloor_FullElevenQueryCase(t *testing.T) {
 		if d < minPerQueryTimeout-tolerance {
 			t.Errorf("query %d: per-query slice %v below the floor %v", i, d, minPerQueryTimeout)
 		}
+	}
+}
+
+func TestCauseUnconfirmed_AlertSignalIsNotCause(t *testing.T) {
+	rule := `service:span_error_ratio:5m > 0.05 and sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])) > 0.02`
+	for _, tc := range []struct {
+		name, expr, service string
+		rules               []string
+		want                bool
+	}{
+		{"own signal", `service:span_error_ratio:5m{service_name="payment"} > 0.05`, "payment", []string{rule}, true},
+		{"other service", `service:span_error_ratio:5m{service_name="payment"}`, "checkout", []string{rule}, false},
+		{"different metric", `token_errors_total{service_name="payment"}`, "payment", []string{rule}, false},
+		{"mixed metrics", `service:span_error_ratio:5m{service_name="payment"} + token_errors_total{service_name="payment"}`, "payment", []string{rule}, false},
+		{"translated label", `service:span_error_ratio:5m{service_name="payment"}`, "payment", []string{rule}, true},
+		{"no rule", `service:span_error_ratio:5m{service_name="payment"}`, "payment", nil, false},
+		{"invalid rule", `service:span_error_ratio:5m{service_name="payment"}`, "payment", []string{"bad("}, false},
+		{"invalid query", "bad(", "payment", []string{rule}, false},
+		{"regex is not equality", `service:span_error_ratio:5m{service_name=~"payment"}`, "payment", []string{rule}, false},
+		{"unnamed selector", `{service_name="payment"}`, "payment", []string{rule}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			labels := map[string]string{"service": tc.service, "service_name": tc.service}
+			if tc.name == "translated label" {
+				delete(labels, "service_name")
+			}
+			ver := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{{Source: "model", Kind: kindPromQL, Outcome: OutcomeFetched, Expr: tc.expr}}}}}
+			n := 1
+			metrics := &MetricEnrichment{RuleExprs: tc.rules, LabelMap: map[string]string{"service": "service_name"}}
+			got := causeUnconfirmed(ver, true, &n, metrics, []store.Alert{{Labels: labels}})
+			if got != tc.want {
+				t.Fatalf("causeUnconfirmed=%v, want %v", got, tc.want)
+			}
+			if got {
+				resp := llmResponse{AnalysisName: "Token failure", OverallIssue: "Token failure"}
+				labelUnconfirmed(&resp, []string{"no check tested this cause"})
+				if resp.AnalysisName != "Unconfirmed: Token failure" {
+					t.Fatal(resp.AnalysisName)
+				}
+			}
+		})
 	}
 }

@@ -17,6 +17,8 @@ import (
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 // VerificationParams carries the skill-side tunables (from config Task 1).
@@ -123,7 +125,7 @@ func parseCauseCheck(raw json.RawMessage) *int {
 }
 
 // causeUnconfirmed checks call 2's cited result in the round it saw.
-func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCheck *int) bool {
+func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCheck *int, metrics *MetricEnrichment, alerts []store.Alert) bool {
 	if ver == nil || !hasMetricSource {
 		return false
 	}
@@ -136,7 +138,56 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 	}
 	q := queries[*causeCheck-1]
 	metricKind := q.Kind == kindPromQL || q.Kind == kindZabbixReachability || q.Kind == kindZabbixNeighborProblems
-	return (q.Source != "model" && q.Source != "operator") || !metricKind || q.Outcome != OutcomeFetched
+	if (q.Source != "model" && q.Source != "operator") || !metricKind || q.Outcome != OutcomeFetched {
+		return true
+	}
+	if q.Kind != kindPromQL || metrics == nil || len(metrics.RuleExprs) == 0 {
+		return false
+	}
+	ruleMetrics := make(map[string]bool)
+	for _, rule := range metrics.RuleExprs {
+		expr, err := parser.NewParser(parser.Options{}).ParseExpr(rule)
+		if err != nil {
+			return false
+		}
+		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+			if sel, ok := node.(*parser.VectorSelector); ok && sel.Name != "" {
+				ruleMetrics[sel.Name] = true
+			}
+			return nil
+		})
+	}
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(q.Expr)
+	if err != nil {
+		return false
+	}
+	pairs := make(map[string]bool)
+	for _, alert := range alerts {
+		for key, value := range alert.Labels {
+			if mapped, ok := metrics.LabelMap[key]; ok {
+				key = mapped
+			}
+			if key != "" {
+				pairs[key+"\x00"+value] = true
+			}
+		}
+	}
+	allInRule, hasMetric, ownLabel := true, false, false
+	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+		if sel, ok := node.(*parser.VectorSelector); ok {
+			hasMetric = true
+			if sel.Name == "" || !ruleMetrics[sel.Name] {
+				allInRule = false
+			}
+			for _, matcher := range sel.LabelMatchers {
+				if matcher.Name != "__name__" && matcher.Type == labels.MatchEqual && pairs[matcher.Name+"\x00"+matcher.Value] {
+					ownLabel = true
+				}
+			}
+		}
+		return nil
+	})
+	return hasMetric && allInRule && ownLabel
 }
 
 // labelUnconfirmed qualifies the stored headline and Finding. The raw
