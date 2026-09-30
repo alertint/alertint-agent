@@ -46,6 +46,12 @@ type Source interface {
 	QueryRange(ctx context.Context, query string, start, end time.Time, limit int, dir string) (json.RawMessage, error)
 }
 
+// ContrastSource optionally fetches lines excluded by the source's default
+// error filter, using the same selector and time window as FetchRecent.
+type ContrastSource interface {
+	FetchContrast(ctx context.Context, sel Selector, start, end time.Time, limit int) (Fetched, error)
+}
+
 // Line is a single normalized log line with its timestamp.
 type Line struct {
 	Timestamp time.Time `json:"timestamp"`
@@ -57,8 +63,9 @@ type Line struct {
 // never parsed. Keeping it here is what lets the snapshot replay exactly what
 // ran and the empty-result breadcrumb name the real query.
 type Fetched struct {
-	Lines []Line
-	Query string // e.g. `{namespace="prod",app="api"} |~ "(?i)(error|…)"`
+	Lines    []Line
+	Query    string // e.g. `{namespace="prod",app="api"} |~ "(?i)(error|…)"`
+	Filtered bool   // lines came from the line-filtered pass, not fallback
 }
 
 // Selector is provider-agnostic: it carries the incident's ALERT labels

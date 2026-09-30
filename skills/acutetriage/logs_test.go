@@ -31,6 +31,88 @@ type fakeSource struct {
 	calls       int
 }
 
+type fakeContrastSource struct {
+	*fakeSource
+
+	contrast         logs.Fetched
+	contrastErr      error
+	contrastCalls    int
+	contrastLimit    int
+	contrastDeadline time.Time
+}
+
+func (f *fakeContrastSource) FetchContrast(ctx context.Context, _ logs.Selector, _, _ time.Time, limit int) (logs.Fetched, error) {
+	f.contrastCalls++
+	f.contrastLimit = limit
+	f.contrastDeadline, _ = ctx.Deadline()
+	return f.contrast, f.contrastErr
+}
+
+func TestFetchLogs_ContrastOnlyAfterFilteredLines(t *testing.T) {
+	lines := []logs.Line{{Timestamp: time.Unix(1, 0), Line: "error loyalty_level=gold"}}
+	comparison := make([]logs.Line, 12)
+	for i := range comparison {
+		comparison[i] = logs.Line{Timestamp: time.Unix(int64(20-i), 0), Line: strings.Repeat("x", 600)}
+	}
+	for _, tc := range []struct {
+		name     string
+		filtered bool
+		lines    []logs.Line
+		want     int
+	}{
+		{"filtered", true, lines, 1},
+		{"fallback", false, lines, 0},
+		{"no lines", true, nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &fakeContrastSource{fakeSource: &fakeSource{name: "loki", fetched: logs.Fetched{Lines: tc.lines, Filtered: tc.filtered}},
+				contrast: logs.Fetched{Lines: comparison}}
+			e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50}, alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "inc", nil)
+			if src.contrastCalls != tc.want {
+				t.Fatalf("contrast calls = %d, want %d", src.contrastCalls, tc.want)
+			}
+			if tc.want == 1 && (src.contrastLimit != 10 || !src.contrastDeadline.Equal(src.deadline) || len(e.Contrast) != 10 || len([]rune(e.Contrast[0].Line)) != logs.MaxLineChars) {
+				t.Fatalf("contrast = %+v, limit %d, deadline %v/%v", e.Contrast, src.contrastLimit, src.contrastDeadline, src.deadline)
+			}
+		})
+	}
+}
+
+func TestFetchLogs_ContrastFailureIsBestEffort(t *testing.T) {
+	src := &fakeContrastSource{fakeSource: &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{{Line: "error"}}, Filtered: true}}, contrastErr: context.DeadlineExceeded}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50}, alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "inc", nil)
+	if e.Outcome != OutcomeFetched || e.ContrastNote == "" || len(e.Contrast) != 0 {
+		t.Fatalf("contrast failure changed main result: %+v", e)
+	}
+}
+
+func TestContrastSummary_Case014Inconclusive(t *testing.T) {
+	errors := make([]logs.Line, 28)
+	for i := range errors {
+		errors[i] = logs.Line{Line: "Payment request failed. Invalid token. demo.user_context.loyalty_level=gold"}
+	}
+	comparison := make([]logs.Line, 10)
+	for i := range comparison {
+		comparison[i] = logs.Line{Line: "Transaction complete."}
+	}
+	got := contrastSummary(errors, comparison)
+	if len(got) != 2 || got[0] != "`demo.user_context.loyalty_level=gold`: on 28/28 error lines, on 0/10 comparison lines" || got[1] != "key demo.user_context.loyalty_level is not in the comparison lines — comparison inconclusive" {
+		t.Fatalf("summary = %v", got)
+	}
+}
+
+func TestContrastSummary_CountsLinesAndCapsTokens(t *testing.T) {
+	errors := []logs.Line{{Line: "a=1 b=2 c=3 d=4"}, {Line: "a=1 b=2 c=3 d=4"}}
+	comparison := []logs.Line{{Line: "a=1 then a=1 b=9"}, {Line: "Transaction complete."}}
+	got := contrastSummary(errors, comparison)
+	if len(got) != 4 || got[0] != "`a=1`: on 2/2 error lines, on 1/2 comparison lines" || got[1] != "`b=2`: on 2/2 error lines, on 0/2 comparison lines" {
+		t.Fatalf("summary = %v", got)
+	}
+	if strings.Contains(strings.Join(got, "\n"), "d=4") || strings.Contains(strings.Join(got, "\n"), "key b is not") {
+		t.Fatalf("token cap or key-presence check failed: %v", got)
+	}
+}
+
 func (f *fakeSource) Name() string { return f.name }
 
 func (f *fakeSource) FetchRecent(ctx context.Context, sel logs.Selector, start, end time.Time, limit int) (logs.Fetched, error) {

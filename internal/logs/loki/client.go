@@ -126,7 +126,7 @@ func (c *Client) FetchRecent(ctx context.Context, sel logs.Selector, start, end 
 		return logs.Fetched{Query: query}, err
 	}
 	if len(lines) > 0 || c.lineFilter == "" {
-		return logs.Fetched{Lines: lines, Query: query}, nil
+		return logs.Fetched{Lines: lines, Query: query, Filtered: len(lines) > 0 && c.lineFilter != ""}, nil
 	}
 
 	// Filtered pass was empty — one unfiltered fallback (matcher only) so apps
@@ -171,7 +171,7 @@ func (c *Client) FetchRecentBounded(ctx context.Context, sel logs.Selector, star
 		return logs.Fetched{Query: query}, err
 	}
 	if len(lines) > 0 || c.lineFilter == "" {
-		return logs.Fetched{Lines: lines, Query: query}, nil
+		return logs.Fetched{Lines: lines, Query: query, Filtered: len(lines) > 0 && c.lineFilter != ""}, nil
 	}
 
 	if err := before(); err != nil {
@@ -183,6 +183,25 @@ func (c *Client) FetchRecentBounded(ctx context.Context, sel logs.Selector, star
 		return logs.Fetched{Query: matcher}, err
 	}
 	return logs.Fetched{Lines: fbLines, Query: matcher}, nil
+}
+
+// FetchContrast samples lines excluded by the single default error regex.
+// Custom filters cannot be inverted safely, so they issue no request.
+func (c *Client) FetchContrast(ctx context.Context, sel logs.Selector, start, end time.Time, limit int) (logs.Fetched, error) {
+	filter := strings.TrimSpace(c.lineFilter)
+	if filter != `|~ "(?i)(error|warn|fatal|panic|fail)"` && filter != "|~ `(?i)(error|warn|fatal|panic|fail)`" {
+		return logs.Fetched{}, nil
+	}
+	matcher := c.buildMatcher(sel)
+	if matcher == "" {
+		return logs.Fetched{}, nil
+	}
+	query := matcher + " !~" + strings.TrimPrefix(filter, "|~")
+	lines, err := c.queryRangeLines(ctx, query, start, end, limit)
+	if err != nil {
+		return logs.Fetched{Query: query}, err
+	}
+	return logs.Fetched{Lines: lines, Query: query}, nil
 }
 
 // QueryRange powers the MCP passthrough: it returns the raw provider "data"

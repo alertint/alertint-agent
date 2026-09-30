@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/httpcount"
@@ -19,12 +21,14 @@ import (
 // can replay exactly what the LLM saw. The same value feeds both the prompt and
 // persistence — one fetch, two uses.
 type LogEnrichment struct {
-	Source string      `json:"source"`          // src.Name()
-	Query  string      `json:"query,omitempty"` // the native query that ran ("" if none built)
-	Start  time.Time   `json:"start"`
-	End    time.Time   `json:"end"`
-	Lines  []logs.Line `json:"lines,omitempty"` // normalized, newest-first
-	Note   string      `json:"note,omitempty"`  // why Lines is empty (queried-empty / timeout / error / no-selector)
+	Source       string      `json:"source"`          // src.Name()
+	Query        string      `json:"query,omitempty"` // the native query that ran ("" if none built)
+	Start        time.Time   `json:"start"`
+	End          time.Time   `json:"end"`
+	Lines        []logs.Line `json:"lines,omitempty"` // normalized, newest-first
+	Note         string      `json:"note,omitempty"`  // why Lines is empty (queried-empty / timeout / error / no-selector)
+	Contrast     []logs.Line `json:"contrast,omitempty"`
+	ContrastNote string      `json:"contrast_note,omitempty"`
 	// SpanStart is the requested window start before any max_window_minutes
 	// clamp; zero when no clamp applied. Lets the prompt say "recent-only".
 	SpanStart            time.Time `json:"span_start,omitzero"`
@@ -165,16 +169,90 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		"range", rangeLabel,
 		"incident", incidentID,
 	)
+	var contrast []logs.Line
+	var contrastNote string
+	contrastSource, canContrast := src.(logs.ContrastSource)
+	if fetched.Filtered && canContrast {
+		sample, contrastErr := contrastSource.FetchContrast(ctx, sel, start, end, 10)
+		if contrastErr != nil {
+			contrastNote = "comparison sample unavailable: " + contrastErr.Error()
+		} else {
+			contrast = logs.Normalize(sample.Lines, logs.MaxBytes, logs.MaxLineChars)
+			contrast = contrast[:min(len(contrast), 10)]
+		}
+	}
 
 	return &LogEnrichment{
-		Source:    source,
-		Query:     fetched.Query,
-		Start:     start,
-		End:       end,
-		SpanStart: spanStart,
-		Lines:     lines,
-		Outcome:   OutcomeFetched,
+		Source:       source,
+		Query:        fetched.Query,
+		Start:        start,
+		End:          end,
+		SpanStart:    spanStart,
+		Lines:        lines,
+		Contrast:     contrast,
+		ContrastNote: contrastNote,
+		Outcome:      OutcomeFetched,
 	}
+}
+
+var contrastTokenRe = regexp.MustCompile(`[A-Za-z_][\w.]*=[\w.:-]+`)
+
+// contrastSummary compares message tokens present in every error line with
+// the sampled lines the default error filter excluded.
+func contrastSummary(errLines, cmpLines []logs.Line) []string {
+	if len(errLines) == 0 {
+		return nil
+	}
+	common := map[string]bool{}
+	for i, line := range errLines {
+		present := map[string]bool{}
+		for _, token := range contrastTokenRe.FindAllString(line.Line, -1) {
+			present[token] = true
+		}
+		if i == 0 {
+			common = present
+		} else {
+			for token := range common {
+				if !present[token] {
+					delete(common, token)
+				}
+			}
+		}
+	}
+	tokens := make([]string, 0, len(common))
+	for token := range common {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	if len(tokens) > 3 {
+		tokens = tokens[:3]
+	}
+	var summary []string
+	for _, token := range tokens {
+		key, _, _ := strings.Cut(token, "=")
+		count := 0
+		keySeen := false
+		for _, line := range cmpLines {
+			lineTokens := contrastTokenRe.FindAllString(line.Line, -1)
+			onLine := false
+			for _, candidate := range lineTokens {
+				if candidate == token {
+					onLine = true
+				}
+				if strings.HasPrefix(candidate, key+"=") {
+					keySeen = true
+				}
+			}
+			if onLine {
+				count++
+			}
+		}
+		summary = append(summary, fmt.Sprintf("`%s`: on %d/%d error lines, on %d/%d comparison lines", token, len(errLines), len(errLines), count, len(cmpLines)))
+		if !keySeen {
+			summary = append(summary, "key "+key+" is not in the comparison lines — comparison inconclusive")
+		}
+	}
+	return summary
 }
 
 // buildLogSelector builds the incident's generic log selector: for each

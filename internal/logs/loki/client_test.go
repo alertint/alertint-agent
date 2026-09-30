@@ -273,6 +273,9 @@ func TestFetchRecent_FilteredThenFallback(t *testing.T) {
 		if len(rec.paths) != 1 {
 			t.Fatalf("expected exactly 1 call, got %d", len(rec.paths))
 		}
+		if !got.Filtered {
+			t.Fatal("filtered hit must report Filtered")
+		}
 		if !strings.Contains(got.Query, `|~ "error"`) {
 			t.Errorf("Fetched.Query should be the filtered query: %q", got.Query)
 		}
@@ -301,6 +304,9 @@ func TestFetchRecent_FilteredThenFallback(t *testing.T) {
 		if len(got.Lines) != 1 {
 			t.Errorf("fallback lines = %d, want 1", len(got.Lines))
 		}
+		if got.Filtered {
+			t.Fatal("fallback lines must not report Filtered")
+		}
 	})
 
 	t.Run("line_filter empty: single call, no fallback", func(t *testing.T) {
@@ -317,7 +323,52 @@ func TestFetchRecent_FilteredThenFallback(t *testing.T) {
 		if got.Query != `{namespace="prod"}` {
 			t.Errorf("Query = %q", got.Query)
 		}
+		if got.Filtered {
+			t.Fatal("unfiltered query must not report Filtered")
+		}
 	})
+}
+
+func TestFetchRecentBounded_FilteredFlag(t *testing.T) {
+	rec := &recorder{}
+	srv := newServer(t, rec, streamsBody(stream([2]string{"1", "ERROR x"})))
+	c := NewClient(Config{BaseURL: srv.URL, LineFilter: `|~ "error"`})
+	got, err := c.FetchRecentBounded(context.Background(), sel("namespace", "prod"), time.Unix(0, 0), time.Now(), 50,
+		func() error { return nil }, func(bool, error) {})
+	if err != nil || !got.Filtered || len(rec.queries) != 1 {
+		t.Fatalf("bounded filtered result = %+v, calls %v, err %v", got, rec.queries, err)
+	}
+}
+
+func TestFetchContrast_OnlyDefaultSingleRegex(t *testing.T) {
+	const pattern = `(?i)(error|warn|fatal|panic|fail)`
+	for _, tc := range []struct {
+		name, filter, wantQuery string
+	}{
+		{"quoted", `|~ "` + pattern + `"`, `{namespace="prod"} !~ "` + pattern + `"`},
+		{"backtick", "|~ `" + pattern + "`", "{namespace=\"prod\"} !~ `" + pattern + "`"},
+		{"multi-stage", `|~ "` + pattern + `" |= "payment"`, ""},
+		{"different regex", `|~ "error"`, ""},
+		{"exact filter", `|= "error"`, ""},
+		{"empty", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			srv := newServer(t, rec, streamsBody(stream([2]string{"1", "Transaction complete."})))
+			c := NewClient(Config{BaseURL: srv.URL, LineFilter: tc.filter})
+			got, err := c.FetchContrast(context.Background(), sel("namespace", "prod"), time.Unix(0, 0), time.Now(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantQuery == "" {
+				if len(rec.queries) != 0 || len(got.Lines) != 0 {
+					t.Fatalf("unsupported filter queried: %v, %+v", rec.queries, got)
+				}
+			} else if len(rec.queries) != 1 || rec.queries[0] != tc.wantQuery || got.Query != tc.wantQuery || len(got.Lines) != 1 || rec.limits[0] != "10" {
+				t.Fatalf("contrast = %+v, queries %v, limits %v", got, rec.queries, rec.limits)
+			}
+		})
+	}
 }
 
 // TestFetchRecent_FilteredBudgetExhaustedNoFallback proves the filtered and
