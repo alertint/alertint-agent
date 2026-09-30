@@ -17,6 +17,7 @@ import (
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -735,7 +736,53 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 		lines = append(lines, fmt.Sprintf("%s %s", r.Series, r.Value))
 	}
 	q.Outcome = OutcomeFetched
-	q.Result = capText(flattenRecalled(strings.Join(lines, "; ")), 400)
+	q.Result = capText(promQLResultUnit(q.Expr)+flattenRecalled(strings.Join(lines, "; ")), 400)
+}
+
+// promQLResultUnit labels only explicit rate/count values whose outer
+// operations preserve units. Arithmetic and recording-rule names are unknown.
+func promQLResultUnit(query string) string {
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
+	if err != nil {
+		return ""
+	}
+	var unit func(parser.Expr) string
+	unit = func(expr parser.Expr) string {
+		switch e := expr.(type) {
+		case *parser.ParenExpr:
+			return unit(e.Expr)
+		case *parser.AggregateExpr:
+			// Counts, grouping and variance do not preserve the input's unit.
+			if e.Op != parser.COUNT && e.Op != parser.COUNT_VALUES && e.Op != parser.GROUP && e.Op != parser.STDVAR {
+				return unit(e.Expr)
+			}
+		case *parser.BinaryExpr:
+			if e.Op.IsComparisonOperator() && !e.ReturnBool {
+				if e.LHS.Type() == parser.ValueTypeScalar {
+					return unit(e.RHS)
+				}
+				return unit(e.LHS)
+			}
+		case *parser.Call:
+			switch e.Func.Name {
+			case "rate", "irate":
+				return "[per second] "
+			case "increase":
+				var window time.Duration
+				switch arg := e.Args[0].(type) {
+				case *parser.MatrixSelector:
+					window = arg.Range
+				case *parser.SubqueryExpr:
+					window = arg.Range
+				}
+				if window > 0 {
+					return "[count over " + model.Duration(window).String() + "] "
+				}
+			}
+		}
+		return ""
+	}
+	return unit(expr)
 }
 
 // isHardErr reports whether err is more than a mere timeout — the shared

@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Verification results label explicit rates per second and increases over their
+  query window; the model is instructed not to report rates as percentages.
 - Cause checks include the referenced and nested Prometheus recording-rule
   definitions, so counting the alert's own error signal does not confirm a cause.
 - Claims naming a value absent from comparison messages are marked unconfirmed

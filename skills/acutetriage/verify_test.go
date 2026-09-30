@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -46,6 +47,53 @@ func TestRunPromQLRejectsInvalidLocally(t *testing.T) {
 	runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "inc-62")
 	if calls != 0 || q.Outcome != OutcomeInvalid || q.Result != "invalid query (not executed)" {
 		t.Fatalf("calls=%d query=%+v", calls, q)
+	}
+}
+
+func TestRunPromQL_Units(t *testing.T) {
+	for _, tc := range []struct{ expr, prefix string }{
+		{`rate(x[5m])`, "[per second] "},
+		{`sum by (service) (rate(x[5m]))`, "[per second] "},
+		{`irate(x[5m])`, "[per second] "},
+		{`rate(x[5m]) > 0.1`, "[per second] "},
+		{`(sum(rate(x[5m]))) > 0.1`, "[per second] "},
+		{`increase(x[15m])`, "[count over 15m] "},
+		{`sum(increase(x[1h]))`, "[count over 1h] "},
+		{`rate(x[5m]) / rate(y[5m])`, ""},
+		{`rate(x[5m]) * 60`, ""},
+		{`x`, ""},
+		{`service:span_error_ratio:5m`, ""},
+		{`rate(x[5m]) > bool 0.1`, ""},
+		{`count(rate(x[5m]))`, ""},
+		{`stdvar(rate(x[5m]))`, ""},
+	} {
+		t.Run(tc.expr, func(t *testing.T) {
+			prom := fakeQuerier(func(string) (json.RawMessage, error) {
+				return vector(s(map[string]string{"service": "api"}, "0.063")), nil
+			})
+			q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: tc.expr}
+			runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "units")
+			want := tc.prefix + `{service="api"} 0.063`
+			if q.Outcome != OutcomeFetched || q.Result != want {
+				t.Fatalf("outcome=%s result=%q, want %q", q.Outcome, q.Result, want)
+			}
+		})
+	}
+}
+
+func TestRunPromQL_UnitPrefixSurvivesCap(t *testing.T) {
+	prom := fakeQuerier(func(string) (json.RawMessage, error) {
+		return vector(s(map[string]string{"service": strings.Repeat("a", 600)}, "0.063")), nil
+	})
+	q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: `rate(x[5m])`}
+	runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "units")
+	// The existing cap retains 400 characters plus its ellipsis marker.
+	if utf8.RuneCountInString(q.Result) > 401 || !strings.HasPrefix(q.Result, "[per second] ") {
+		t.Fatalf("unit lost at cap: %q", q.Result)
+	}
+	continuation := callTwoContinuation(json.RawMessage(`{}`), &VerificationRound{Queries: []VerificationQuery{q}}, nil)
+	if !strings.Contains(continuation, q.Result) || !strings.Contains(continuation, "Values marked [per second] are rates, not fractions; never present them as percentages.") {
+		t.Fatalf("verification prompt lost unit or instruction: %s", continuation)
 	}
 }
 
