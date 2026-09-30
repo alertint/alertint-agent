@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -155,6 +156,26 @@ func TestFetchRecent_MultiStreamMergeNewestFirst(t *testing.T) {
 		if got.Lines[i].Line != w {
 			t.Fatalf("position %d = %q, want %q (merge not newest-first)", i, got.Lines[i].Line, w)
 		}
+	}
+}
+
+func TestParseStreamsDeduplicatesExactTimestampAndLine(t *testing.T) {
+	raw := json.RawMessage(`{"resultType":"streams","result":[
+		{"stream":{"pod":"a"},"values":[["3","newest"],["2","same"],["1","same"]]},
+		{"stream":{"pod":"b"},"values":[["2","same"],["2","different"],["1","same"]]}
+	]}`)
+	got, err := parseStreams(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []logs.Line{
+		{Timestamp: time.Unix(0, 3).UTC(), Line: "newest"},
+		{Timestamp: time.Unix(0, 2).UTC(), Line: "same"},
+		{Timestamp: time.Unix(0, 2).UTC(), Line: "different"},
+		{Timestamp: time.Unix(0, 1).UTC(), Line: "same"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("lines = %+v, want %+v", got, want)
 	}
 }
 
