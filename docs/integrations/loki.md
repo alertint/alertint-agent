@@ -86,8 +86,9 @@ When an incident is ready for analysis, AlertINT:
 When the default error filter returns lines, AlertINT also samples up to 10
 lines that filter excluded, using the same selector, window, and deadline. It
 compares `key=value` tokens in message text only. If an attribute is absent
-from comparison messages, the comparison is inconclusive: stream labels are
-not available in this sample. Custom line filters do not trigger this sample.
+from comparison messages, the affected group is unknown and a finding naming
+that value is marked Unconfirmed. Stream labels are not available in this
+sample. Custom line filters do not trigger this sample.
 
 The exact lines the model saw are **persisted with the finding** and replayed
 verbatim by the `alertint_get_evidence_pack` MCP tool — even after Loki

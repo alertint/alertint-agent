@@ -42,7 +42,7 @@ func TestRenderLogs_ContrastAfterMainLines(t *testing.T) {
 	out := UserPrompt(basePack(), "{}", nil, e, nil, nil, nil, nil, VerificationParams{})
 	first := strings.Index(out, "error loyalty_level=gold")
 	heading := strings.Index(out, "Comparison sample (lines the error filter excluded, same selector and window):")
-	if first < 0 || heading < first || !strings.Contains(out, "key loyalty_level is not in the comparison lines — comparison inconclusive") {
+	if first < 0 || heading < first || !strings.Contains(out, "the comparison lines don't carry `loyalty_level`, so the affected group is unknown") {
 		t.Fatalf("comparison missing or out of order: %s", out)
 	}
 	e.Contrast = nil
@@ -84,7 +84,7 @@ func TestSystemPrompt_CarriesAbsentLogsGuidance(t *testing.T) {
 	if !strings.Contains(SystemPrompt, "Recent logs") {
 		t.Error("SystemPrompt should reference the Recent logs section")
 	}
-	guidance := "if the attribute is absent there, say the comparison is inconclusive"
+	guidance := "If the comparison lines don't carry an attribute, don't say which group is affected"
 	if !strings.Contains(SystemPrompt, guidance) || !strings.Contains(operatorEvidenceInstructions, guidance) {
 		t.Fatal("both prompt variants need comparison guidance")
 	}

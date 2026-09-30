@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
@@ -419,9 +422,29 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 	if ver != nil {
 		ver.CauseCheck = resp.CauseCheck
 	}
+	var reasons []string
 	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix, resp.CauseCheck) {
-		labelUnconfirmed(&resp, []string{"no check tested this cause"})
+		reasons = append(reasons, "no check tested this cause")
 		s.logger.Info("acutetriage: cause unconfirmed: no cited check tested this cause", "incident", inc.ID)
+	}
+	if ar.logs != nil {
+		claim := strings.Join(append([]string{resp.AnalysisName, resp.OverallIssue}, resp.CorrelationFindings...), " ")
+		for _, token := range inconclusiveTokens(ar.logs.Lines, ar.logs.Contrast) {
+			key, value, _ := strings.Cut(token, "=")
+			if len(value) < 3 {
+				continue
+			}
+			if _, err := strconv.ParseFloat(value, 64); err == nil {
+				continue
+			}
+			pattern := `(?i)(^|[^[:alnum:]_])` + regexp.QuoteMeta(value) + `($|[^[:alnum:]_])`
+			if regexp.MustCompile(pattern).MatchString(claim) {
+				reasons = append(reasons, "affected group not shown: comparison logs lack `"+key+"`")
+			}
+		}
+	}
+	if len(reasons) > 0 {
+		labelUnconfirmed(&resp, reasons)
 	}
 
 	// enrichmentJSON is what a successful persist stores, including the

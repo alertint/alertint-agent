@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Findings naming a group absent from comparison logs identify that claim as
+  unconfirmed, and the log summary no longer implies exclusivity from zero matches.
 - Duplicate Loki entries with the same timestamp and text count once in evidence.
 - Recovery assessments keep rejected proposals visible for diagnosis and leave
   LLM health healthy after policy or capability rejections.

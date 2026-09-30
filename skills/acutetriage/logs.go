@@ -197,6 +197,58 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 
 var contrastTokenRe = regexp.MustCompile(`[A-Za-z_][\w.]*=[\w.:-]+`)
 
+// inconclusiveTokens finds shared error tokens whose key is absent from the
+// comparison sample. It uses the same sorted, three-token limit as the prompt.
+func inconclusiveTokens(errLines, cmpLines []logs.Line) []string {
+	if len(errLines) == 0 {
+		return nil
+	}
+	common := map[string]bool{}
+	for i, line := range errLines {
+		present := map[string]bool{}
+		for _, token := range contrastTokenRe.FindAllString(line.Line, -1) {
+			present[token] = true
+		}
+		if i == 0 {
+			common = present
+		} else {
+			for token := range common {
+				if !present[token] {
+					delete(common, token)
+				}
+			}
+		}
+	}
+	tokens := make([]string, 0, len(common))
+	for token := range common {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	if len(tokens) > 3 {
+		tokens = tokens[:3]
+	}
+	var missing []string
+	for _, token := range tokens {
+		key, _, _ := strings.Cut(token, "=")
+		found := false
+		for _, line := range cmpLines {
+			for _, candidate := range contrastTokenRe.FindAllString(line.Line, -1) {
+				if strings.HasPrefix(candidate, key+"=") {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, token)
+		}
+	}
+	return missing
+}
+
 // contrastSummary compares message tokens present in every error line with
 // the sampled lines the default error filter excluded.
 func contrastSummary(errLines, cmpLines []logs.Line) []string {
@@ -227,11 +279,18 @@ func contrastSummary(errLines, cmpLines []logs.Line) []string {
 	if len(tokens) > 3 {
 		tokens = tokens[:3]
 	}
+	missing := make(map[string]bool)
+	for _, token := range inconclusiveTokens(errLines, cmpLines) {
+		missing[token] = true
+	}
 	var summary []string
 	for _, token := range tokens {
 		key, _, _ := strings.Cut(token, "=")
+		if missing[token] {
+			summary = append(summary, fmt.Sprintf("`%s` is on all %d error lines; the comparison lines don't carry `%s`, so the affected group is unknown.", token, len(errLines), key))
+			continue
+		}
 		count := 0
-		keySeen := false
 		for _, line := range cmpLines {
 			lineTokens := contrastTokenRe.FindAllString(line.Line, -1)
 			onLine := false
@@ -239,18 +298,12 @@ func contrastSummary(errLines, cmpLines []logs.Line) []string {
 				if candidate == token {
 					onLine = true
 				}
-				if strings.HasPrefix(candidate, key+"=") {
-					keySeen = true
-				}
 			}
 			if onLine {
 				count++
 			}
 		}
 		summary = append(summary, fmt.Sprintf("`%s`: on %d/%d error lines, on %d/%d comparison lines", token, len(errLines), len(errLines), count, len(cmpLines)))
-		if !keySeen {
-			summary = append(summary, "key "+key+" is not in the comparison lines — comparison inconclusive")
-		}
 	}
 	return summary
 }

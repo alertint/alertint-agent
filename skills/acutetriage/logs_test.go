@@ -87,7 +87,7 @@ func TestFetchLogs_ContrastFailureIsBestEffort(t *testing.T) {
 }
 
 func TestContrastSummary_Case014Inconclusive(t *testing.T) {
-	errors := make([]logs.Line, 28)
+	errors := make([]logs.Line, 14)
 	for i := range errors {
 		errors[i] = logs.Line{Line: "Payment request failed. Invalid token. demo.user_context.loyalty_level=gold"}
 	}
@@ -96,8 +96,11 @@ func TestContrastSummary_Case014Inconclusive(t *testing.T) {
 		comparison[i] = logs.Line{Line: "Transaction complete."}
 	}
 	got := contrastSummary(errors, comparison)
-	if len(got) != 2 || got[0] != "`demo.user_context.loyalty_level=gold`: on 28/28 error lines, on 0/10 comparison lines" || got[1] != "key demo.user_context.loyalty_level is not in the comparison lines — comparison inconclusive" {
+	if len(got) != 1 || got[0] != "`demo.user_context.loyalty_level=gold` is on all 14 error lines; the comparison lines don't carry `demo.user_context.loyalty_level`, so the affected group is unknown." {
 		t.Fatalf("summary = %v", got)
+	}
+	if tokens := inconclusiveTokens(errors, comparison); len(tokens) != 1 || tokens[0] != "demo.user_context.loyalty_level=gold" {
+		t.Fatalf("inconclusive tokens = %v", tokens)
 	}
 }
 
@@ -105,11 +108,14 @@ func TestContrastSummary_CountsLinesAndCapsTokens(t *testing.T) {
 	errors := []logs.Line{{Line: "a=1 b=2 c=3 d=4"}, {Line: "a=1 b=2 c=3 d=4"}}
 	comparison := []logs.Line{{Line: "a=1 then a=1 b=9"}, {Line: "Transaction complete."}}
 	got := contrastSummary(errors, comparison)
-	if len(got) != 4 || got[0] != "`a=1`: on 2/2 error lines, on 1/2 comparison lines" || got[1] != "`b=2`: on 2/2 error lines, on 0/2 comparison lines" {
+	if len(got) != 3 || got[0] != "`a=1`: on 2/2 error lines, on 1/2 comparison lines" || got[1] != "`b=2`: on 2/2 error lines, on 0/2 comparison lines" || got[2] != "`c=3` is on all 2 error lines; the comparison lines don't carry `c`, so the affected group is unknown." {
 		t.Fatalf("summary = %v", got)
 	}
 	if strings.Contains(strings.Join(got, "\n"), "d=4") || strings.Contains(strings.Join(got, "\n"), "key b is not") {
 		t.Fatalf("token cap or key-presence check failed: %v", got)
+	}
+	if missing := inconclusiveTokens(errors, comparison); len(missing) != 1 || missing[0] != "c=3" {
+		t.Fatalf("missing tokens = %v, want c=3 only", missing)
 	}
 }
 
