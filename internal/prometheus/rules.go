@@ -15,6 +15,35 @@ import (
 
 const RuleDefinitionVersionAlgorithm = "prometheus-alerting-rule-effective-v1"
 
+// RecordingRules reads recording-rule definitions with one bounded request.
+func (c *Client) RecordingRules(ctx context.Context) (map[string]string, error) {
+	raw, err := c.apiGetBounded(ctx, "/api/v1/rules", nil)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Groups []struct {
+			Rules []struct {
+				Type  string `json:"type"`
+				Name  string `json:"name"`
+				Query string `json:"query"`
+			} `json:"rules"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	rules := make(map[string]string)
+	for _, group := range payload.Groups {
+		for _, rule := range group.Rules {
+			if rule.Type == "recording" {
+				rules[rule.Name] = rule.Query
+			}
+		}
+	}
+	return rules, nil
+}
+
 // RuleDefinition is current Prometheus configuration truth. It never claims
 // the version that produced an older Alertmanager delivery.
 type RuleDefinition struct {

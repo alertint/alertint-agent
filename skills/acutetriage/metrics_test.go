@@ -6,12 +6,66 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/store"
 )
+
+type rulesProm struct {
+	fakeProm
+	rules      map[string]string
+	err        error
+	rulesCalls int
+	deadline   time.Time
+}
+
+func (f *rulesProm) RecordingRules(ctx context.Context) (map[string]string, error) {
+	f.rulesCalls++
+	f.deadline, _ = ctx.Deadline()
+	return f.rules, f.err
+}
+
+func TestFetchMetrics_RecordingRules(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		rules map[string]string
+		err   error
+		want  map[string]string
+	}{
+		{"nested", map[string]string{"service:errors": `service:raw_errors`, "service:raw_errors": `rate(requests_total{status="error"}[5m])`, "unrelated": `up`}, nil, map[string]string{"service:errors": `service:raw_errors`, "service:raw_errors": `rate(requests_total{status="error"}[5m])`}},
+		{"cycle", map[string]string{"service:errors": `service:raw_errors`, "service:raw_errors": `service:errors`}, nil, map[string]string{"service:errors": `service:raw_errors`, "service:raw_errors": `service:errors`}},
+		{"fetch error", nil, errors.New("rules unsupported"), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &rulesProm{rules: tc.rules, err: tc.err}
+			f.responses = map[string]json.RawMessage{`{service="api"}`: vector(s(map[string]string{"__name__": "requests_total", "service": "api"}, "1"))}
+			start := time.Now()
+			enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, []string{`service:errors > 0.05`}, []store.Alert{alert(map[string]string{"service": "api"})}, start, "i", nil)
+			if enr == nil || enr.Outcome != OutcomeFetched {
+				t.Fatalf("triage metric evidence lost: %+v", enr)
+			}
+			raw, err := json.Marshal(enr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted struct {
+				RecordingRules map[string]string `json:"recording_rules"`
+			}
+			if err := json.Unmarshal(raw, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(persisted.RecordingRules, tc.want) {
+				t.Errorf("persisted definitions=%v, want %v", persisted.RecordingRules, tc.want)
+			}
+			if f.rulesCalls != 1 || f.deadline.IsZero() || f.deadline.After(start.Add(time.Second+50*time.Millisecond)) {
+				t.Errorf("rules must be fetched once within metrics deadline: calls=%d deadline=%v", f.rulesCalls, f.deadline)
+			}
+		})
+	}
+}
 
 func alert(labels map[string]string) store.Alert { return store.Alert{Labels: labels} }
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 // metricPhysicalKeys are the physical-identity allowlist keys — the ones that
@@ -431,6 +432,41 @@ type metricQuerier interface {
 	QueryInstant(ctx context.Context, expr string, t time.Time, limit int) (json.RawMessage, error)
 }
 
+type recordingRuleReader interface {
+	RecordingRules(context.Context) (map[string]string, error)
+}
+
+// usedRecordingRules retains only dependencies of the alert expressions.
+func usedRecordingRules(exprs []string, definitions map[string]string) map[string]string {
+	used := make(map[string]string)
+	visited := make(map[string]bool)
+	var visit func(string)
+	visit = func(query string) {
+		expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
+		if err != nil {
+			return
+		}
+		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+			if sel, ok := node.(*parser.VectorSelector); ok {
+				name := vectorMetricName(sel)
+				if definition, ok := definitions[name]; ok && !visited[name] {
+					visited[name] = true
+					used[name] = definition
+					visit(definition)
+				}
+			}
+			return nil
+		})
+	}
+	for _, expr := range exprs {
+		visit(expr)
+	}
+	if len(used) == 0 {
+		return nil
+	}
+	return used
+}
+
 // MetricEnrichment is the live-metric context attached to a triage prompt and
 // persisted under the "metrics" envelope key. Mirrors LogEnrichment: the same
 // value feeds both the prompt and persistence (one fetch, two uses), and its
@@ -440,6 +476,7 @@ type MetricEnrichment struct {
 	At                   time.Time         `json:"at"`
 	Selector             string            `json:"selector,omitempty"` // rendered matcher(s) that ran (breadcrumb/replay)
 	RuleExprs            []string          `json:"rule_exprs,omitempty"`
+	RecordingRules       map[string]string `json:"recording_rules,omitempty"`
 	LabelMap             map[string]string `json:"label_map,omitempty"`
 	Snapshots            []MetricSnapshot  `json:"snapshots,omitempty"` // ranked, capped
 	Note                 string            `json:"note,omitempty"`      // why Snapshots is empty
@@ -482,6 +519,20 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	}()
 	fetchCtx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
 	defer cancel()
+	// Spend only the remaining metric budget on optional definitions, so a
+	// slow or unsupported rules endpoint cannot starve the metric queries.
+	defer func() {
+		reader, ok := prom.(recordingRuleReader)
+		if !ok || out == nil || len(ruleExprs) == 0 {
+			return
+		}
+		definitions, err := reader.RecordingRules(fetchCtx)
+		if err != nil {
+			logger.Warn("acutetriage: metrics: recording rules unavailable", "err", err, "incident", incidentID)
+			return
+		}
+		out.RecordingRules = usedRecordingRules(ruleExprs, definitions)
+	}()
 
 	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
 	logDroppedSelectorKeys(ctx, logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)

@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cause checks include the referenced and nested Prometheus recording-rule
+  definitions, so counting the alert's own error signal does not confirm a cause.
 - Claims naming a value absent from comparison messages are marked unconfirmed
   only when the same text uses "only" or "exclusively"; no comparison sample
   means no affected-group check. The log summary does not imply exclusivity

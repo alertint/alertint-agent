@@ -146,7 +146,11 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 	}
 	ruleMetrics := make(map[string]bool)
 	rulePairs := make(map[string]bool)
-	for _, rule := range metrics.RuleExprs {
+	rules := append([]string(nil), metrics.RuleExprs...)
+	for _, definition := range metrics.RecordingRules {
+		rules = append(rules, definition)
+	}
+	for _, rule := range rules {
 		expr, err := parser.NewParser(parser.Options{}).ParseExpr(rule)
 		if err != nil {
 			return false

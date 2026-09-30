@@ -897,3 +897,34 @@ func TestCauseUnconfirmed_AlertSignalIsNotCause(t *testing.T) {
 		})
 	}
 }
+
+func TestCauseUnconfirmed_RecordingRuleSignal(t *testing.T) {
+	const rule = `service:span_error_ratio:5m > 0.05 and sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])) > 0.02`
+	const recording = `sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}[5m])) / sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m]))`
+	for _, tc := range []struct {
+		name, service, expr string
+		definitions         map[string]string
+		want                bool
+	}{
+		{"own error spans", "payment", `sum by (service_name) (rate(traces_span_metrics_calls_total{service_name="payment",status_code="STATUS_CODE_ERROR",span_kind="SPAN_KIND_SERVER"}[5m]))`, map[string]string{"service:span_error_ratio:5m": recording}, true},
+		{"specific client spans", "checkout", `sum(rate(traces_span_metrics_calls_total{service_name="checkout",span_kind="SPAN_KIND_CLIENT",span_name="oteldemo.PaymentService/Charge",status_code="STATUS_CODE_ERROR"}[5m]))`, map[string]string{"service:span_error_ratio:5m": recording}, false},
+		{"no definitions", "payment", `sum by (service_name) (rate(traces_span_metrics_calls_total{service_name="payment",status_code="STATUS_CODE_ERROR",span_kind="SPAN_KIND_SERVER"}[5m]))`, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// JSON exercises the persisted input consumed by replay, too.
+			raw, err := json.Marshal(map[string]any{"rule_exprs": []string{rule}, "recording_rules": tc.definitions, "label_map": map[string]string{"service": "service_name"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metrics MetricEnrichment
+			if err := json.Unmarshal(raw, &metrics); err != nil {
+				t.Fatal(err)
+			}
+			ver := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{{Source: "model", Kind: kindPromQL, Outcome: OutcomeFetched, Expr: tc.expr}}}}}
+			n := 1
+			if got := causeUnconfirmed(ver, true, &n, &metrics, []store.Alert{{Labels: map[string]string{"service": tc.service}}}); got != tc.want {
+				t.Fatalf("causeUnconfirmed=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
