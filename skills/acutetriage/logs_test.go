@@ -597,3 +597,23 @@ func TestFetchLogs_ContrastLimitBeforeDedup(t *testing.T) {
 		})
 	}
 }
+
+func TestFetchLogs_AttributeLengthCountsCharacters(t *testing.T) {
+	value := strings.Repeat("界", 64)
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{
+		{Line: "first", Attrs: map[string]string{"category": value}},
+		{Line: "second", Attrs: map[string]string{"category": value + "界"}},
+	}}}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	if len(e.Lines) != 2 || e.Lines[0].Attrs["category"] != value {
+		t.Fatalf("64-character value omitted: %+v", e.Lines)
+	}
+	if len(e.Lines[1].Attrs) != 0 {
+		t.Fatalf("65-character value retained: %+v", e.Lines[1])
+	}
+	var b strings.Builder
+	renderLogs(&b, e)
+	if !strings.Contains(b.String(), "first {category="+value+"}") {
+		t.Fatal(b.String())
+	}
+}

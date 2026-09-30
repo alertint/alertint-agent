@@ -92,7 +92,7 @@ Both sections include useful entry attributes returned in Loki's `stream` map,
 rendered after each message as `{key=value, key=value}`. Attribute selection
 uses the error and comparison lines together: constant fields are omitted,
 including shared resource labels. Numeric values, long hex or UUID identifiers,
-multi-line values, and values over 64 bytes are omitted. Up to eight attributes
+multi-line values, and values over 64 characters are omitted. Up to eight attributes
 per line are kept, preferring keys with fewer distinct values, then key order.
 Absent attributes count as a distinct value. Attributes count toward the log
 byte cap and are persisted with the selected lines.

@@ -169,10 +169,10 @@ func TestParseStreamsDeduplicatesExactTimestampAndLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []logs.Line{
-		{Timestamp: time.Unix(0, 3).UTC(), Line: "newest"},
-		{Timestamp: time.Unix(0, 2).UTC(), Line: "same"},
-		{Timestamp: time.Unix(0, 2).UTC(), Line: "different"},
-		{Timestamp: time.Unix(0, 1).UTC(), Line: "same"},
+		{Timestamp: time.Unix(0, 3).UTC(), Line: "newest", Attrs: map[string]string{"pod": "a"}},
+		{Timestamp: time.Unix(0, 2).UTC(), Line: "same", Attrs: map[string]string{"pod": "a"}},
+		{Timestamp: time.Unix(0, 2).UTC(), Line: "different", Attrs: map[string]string{"pod": "b"}},
+		{Timestamp: time.Unix(0, 1).UTC(), Line: "same", Attrs: map[string]string{"pod": "a"}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("lines = %+v, want %+v", got, want)

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/logs"
@@ -411,7 +412,7 @@ func selectLogAttrs(lines []logs.Line) {
 		var attrs map[string]string
 		for _, key := range keys {
 			text, ok := lines[i].Attrs[key]
-			if !ok || len(text) > 64 || strings.ContainsAny(text, "\r\n") || hexID.MatchString(strings.ReplaceAll(text, "-", "")) {
+			if !ok || utf8.RuneCountInString(text) > 64 || strings.ContainsAny(text, "\r\n") || hexID.MatchString(strings.ReplaceAll(text, "-", "")) {
 				continue
 			}
 			if _, err := strconv.ParseFloat(text, 64); err == nil || errors.Is(err, strconv.ErrRange) {

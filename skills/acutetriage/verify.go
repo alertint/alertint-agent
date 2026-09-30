@@ -151,8 +151,10 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 			return false
 		}
 		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
-			if sel, ok := node.(*parser.VectorSelector); ok && sel.Name != "" {
-				ruleMetrics[sel.Name] = true
+			if sel, ok := node.(*parser.VectorSelector); ok {
+				if name := vectorMetricName(sel); name != "" {
+					ruleMetrics[name] = true
+				}
 			}
 			return nil
 		})
@@ -176,7 +178,8 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
 		if sel, ok := node.(*parser.VectorSelector); ok {
 			hasMetric = true
-			if sel.Name == "" || !ruleMetrics[sel.Name] {
+			name := vectorMetricName(sel)
+			if name == "" || !ruleMetrics[name] {
 				allInRule = false
 			}
 			for _, matcher := range sel.LabelMatchers {
@@ -188,6 +191,19 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 		return nil
 	})
 	return hasMetric && allInRule && ownLabel
+}
+
+// vectorMetricName also accepts PromQL's exact metric-name selector form.
+func vectorMetricName(sel *parser.VectorSelector) string {
+	if sel.Name != "" {
+		return sel.Name
+	}
+	for _, matcher := range sel.LabelMatchers {
+		if matcher.Name == "__name__" && matcher.Type == labels.MatchEqual {
+			return matcher.Value
+		}
+	}
+	return ""
 }
 
 // labelUnconfirmed qualifies the stored headline and Finding. The raw

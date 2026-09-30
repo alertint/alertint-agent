@@ -849,6 +849,11 @@ func TestCauseUnconfirmed_AlertSignalIsNotCause(t *testing.T) {
 		want                bool
 	}{
 		{"own signal", `service:span_error_ratio:5m{service_name="payment"} > 0.05`, "payment", []string{rule}, true},
+		{"explicit metric name in query", `{__name__="service:span_error_ratio:5m",service_name="payment"} > 0.05`, "payment", []string{rule}, true},
+		{"explicit metric name in rule", `service:span_error_ratio:5m{service_name="payment"}`, "payment", []string{`{__name__="service:span_error_ratio:5m"} > 0.05`}, true},
+		{"explicit other metric", `{__name__="token_errors_total",service_name="payment"}`, "payment", []string{rule}, false},
+		{"broad metric name", `{__name__=~"service:.*",service_name="payment"}`, "payment", []string{rule}, false},
+
 		{"other service", `service:span_error_ratio:5m{service_name="payment"}`, "checkout", []string{rule}, false},
 		{"different metric", `token_errors_total{service_name="payment"}`, "payment", []string{rule}, false},
 		{"mixed metrics", `service:span_error_ratio:5m{service_name="payment"} + token_errors_total{service_name="payment"}`, "payment", []string{rule}, false},
