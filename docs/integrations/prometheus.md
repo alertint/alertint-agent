@@ -108,6 +108,8 @@ makes Kubernetes-style alerts (labeled by `namespace`/`pod`/`container`,
 often with no `instance` at all) get live metrics instead of falling
 back to annotations-only: the old behavior queried `{instance="X"}`
 alone, which most K8s alerting rules never set.
+Each successful selector query also checks the same series 15 minutes earlier,
+so changed and newly present series rank above unchanged metric noise.
 
 Two refinements keep the selector from missing evidence:
 

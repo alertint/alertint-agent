@@ -102,6 +102,20 @@ func TestRenderMetrics_SeriesAndNote(t *testing.T) {
 	}
 }
 
+func TestRenderMetricsShowsBaselineOnlyWhenKnown(t *testing.T) {
+	var b strings.Builder
+	renderMetrics(&b, &MetricEnrichment{Snapshots: []MetricSnapshot{
+		{Metric: "requests_total", Series: `{job="api"}`, Value: "8", Baseline: "4"},
+		{Metric: "errors_total", Series: `{job="api"}`, Value: "2", Baseline: "none"},
+		{Metric: "up", Series: `{job="api"}`, Value: "1"},
+	}})
+	for _, want := range []string{`requests_total{job="api"} = 8 (15m earlier: 4)`, `errors_total{job="api"} = 2 (15m earlier: none)`, `up{job="api"} = 1`} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("missing %q in %q", want, b.String())
+		}
+	}
+}
+
 // TestAnnotationsOnlyBasis_DegradedExemptOthersNot locks the single predicate
 // both the prompt directive and the deterministic cap backstop rely on: a
 // degraded (slow) metric fetch is exempt from the cap, while genuine failure,

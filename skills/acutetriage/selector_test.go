@@ -183,13 +183,13 @@ func TestFetchMetrics_RetryKeepsExtra(t *testing.T) {
 	q := &fakeProm{}
 	params := MetricParams{TimeoutSeconds: 5, ExtraSelectorLabels: []string{"cluster"}}
 	FetchMetrics(context.Background(), q, params, nil, clusterAlerts(), time.Now(), "inc-1", nil)
-	if len(q.calls) != 2 {
-		t.Fatalf("want primary + retry, got %d queries: %v", len(q.calls), q.calls)
+	if len(q.calls) != 4 {
+		t.Fatalf("want primary and retry with 15-minute comparisons, got %d queries: %v", len(q.calls), q.calls)
 	}
 	if want := `{cluster="eu-west",namespace="payments",service="checkout"}`; q.calls[0] != want {
 		t.Fatalf("primary: got %q want %q", q.calls[0], want)
 	}
-	if want := `{cluster="eu-west",namespace="payments"}`; q.calls[1] != want {
-		t.Fatalf("retry must keep the extra: got %q want %q", q.calls[1], want)
+	if want := `{cluster="eu-west",namespace="payments"}`; q.calls[2] != want || q.calls[3] != want {
+		t.Fatalf("retry and baseline must keep the extra: got %v want %q", q.calls, want)
 	}
 }

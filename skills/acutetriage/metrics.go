@@ -194,21 +194,22 @@ func memberLabelPairs(alerts []store.Alert) map[string]bool {
 // __name__) — renamed from the old instance-only Instance field, since scope is
 // no longer instance-only (Outstanding Q3).
 type MetricSnapshot struct {
-	Series string `json:"series"`
-	Metric string `json:"metric"`
-	Value  string `json:"value"`
+	Series   string `json:"series"`
+	Metric   string `json:"metric"`
+	Value    string `json:"value"`
+	Baseline string `json:"baseline,omitempty"`
 }
 
 // rankSeries parses a Prometheus instant-vector data blob (the "data" field of
 // the API envelope), filters system metrics and alert bookkeeping series, and
-// returns at most limit snapshots ranked by (overlap desc, metric asc,
+// returns at most limit snapshots ranked by (overlap desc, change desc, metric asc,
 // numeric-value desc within family,
 // series-identity asc) — a total, response-order-independent order (R5/R11,
 // ADR-0025). overlap counts a series' (k,v) label pairs (excluding __name__)
 // that a member alert also carries.
 //
-//nolint:unparam // limit is a general cap parameter exercised directly by unit tests; production callers happen to share one constant (maxSnapshotsPerScope) today.
-func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []MetricSnapshot {
+//nolint:unparam,gocyclo // bounded ranking keeps filtering, overlap, baseline change, and family cap together; limit is also exercised by unit tests.
+func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int, baseline map[string]string) []MetricSnapshot {
 	var d struct {
 		Result []struct {
 			Metric map[string]string `json:"metric"`
@@ -223,11 +224,12 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 		overlap int
 		value   float64
 		numeric bool
+		change  float64
 	}
 	cands := make([]cand, 0, len(d.Result))
 	for _, r := range d.Result {
 		name := r.Metric["__name__"]
-		if name == "" || isSystemMetric(name) || alertBookkeepingMetrics[name] {
+		if name == "" || isSystemMetric(name) || alertBookkeepingMetrics[name] || strings.HasSuffix(name, "_bucket") {
 			continue
 		}
 		val, ok := r.Value[1].(string)
@@ -248,16 +250,34 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 		// a literal "+Inf"/"-Inf" sample already is.
 		f, err := strconv.ParseFloat(val, 64)
 		numericErr := err == nil || errors.Is(err, strconv.ErrRange)
+		snap := MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val}
+		var change float64
+		if baseline != nil {
+			before, found := baseline[name+"\x00"+snap.Series]
+			if !found {
+				snap.Baseline = "none"
+				change = math.Inf(1)
+			} else {
+				snap.Baseline = before
+				if b, parseErr := strconv.ParseFloat(before, 64); parseErr == nil && numericErr && !math.IsNaN(f) && !math.IsNaN(b) && !math.IsInf(f, 0) && !math.IsInf(b, 0) {
+					change = math.Abs(f-b) / math.Max(math.Abs(b), 1e-9)
+				}
+			}
+		}
 		cands = append(cands, cand{
-			snap:    MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val},
+			snap:    snap,
 			overlap: overlap,
 			value:   f,
 			numeric: numericErr && !math.IsNaN(f),
+			change:  change,
 		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		if cands[i].overlap != cands[j].overlap {
 			return cands[i].overlap > cands[j].overlap
+		}
+		if cands[i].change != cands[j].change {
+			return cands[i].change > cands[j].change
 		}
 		if cands[i].snap.Metric != cands[j].snap.Metric {
 			return cands[i].snap.Metric < cands[j].snap.Metric
@@ -281,14 +301,35 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 			break
 		}
 		if c.overlap <= comparatorMaxOverlap {
-			if perFamily[c.snap.Metric] >= maxSeriesPerFamily {
+			family := strings.TrimSuffix(strings.TrimSuffix(c.snap.Metric, "_count"), "_sum")
+			if perFamily[family] >= maxSeriesPerFamily {
 				continue
 			}
-			perFamily[c.snap.Metric]++
+			perFamily[family]++
 		}
 		out = append(out, c.snap)
 	}
 	return out
+}
+
+func metricBaseline(raw json.RawMessage) map[string]string {
+	var d struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string `json:"metric"`
+			Value  [2]any            `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil || d.ResultType != "vector" {
+		return nil
+	}
+	values := make(map[string]string, len(d.Result))
+	for _, r := range d.Result {
+		if value, ok := r.Value[1].(string); ok {
+			values[r.Metric["__name__"]+"\x00"+formatSeriesIdentity(r.Metric)] = value
+		}
+	}
+	return values
 }
 
 // formatSeriesIdentity renders a series' identifying labels (all but __name__) as
@@ -489,7 +530,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		result.Result = joined
 		filtered, err := json.Marshal(result)
 		if err == nil {
-			snapshots = append(snapshots, rankSeries(filtered, memberPairs, maxSnapshotsPerScope)...)
+			snapshots = append(snapshots, rankSeries(filtered, memberPairs, maxSnapshotsPerScope, nil)...)
 		}
 	}
 	labelMap := make(map[string]string)
@@ -548,10 +589,18 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	if len(scopes) > 0 {
 		perScope = time.Duration(params.TimeoutSeconds) * time.Second / time.Duration(len(scopes))
 	}
-	queryScope := func(scope string) (json.RawMessage, error) {
+	queryScope := func(scope string) (json.RawMessage, map[string]string, error) {
 		scopeCtx, scopeCancel := context.WithTimeout(fetchCtx, perScope)
 		defer scopeCancel()
-		return prom.QueryInstant(scopeCtx, scope, t, params.MaxSeries)
+		data, err := prom.QueryInstant(scopeCtx, scope, t, params.MaxSeries)
+		if err != nil {
+			return nil, nil, err
+		}
+		before, err := prom.QueryInstant(scopeCtx, scope, t.Add(-15*time.Minute), params.MaxSeries)
+		if err != nil {
+			return data, nil, nil
+		}
+		return data, metricBaseline(before), nil
 	}
 
 	// Track the two failure kinds apart: a per-scope deadline (backend reachable
@@ -570,21 +619,21 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			"selector", scope, "err", err, "incident", incidentID)
 	}
 	for i, scope := range scopes {
-		data, err := queryScope(scope)
+		data, baseline, err := queryScope(scope)
 		if err != nil {
 			classify(scope, err)
 			continue
 		}
-		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope)
+		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope, baseline)
 		// R9 physical-core rescue — primary scope only, when no usable series
 		// remain (including when only alert bookkeeping series matched) and
 		// dropping the logical keys yields a distinct selector.
 		if i == 0 && scope == primary && len(ranked) == 0 && physicalFallback != "" && physicalFallback != primary {
-			data2, err2 := queryScope(physicalFallback)
+			data2, baseline2, err2 := queryScope(physicalFallback)
 			if err2 != nil {
 				classify(physicalFallback, err2)
 			} else {
-				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope)
+				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope, baseline2)
 			}
 		}
 		snapshots = append(snapshots, ranked...)

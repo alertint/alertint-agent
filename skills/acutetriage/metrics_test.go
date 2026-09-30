@@ -94,7 +94,7 @@ func TestRankSeries_ExcludesAlertBookkeepingOnly(t *testing.T) {
 		s(map[string]string{"__name__": "ALERTS_x", "service": "payment"}, "2"),
 		s(map[string]string{"__name__": "service:span_error_ratio:5m", "service": "payment"}, "0.54"),
 	)
-	got := rankSeries(raw, memberLabelPairs([]store.Alert{alert(map[string]string{"service": "payment"})}), 10)
+	got := rankSeries(raw, memberLabelPairs([]store.Alert{alert(map[string]string{"service": "payment"})}), 10, nil)
 	if len(got) != 2 || got[0].Metric != "ALERTS_x" || got[1].Metric != "service:span_error_ratio:5m" {
 		t.Fatalf("want real series and ALERTS_x only, got %+v", got)
 	}
@@ -112,7 +112,7 @@ func TestRankSeries_OverlapPreferredWithDeterministicTiebreak(t *testing.T) {
 		s(map[string]string{"__name__": "go_gc_duration_seconds", "namespace": "checkout"}, "0.1"), // system → dropped
 		s(map[string]string{"__name__": "mem", "namespace": "checkout", "pod": "api-7f9x"}, "700"), // overlap 2
 	)
-	got := rankSeries(raw, members, 10)
+	got := rankSeries(raw, members, 10, nil)
 	if len(got) != 3 {
 		t.Fatalf("want 3 non-system, got %d: %+v", len(got), got)
 	}
@@ -131,7 +131,7 @@ func TestRankSeries_CapKeepsTopN(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		list = append(list, s(map[string]string{"__name__": "m" + string(rune('a'+i)), "namespace": "n"}, "1"))
 	}
-	if got := rankSeries(vector(list...), members, 10); len(got) != 10 {
+	if got := rankSeries(vector(list...), members, 10, nil); len(got) != 10 {
 		t.Errorf("cap not applied: got %d", len(got))
 	}
 }
@@ -146,7 +146,7 @@ func TestRankSeries_ValueOrdersWithinFamily(t *testing.T) {
 		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "anu-iap-proxy"}, "6.6e+06"),
 		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "payments-service-live"}, "5.5e+06"),
 	)
-	got := rankSeries(raw, members, 10)
+	got := rankSeries(raw, members, 10, nil)
 	if len(got) != 3 {
 		t.Fatalf("want 3, got %d: %+v", len(got), got)
 	}
@@ -164,7 +164,7 @@ func TestRankSeries_UnparsableValueRanksLast(t *testing.T) {
 		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "aa"}, "NaN"),
 		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "small"}, "1"),
 	)
-	got := rankSeries(raw, members, 10)
+	got := rankSeries(raw, members, 10, nil)
 	if len(got) != 3 {
 		t.Fatalf("want 3, got %d: %+v", len(got), got)
 	}
@@ -191,7 +191,7 @@ func TestRankSeries_ResponseOrderIndependent(t *testing.T) {
 		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "b"}, "2"),
 		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "a"}, "1"),
 	)
-	g1, g2 := rankSeries(fwd, members, 10), rankSeries(rev, members, 10)
+	g1, g2 := rankSeries(fwd, members, 10, nil), rankSeries(rev, members, 10, nil)
 	if len(g1) != 3 || len(g2) != 3 {
 		t.Fatalf("want 3+3, got %d+%d", len(g1), len(g2))
 	}
@@ -215,7 +215,7 @@ func TestRankSeries_ComparatorFamilyCap(t *testing.T) {
 		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "e"}, "1"),
 		s(map[string]string{"__name__": "other_family", "instance": "node-1"}, "9"),
 	)
-	got := rankSeries(raw, members, 10)
+	got := rankSeries(raw, members, 10, nil)
 	if len(got) != 4 {
 		t.Fatalf("want 3 capped big_family + 1 other_family = 4, got %d: %+v", len(got), got)
 	}
@@ -248,7 +248,7 @@ func TestRankSeries_MemberEvidenceNeverCapped(t *testing.T) {
 		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-z"}, "7"),
 		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-w"}, "6"),
 	}
-	got := rankSeries(vector(series...), members, 10)
+	got := rankSeries(vector(series...), members, 10, nil)
 	// 5 member series (overlap 2, uncapped) + 3 comparator series (capped) = 8.
 	if len(got) != 8 {
 		t.Fatalf("want 5 member + 3 comparators = 8, got %d: %+v", len(got), got)
@@ -269,7 +269,7 @@ func TestRankSeries_OverflowValueRanksAsInfinite(t *testing.T) {
 		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "normal"}, "42"),
 		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "overflow"}, "1e400"),
 	)
-	got := rankSeries(raw, members, 10)
+	got := rankSeries(raw, members, 10, nil)
 	if len(got) != 2 {
 		t.Fatalf("want 2, got %d: %+v", len(got), got)
 	}
@@ -288,12 +288,29 @@ type fakeProm struct {
 	slow  map[string]bool
 	calls []string
 	// limits records the limit argument of each QueryInstant call, in order.
-	limits []int
+	limits            []int
+	baselineAt        time.Time
+	baselineResponses map[string]json.RawMessage
+	baselineFail      bool
+	baselineTimeout   bool
+	times             []time.Time
 }
 
-func (f *fakeProm) QueryInstant(ctx context.Context, expr string, _ time.Time, limit int) (json.RawMessage, error) {
+func (f *fakeProm) QueryInstant(ctx context.Context, expr string, at time.Time, limit int) (json.RawMessage, error) {
 	f.calls = append(f.calls, expr)
 	f.limits = append(f.limits, limit)
+	f.times = append(f.times, at)
+	if at.Equal(f.baselineAt) {
+		if f.baselineTimeout {
+			return nil, context.DeadlineExceeded
+		}
+		if f.baselineFail {
+			return nil, errors.New("baseline unavailable")
+		}
+		if r, ok := f.baselineResponses[expr]; ok {
+			return r, nil
+		}
+	}
 	if f.slow[expr] {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -310,6 +327,91 @@ func (f *fakeProm) QueryInstant(ctx context.Context, expr string, _ time.Time, l
 		return r, nil
 	}
 	return vector(), nil // matched nothing
+}
+
+func TestFetchMetricsRanksNewErrorSeriesAheadOfUnchangedNoise(t *testing.T) {
+	at := time.Date(2026, 9, 30, 6, 0, 0, 0, time.UTC)
+	scope := `{service_name="worker"}`
+	ruleExpr := `service:span_error_ratio:5m`
+	series := vector(
+		s(map[string]string{"__name__": "http_client_duration_milliseconds_bucket", "service_name": "worker", "le": "1"}, "4"),
+		s(map[string]string{"__name__": "http_client_duration_milliseconds_count", "service_name": "worker", "net_peer_name": "169.254.169.254"}, "4"),
+		s(map[string]string{"__name__": "http_client_duration_milliseconds_sum", "service_name": "worker", "net_peer_name": "169.254.169.254"}, "4"),
+		s(map[string]string{"__name__": "nodejs_eventloop_delay_max_seconds", "service_name": "worker"}, "4"),
+		s(map[string]string{"__name__": "traces_span_metrics_calls_total", "service_name": "worker", "status_code": "STATUS_CODE_ERROR"}, "1"),
+	)
+	baseline := vector(
+		s(map[string]string{"__name__": "http_client_duration_milliseconds_count", "service_name": "worker", "net_peer_name": "169.254.169.254"}, "4"),
+		s(map[string]string{"__name__": "http_client_duration_milliseconds_sum", "service_name": "worker", "net_peer_name": "169.254.169.254"}, "4"),
+		s(map[string]string{"__name__": "nodejs_eventloop_delay_max_seconds", "service_name": "worker"}, "4"),
+	)
+	f := &fakeProm{responses: map[string]json.RawMessage{scope: series, ruleExpr: vector(s(map[string]string{"__name__": ruleExpr, "service_name": "worker"}, "0.5"))}, baselineAt: at.Add(-15 * time.Minute), baselineResponses: map[string]json.RawMessage{scope: baseline}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, ExtraSelectorLabels: []string{"service_name"}}, []string{ruleExpr}, []store.Alert{alert(map[string]string{"service_name": "worker"})}, at, "i", nil)
+	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 5 {
+		t.Fatalf("snapshots=%+v outcome=%s", enr.Snapshots, enr.Outcome)
+	}
+	if enr.Snapshots[0].Metric != ruleExpr || enr.Snapshots[0].Baseline != "" || enr.Snapshots[1].Metric != "traces_span_metrics_calls_total" || enr.Snapshots[1].Baseline != "none" {
+		t.Fatalf("new error series must rank first with absent baseline: %+v", enr.Snapshots)
+	}
+	for _, snap := range enr.Snapshots {
+		if strings.HasSuffix(snap.Metric, "_bucket") {
+			t.Fatalf("bucket retained: %+v", snap)
+		}
+		if snap.Metric != ruleExpr && snap.Metric != "traces_span_metrics_calls_total" && snap.Baseline != "4" {
+			t.Fatalf("baseline missing: %+v", snap)
+		}
+	}
+	if len(f.times) != 3 || !f.times[0].Equal(at) || !f.times[1].Equal(at) || !f.times[2].Equal(at.Add(-15*time.Minute)) {
+		t.Fatalf("query times=%v", f.times)
+	}
+}
+
+func TestFetchMetricsBaselineFailureKeepsCurrentRanking(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		timeout bool
+	}{{name: "failed"}, {name: "timed out", timeout: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			at := time.Date(2026, 9, 30, 6, 0, 0, 0, time.UTC)
+			scope := `{namespace="n"}`
+			f := &fakeProm{responses: map[string]json.RawMessage{scope: vector(
+				s(map[string]string{"__name__": "z_metric", "namespace": "n"}, "5"),
+				s(map[string]string{"__name__": "a_metric", "namespace": "n"}, "1"),
+			)}, baselineAt: at.Add(-15 * time.Minute), baselineFail: !tc.timeout, baselineTimeout: tc.timeout}
+			enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, []store.Alert{alert(map[string]string{"namespace": "n"})}, at, "i", nil)
+			if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 2 || enr.Snapshots[0].Metric != "a_metric" || enr.Snapshots[0].Baseline != "" {
+				t.Fatalf("baseline failure changed current evidence: %+v", enr)
+			}
+		})
+	}
+}
+
+func TestRankSeriesCapsHistogramCountAndSumTogether(t *testing.T) {
+	series := make([]map[string]any, 0, 4)
+	for _, metric := range []string{"http_client_duration_milliseconds_count", "http_client_duration_milliseconds_sum"} {
+		for _, peer := range []string{"a", "b"} {
+			series = append(series, s(map[string]string{"__name__": metric, "net_peer_name": peer}, "1"))
+		}
+	}
+	got := rankSeries(vector(series...), nil, 10, nil)
+	if len(got) != 3 {
+		t.Fatalf("one comparator family took %d slots, want 3: %+v", len(got), got)
+	}
+}
+
+func TestRankSeriesChangeBeatsAlphabeticalTie(t *testing.T) {
+	raw := vector(
+		s(map[string]string{"__name__": "a_metric", "namespace": "n"}, "4"),
+		s(map[string]string{"__name__": "z_metric", "namespace": "n"}, "8"),
+	)
+	baseline := map[string]string{
+		"a_metric\x00" + `{namespace="n"}`: "4",
+		"z_metric\x00" + `{namespace="n"}`: "4",
+	}
+	got := rankSeries(raw, memberLabelPairs([]store.Alert{alert(map[string]string{"namespace": "n"})}), 10, baseline)
+	if len(got) != 2 || got[0].Metric != "z_metric" || got[0].Baseline != "4" {
+		t.Fatalf("changed series did not win equal-overlap tie: %+v", got)
+	}
 }
 
 func TestFetchMetrics_K8sSelectorFetches(t *testing.T) {
@@ -332,7 +434,7 @@ func TestFetchMetrics_LabelMapUsesSeriesLabel(t *testing.T) {
 		`{service_name="payment"}`: vector(s(map[string]string{"__name__": "service:span_error_ratio:5m", "service_name": "payment"}, "0.54")),
 	}}
 	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, LabelMap: map[string]string{"service": "service_name"}}, nil, alerts, time.Now(), "payment", nil)
-	if len(f.calls) != 1 || f.calls[0] != `{service_name="payment"}` || enr.Outcome != OutcomeFetched {
+	if len(f.calls) != 2 || f.calls[0] != `{service_name="payment"}` || f.calls[1] != f.calls[0] || enr.Outcome != OutcomeFetched {
 		t.Fatalf("calls = %v, enrichment = %+v", f.calls, enr)
 	}
 }
@@ -437,7 +539,7 @@ func TestFetchMetrics_AlertBookkeepingTriggersPhysicalCoreRetry(t *testing.T) {
 		),
 	}}
 	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, ExtraSelectorLabels: []string{"service_name"}}, nil, alerts, time.Now(), "payment", nil)
-	if len(f.calls) != 2 || f.calls[0] != `{service="payment",service_name="payment"}` || f.calls[1] != `{service_name="payment"}` {
+	if len(f.calls) != 4 || f.calls[0] != `{service="payment",service_name="payment"}` || f.calls[1] != f.calls[0] || f.calls[2] != `{service_name="payment"}` || f.calls[3] != f.calls[2] {
 		t.Fatalf("want primary then physical-core fallback, got calls %v", f.calls)
 	}
 	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 || enr.Snapshots[0].Metric != "service:span_error_ratio:5m" {
@@ -457,7 +559,7 @@ func TestFetchMetrics_AlertBookkeepingWithoutFallbackIsEmpty(t *testing.T) {
 		),
 	}}
 	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, alerts, time.Now(), "payment", nil)
-	if len(f.calls) != 1 || f.calls[0] != `{service="payment"}` {
+	if len(f.calls) != 2 || f.calls[0] != `{service="payment"}` || f.calls[1] != f.calls[0] {
 		t.Fatalf("want only the primary scope, got calls %v", f.calls)
 	}
 	if enr.Outcome != OutcomeEmpty || enr.Note != "no metric series matched the incident selector" || len(enr.Snapshots) != 0 {
@@ -498,7 +600,7 @@ func TestFetchMetrics_CapsInstanceSupplements(t *testing.T) {
 	}
 	// One primary (namespace+instance regex) + at most maxInstanceSupplements
 	// bare per-instance scopes — never one per node.
-	if want := 1 + maxInstanceSupplements; len(f.calls) != want {
+	if want := 2 * (1 + maxInstanceSupplements); len(f.calls) != want {
 		t.Fatalf("queried %d scopes, want %d (1 primary + %d capped supplements); calls=%v",
 			len(f.calls), want, maxInstanceSupplements, f.calls)
 	}
@@ -522,7 +624,7 @@ func TestFetchMetrics_PerScopeDeadlinePreventsStarvation(t *testing.T) {
 		},
 	}
 	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, nil, alerts, time.Now(), "inc1", nil)
-	if len(f.calls) != 3 {
+	if len(f.calls) != 5 {
 		t.Fatalf("all three scopes must be attempted, got calls=%v", f.calls)
 	}
 	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 2 {

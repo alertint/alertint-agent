@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Metric evidence compares selector series with values 15 minutes earlier,
+  ranks changed series first, and caps histogram count and sum together.
 - Findings with no fetched model or operator metric checks identify their cause
   as unconfirmed in the stored headline and Finding.
 
