@@ -265,6 +265,9 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 		"hypothesis formed now is itself unverified: keep its confidence moderate. Respond " +
 		"with the SAME JSON schema as before, complete (do NOT include the \"verification\" " +
 		"key again).")
+	b.WriteString(" Add \"cause_check\": the [n] of the one result that directly measured your " +
+		"proposed cause, or 0 if none did. A result that only shows the symptom, " +
+		"other services, or throughput does not test the cause.")
 	if memory != nil && memory.Strong != nil {
 		b.WriteString("\n\nAfter weighing the verification results, add a \"memory_verdict\" field " +
 			"judging the folded prior hypothesis in the Memory section: \"confirms\", \"refutes\", " +

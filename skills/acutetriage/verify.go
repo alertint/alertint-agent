@@ -86,8 +86,9 @@ type DraftRef struct {
 
 // VerificationEnrichment is the envelope key "verification" (R8).
 type VerificationEnrichment struct {
-	Outcome string              `json:"outcome"` // supported | revised | degraded
-	Rounds  []VerificationRound `json:"rounds"`
+	Outcome    string              `json:"outcome"` // supported | revised | degraded
+	Rounds     []VerificationRound `json:"rounds"`
+	CauseCheck *int                `json:"cause_check,omitempty"`
 	// OperatorRuling records call 2's judgment on the governing correction
 	// (ADR-0029) when one is steering; nil when no correction governs this
 	// triage at all.
@@ -97,31 +98,31 @@ type VerificationEnrichment struct {
 	DegradationReason string `json:"degradation_reason,omitempty"`
 }
 
-// causeUnconfirmed reports whether verification ran with a configured metric
-// source but no model or operator check of the proposed cause returned data.
-// The floor and incidents_in_window do not test the cause itself.
-func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool) bool {
+// causeUnconfirmed checks call 2's cited result in the round it saw.
+func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCheck *int) bool {
 	if ver == nil || !hasMetricSource {
 		return false
 	}
-	for _, round := range ver.Rounds {
-		for _, q := range round.Queries {
-			if (q.Source == "model" || q.Source == "operator") && q.Kind != kindIncidentsInWindow && q.Outcome == OutcomeFetched {
-				return false
-			}
-		}
+	if causeCheck == nil || *causeCheck < 1 || len(ver.Rounds) == 0 {
+		return true
 	}
-	return true
+	queries := ver.Rounds[len(ver.Rounds)-1].Queries
+	if *causeCheck > len(queries) {
+		return true
+	}
+	q := queries[*causeCheck-1]
+	metricKind := q.Kind == kindPromQL || q.Kind == kindZabbixReachability || q.Kind == kindZabbixNeighborProblems
+	return (q.Source != "model" && q.Source != "operator") || !metricKind || q.Outcome != OutcomeFetched
 }
 
-// labelUnconfirmedCause qualifies the stored headline and Finding. The raw
+// labelUnconfirmed qualifies the stored headline and Finding. The raw
 // model response remains unchanged for output_json and its attempt digest.
-func labelUnconfirmedCause(resp *llmResponse) {
+func labelUnconfirmed(resp *llmResponse, reasons []string) {
 	if !strings.HasPrefix(strings.ToLower(resp.AnalysisName), "unconfirmed") {
 		resp.AnalysisName = "Unconfirmed: " + resp.AnalysisName
 	}
 	if !strings.HasPrefix(strings.ToLower(resp.OverallIssue), "unconfirmed") {
-		resp.OverallIssue = "Unconfirmed (no metric check returned data): " + resp.OverallIssue
+		resp.OverallIssue = "Unconfirmed (" + strings.Join(reasons, "; ") + "): " + resp.OverallIssue
 	}
 }
 
@@ -921,8 +922,8 @@ func renderVerificationResults(b *strings.Builder, r *VerificationRound) {
 		return
 	}
 	b.WriteString("\n\n## Verification results (computed, read-only)")
-	for _, q := range r.Queries {
-		fmt.Fprintf(b, "\n\n- [%s/%s]", q.Source, q.Kind)
+	for i, q := range r.Queries {
+		fmt.Fprintf(b, "\n\n- [%d] [%s/%s]", i+1, q.Source, q.Kind)
 		if q.Why != "" {
 			fmt.Fprintf(b, " %s", q.Why)
 		}

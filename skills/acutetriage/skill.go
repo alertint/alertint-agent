@@ -166,6 +166,7 @@ type llmResponse struct {
 	// unparseable/invalid all collapse to the same "absent" record there, the
 	// deterministic backstop clamps instead of failing triage.
 	OperatorRuling json.RawMessage `json:"operator_ruling,omitempty"`
+	CauseCheck     *int            `json:"cause_check,omitempty"`
 }
 
 // modelRuling is the model's raw operator_ruling reply — shaped exactly like
@@ -415,9 +416,12 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 	// it passed nil — only this deterministic post-call cap sees verification).
 	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
-	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix) {
-		labelUnconfirmedCause(&resp)
-		s.logger.Info("acutetriage: cause unconfirmed: no metric check returned data", "incident", inc.ID)
+	if ver != nil {
+		ver.CauseCheck = resp.CauseCheck
+	}
+	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix, resp.CauseCheck) {
+		labelUnconfirmed(&resp, []string{"no check tested this cause"})
+		s.logger.Info("acutetriage: cause unconfirmed: no cited check tested this cause", "incident", inc.ID)
 	}
 
 	// enrichmentJSON is what a successful persist stores, including the

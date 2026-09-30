@@ -273,11 +273,43 @@ func TestUnconfirmedCauseLabelsStoredFindingWithoutChangingModelOutput(t *testin
 	if want := "Unconfirmed: Payment token failure"; summary != want {
 		t.Errorf("summary = %q, want %q", summary, want)
 	}
-	if want := "Unconfirmed (no metric check returned data): payment auth defect affecting gold-tier users"; f.rootCause != want {
+	if want := "Unconfirmed (no check tested this cause): payment auth defect affecting gold-tier users"; f.rootCause != want {
 		t.Errorf("root_cause = %q, want %q", f.rootCause, want)
 	}
 	if f.output != string(final) {
 		t.Errorf("output_json changed: got %q, want byte-identical %q", f.output, final)
+	}
+	if ver := verificationOf(t, f.enrichment); ver == nil || ver.CauseCheck != nil {
+		t.Fatalf("missing citation should stay absent in enrichment: %+v", ver)
+	}
+}
+
+func TestCitedFetchedCauseCheckPersistsWithoutLabel(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-service", map[string]string{"alertname": "ServiceErrors", "service": "api", "severity": "critical"})
+	var final map[string]any
+	if err := json.Unmarshal(callTwoResp(t, "Service errors", "upstream request failures", 0.68, ""), &final); err != nil {
+		t.Fatal(err)
+	}
+	final["cause_check"] = 3
+	finalRaw := mustJSON(t, final)
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "Service errors", "upstream request failures", 0.82, []map[string]any{{"kind": "promql", "expr": "service_errors_total", "why": "check errors"}})},
+		{raw: finalRaw},
+	}}
+	skill := acutetriage.New(verifyConfig(promHealthy(t)), st, scripted, nil, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatal(err)
+	}
+	f := readFinding(t, st, inc.ID)
+	if f.rootCause != "upstream request failures" || f.output != string(finalRaw) {
+		t.Fatalf("finding=%+v, want unqualified cause and exact model reply", f)
+	}
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || ver.CauseCheck == nil || *ver.CauseCheck != 3 {
+		t.Fatalf("citation not persisted: %+v", ver)
 	}
 }
 

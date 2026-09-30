@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A triage cause stays unconfirmed unless the model cites one fetched check
+  that tested it; the cited result is stored with verification evidence.
 - Metric evidence compares selector series with values 15 minutes earlier,
   ranks changed series first, and caps histogram count and sum together.
 - Findings with no fetched model or operator metric checks identify their cause
