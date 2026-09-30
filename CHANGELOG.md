@@ -35,8 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only when the same text uses "only" or "exclusively"; no comparison sample
   means no affected-group check. The log summary does not imply exclusivity
   from zero matches.
-- PromQL checks that only repeat alert-rule metrics with a matching member-alert
-  label no longer confirm a cause; label mapping is respected.
+- PromQL checks that only repeat alert-rule metrics on the alert's own labels
+  no longer confirm a cause; label mapping is respected.
 - Loki comparison queries request 20 entries before deduplication and retain
   up to 10 unique lines, preserving samples when streams duplicate entries.
 - Duplicate Loki entries with the same timestamp and text count once in evidence.

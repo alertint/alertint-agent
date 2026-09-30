@@ -145,6 +145,7 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 		return false
 	}
 	ruleMetrics := make(map[string]bool)
+	rulePairs := make(map[string]bool)
 	for _, rule := range metrics.RuleExprs {
 		expr, err := parser.NewParser(parser.Options{}).ParseExpr(rule)
 		if err != nil {
@@ -154,6 +155,11 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 			if sel, ok := node.(*parser.VectorSelector); ok {
 				if name := vectorMetricName(sel); name != "" {
 					ruleMetrics[name] = true
+				}
+				for _, matcher := range sel.LabelMatchers {
+					if matcher.Name != "__name__" && matcher.Type == labels.MatchEqual {
+						rulePairs[matcher.Name+"\x00"+matcher.Value] = true
+					}
 				}
 			}
 			return nil
@@ -174,7 +180,7 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 			}
 		}
 	}
-	allInRule, hasMetric, ownLabel := true, false, false
+	allInRule, allMatchersInScope, hasMetric, ownLabel := true, true, false, false
 	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
 		if sel, ok := node.(*parser.VectorSelector); ok {
 			hasMetric = true
@@ -183,14 +189,22 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 				allInRule = false
 			}
 			for _, matcher := range sel.LabelMatchers {
-				if matcher.Name != "__name__" && matcher.Type == labels.MatchEqual && pairs[matcher.Name+"\x00"+matcher.Value] {
+				if matcher.Name == "__name__" {
+					continue
+				}
+				pair := matcher.Name + "\x00" + matcher.Value
+				if matcher.Type != labels.MatchEqual {
+					allMatchersInScope = false
+				} else if pairs[pair] {
 					ownLabel = true
+				} else if !rulePairs[pair] {
+					allMatchersInScope = false
 				}
 			}
 		}
 		return nil
 	})
-	return hasMetric && allInRule && ownLabel
+	return hasMetric && allInRule && allMatchersInScope && ownLabel
 }
 
 // vectorMetricName also accepts PromQL's exact metric-name selector form.

@@ -849,6 +849,14 @@ func TestCauseUnconfirmed_AlertSignalIsNotCause(t *testing.T) {
 		want                bool
 	}{
 		{"own signal", `service:span_error_ratio:5m{service_name="payment"} > 0.05`, "payment", []string{rule}, true},
+		{"own signal with shared cluster", `service:span_error_ratio:5m{service_name="payment",cluster="alertint-lab"} > 0.05`, "payment", []string{rule}, true},
+		{"own signal with rule matcher", `rate(traces_span_metrics_calls_total{service_name="payment",span_kind="SPAN_KIND_SERVER"}[5m])`, "payment", []string{rule}, true},
+		{"other service with shared cluster", `service:span_error_ratio:5m{service_name="payment",cluster="alertint-lab"}`, "checkout", []string{rule}, false},
+		{"client span cause check", `sum(rate(traces_span_metrics_calls_total{service_name="checkout",span_kind="SPAN_KIND_CLIENT",span_name="oteldemo.PaymentService/Charge",status_code="STATUS_CODE_ERROR"}[5m]))`, "checkout", []string{rule}, false},
+		{"unrelated label", `service:span_error_ratio:5m{service_name="payment",zone="east"}`, "payment", []string{rule}, false},
+		{"regex with own label", `service:span_error_ratio:5m{service_name="payment",cluster=~"alertint-lab"}`, "payment", []string{rule}, false},
+		{"inequality with own label", `service:span_error_ratio:5m{service_name="payment",cluster!="other"}`, "payment", []string{rule}, false},
+		{"rule matcher without alert label", `rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])`, "payment", []string{rule}, false},
 		{"explicit metric name in query", `{__name__="service:span_error_ratio:5m",service_name="payment"} > 0.05`, "payment", []string{rule}, true},
 		{"explicit metric name in rule", `service:span_error_ratio:5m{service_name="payment"}`, "payment", []string{`{__name__="service:span_error_ratio:5m"} > 0.05`}, true},
 		{"explicit other metric", `{__name__="token_errors_total",service_name="payment"}`, "payment", []string{rule}, false},
@@ -865,7 +873,10 @@ func TestCauseUnconfirmed_AlertSignalIsNotCause(t *testing.T) {
 		{"unnamed selector", `{service_name="payment"}`, "payment", []string{rule}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			labels := map[string]string{"service": tc.service, "service_name": tc.service}
+			labels := map[string]string{
+				"alertname": "ServiceErrorRatio", "cluster": "alertint-lab", "environment": "lab",
+				"service": tc.service, "service_name": tc.service, "severity": "critical", "team": "shop",
+			}
 			if tc.name == "translated label" {
 				delete(labels, "service_name")
 			}
