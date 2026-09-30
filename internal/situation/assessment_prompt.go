@@ -209,8 +209,7 @@ Ground every claim stronger than "unknown" in the snapshot's own evidence.
 If prior_assessment is present, preserve each prior semantic value unless a
 current fact contradicts it or the value is no longer allowed.
 impact "confirmed" and causality "supported" require a sufficient_reason from
-eligible_reasons. When eligible_reasons is empty, do not use them, even if
-prior_assessment did.
+eligible_reasons. When eligible_reasons is empty, impact must not be "confirmed" and causality must not be "supported", even if prior_assessment used them.
 Do not oscillate between equivalent values on unchanged evidence.
 Never claim urgent attention unless the snapshot proves a deterministic
 urgent anchor. Never present mere temporal overlap as a supported cause.`
