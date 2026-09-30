@@ -165,7 +165,7 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	var contrastNote string
 	contrastSource, canContrast := src.(logs.ContrastSource)
 	if fetched.Filtered && canContrast {
-		sample, contrastErr := contrastSource.FetchContrast(ctx, sel, start, end, 10)
+		sample, contrastErr := contrastSource.FetchContrast(ctx, sel, start, end, 20)
 		if contrastErr != nil {
 			contrastNote = "comparison sample unavailable: " + contrastErr.Error()
 		} else {

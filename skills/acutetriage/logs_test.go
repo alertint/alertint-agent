@@ -6,12 +6,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/logs"
+	"github.com/alertint/alertint-agent/internal/logs/loki"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -71,7 +76,7 @@ func TestFetchLogs_ContrastOnlyAfterFilteredLines(t *testing.T) {
 			if src.contrastCalls != tc.want {
 				t.Fatalf("contrast calls = %d, want %d", src.contrastCalls, tc.want)
 			}
-			if tc.want == 1 && (src.contrastLimit != 10 || !src.contrastDeadline.Equal(src.deadline) || len(e.Contrast) != 10 || len([]rune(e.Contrast[0].Line)) != logs.MaxLineChars) {
+			if tc.want == 1 && (src.contrastLimit != 20 || !src.contrastDeadline.Equal(src.deadline) || len(e.Contrast) != 10 || len([]rune(e.Contrast[0].Line)) != logs.MaxLineChars) {
 				t.Fatalf("contrast = %+v, limit %d, deadline %v/%v", e.Contrast, src.contrastLimit, src.contrastDeadline, src.deadline)
 			}
 		})
@@ -541,5 +546,54 @@ func TestFetchLogs_AttributeLimitPrefersFewerDistinctValuesThenKey(t *testing.T)
 	renderLogs(&b, e)
 	if !strings.Contains(b.String(), "one {a=red, b=red, c=red, d=red, e=red, f=red, g=red, z=red}") || strings.Contains(b.String(), "h=") || strings.Contains(b.String(), "i=") {
 		t.Fatal(b.String())
+	}
+}
+
+func TestFetchLogs_ContrastLimitBeforeDedup(t *testing.T) {
+	for _, duplicate := range []bool{true, false} {
+		t.Run(fmt.Sprintf("duplicates_%v", duplicate), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				result := []map[string]any{{"stream": map[string]string{"service": "api"}, "values": [][2]string{{"200", "ERROR request failed"}}}}
+				if strings.Contains(r.URL.Query().Get("query"), "!~") {
+					limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+					if err != nil {
+						t.Error(err)
+						w.WriteHeader(400)
+						return
+					}
+					n := limit
+					if duplicate {
+						n = limit / 2
+					}
+					entries := make([][2]string, 0, n)
+					for i := range n {
+						entries = append(entries, [2]string{strconv.Itoa(100 + i), "Transaction complete."})
+					}
+					result = []map[string]any{{"stream": map[string]string{"service": "api", "copy": "first"}, "values": entries}}
+					if duplicate {
+						result = append(result, map[string]any{"stream": map[string]string{"service": "api", "copy": "second"}, "values": entries})
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(map[string]any{"status": "success", "data": map[string]any{"resultType": "streams", "result": result}}); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer srv.Close()
+			src := loki.NewClient(loki.Config{BaseURL: srv.URL, LineFilter: `|~ "(?i)(error|warn|fatal|panic|fail)"`})
+			e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+			if len(e.Contrast) != 10 {
+				t.Fatalf("want 10 unique comparison lines, got %d", len(e.Contrast))
+			}
+			newest := int64(119)
+			if duplicate {
+				newest = 109
+			}
+			for i, line := range e.Contrast {
+				if line.Timestamp.UnixNano() != newest-int64(i) {
+					t.Fatalf("comparison order/uniqueness changed at %d: %+v", i, line)
+				}
+			}
+		})
 	}
 }
