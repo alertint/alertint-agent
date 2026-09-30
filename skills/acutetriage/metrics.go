@@ -194,10 +194,12 @@ func memberLabelPairs(alerts []store.Alert) map[string]bool {
 // __name__) — renamed from the old instance-only Instance field, since scope is
 // no longer instance-only (Outstanding Q3).
 type MetricSnapshot struct {
-	Series   string `json:"series"`
-	Metric   string `json:"metric"`
-	Value    string `json:"value"`
-	Baseline string `json:"baseline,omitempty"`
+	Series        string `json:"series"`
+	Metric        string `json:"metric"`
+	Value         string `json:"value"`
+	Baseline      string `json:"baseline,omitempty"`
+	Increase      string `json:"increase,omitempty"`
+	PriorIncrease string `json:"prior_increase,omitempty"`
 }
 
 // rankSeries parses a Prometheus instant-vector data blob (the "data" field of
@@ -209,7 +211,7 @@ type MetricSnapshot struct {
 // that a member alert also carries.
 //
 //nolint:unparam,gocyclo // bounded ranking keeps filtering, overlap, baseline change, and family cap together; limit is also exercised by unit tests.
-func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int, baseline map[string]string) []MetricSnapshot {
+func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int, baseline, prior map[string]string) []MetricSnapshot {
 	var d struct {
 		Result []struct {
 			Metric map[string]string `json:"metric"`
@@ -261,6 +263,25 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int, bas
 				snap.Baseline = before
 				if b, parseErr := strconv.ParseFloat(before, 64); parseErr == nil && numericErr && !math.IsNaN(f) && !math.IsNaN(b) && !math.IsInf(f, 0) && !math.IsInf(b, 0) {
 					change = math.Abs(f-b) / math.Max(math.Abs(b), 1e-9)
+					if strings.HasSuffix(name, "_total") || strings.HasSuffix(name, "_count") || strings.HasSuffix(name, "_sum") {
+						if p, err := strconv.ParseFloat(prior[name+"\x00"+snap.Series], 64); err == nil && !math.IsNaN(p) && !math.IsInf(p, 0) {
+							nowDelta, prevDelta := f-b, b-p
+							if nowDelta < 0 {
+								nowDelta = f
+							}
+							if prevDelta < 0 {
+								prevDelta = b
+							}
+							snap.Increase = strconv.FormatFloat(nowDelta, 'g', -1, 64)
+							snap.PriorIncrease = strconv.FormatFloat(prevDelta, 'g', -1, 64)
+							change = 0
+							if prevDelta > 0 {
+								change = math.Abs(nowDelta-prevDelta) / prevDelta
+							} else if nowDelta > 0 {
+								change = math.Inf(1)
+							}
+						}
+					}
 				}
 			}
 		}
@@ -530,7 +551,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		result.Result = joined
 		filtered, err := json.Marshal(result)
 		if err == nil {
-			snapshots = append(snapshots, rankSeries(filtered, memberPairs, maxSnapshotsPerScope, nil)...)
+			snapshots = append(snapshots, rankSeries(filtered, memberPairs, maxSnapshotsPerScope, nil, nil)...)
 		}
 	}
 	labelMap := make(map[string]string)
@@ -589,18 +610,22 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	if len(scopes) > 0 {
 		perScope = time.Duration(params.TimeoutSeconds) * time.Second / time.Duration(len(scopes))
 	}
-	queryScope := func(scope string) (json.RawMessage, map[string]string, error) {
+	queryScope := func(scope string) (json.RawMessage, map[string]string, map[string]string, error) {
 		scopeCtx, scopeCancel := context.WithTimeout(fetchCtx, perScope)
 		defer scopeCancel()
 		data, err := prom.QueryInstant(scopeCtx, scope, t, params.MaxSeries)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		before, err := prom.QueryInstant(scopeCtx, scope, t.Add(-15*time.Minute), params.MaxSeries)
 		if err != nil {
-			return data, nil, nil
+			return data, nil, nil, nil
 		}
-		return data, metricBaseline(before), nil
+		prior, err := prom.QueryInstant(scopeCtx, scope, t.Add(-30*time.Minute), params.MaxSeries)
+		if err != nil {
+			return data, metricBaseline(before), nil, nil
+		}
+		return data, metricBaseline(before), metricBaseline(prior), nil
 	}
 
 	// Track the two failure kinds apart: a per-scope deadline (backend reachable
@@ -619,21 +644,21 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			"selector", scope, "err", err, "incident", incidentID)
 	}
 	for i, scope := range scopes {
-		data, baseline, err := queryScope(scope)
+		data, baseline, prior, err := queryScope(scope)
 		if err != nil {
 			classify(scope, err)
 			continue
 		}
-		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope, baseline)
+		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope, baseline, prior)
 		// R9 physical-core rescue — primary scope only, when no usable series
 		// remain (including when only alert bookkeeping series matched) and
 		// dropping the logical keys yields a distinct selector.
 		if i == 0 && scope == primary && len(ranked) == 0 && physicalFallback != "" && physicalFallback != primary {
-			data2, baseline2, err2 := queryScope(physicalFallback)
+			data2, baseline2, prior2, err2 := queryScope(physicalFallback)
 			if err2 != nil {
 				classify(physicalFallback, err2)
 			} else {
-				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope, baseline2)
+				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope, baseline2, prior2)
 			}
 		}
 		snapshots = append(snapshots, ranked...)

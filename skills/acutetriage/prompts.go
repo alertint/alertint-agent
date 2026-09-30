@@ -404,7 +404,9 @@ func renderMetrics(b *strings.Builder, m *MetricEnrichment) {
 		b.WriteString("\n\nLive metrics (Prometheus, at incident time):")
 		for _, s := range m.Snapshots {
 			fmt.Fprintf(b, "\n  %s%s = %s", s.Metric, s.Series, s.Value)
-			if s.Baseline != "" {
+			if s.Increase != "" && s.PriorIncrease != "" {
+				fmt.Fprintf(b, " (+%s in last 15m, +%s in prior 15m)", s.Increase, s.PriorIncrease)
+			} else if s.Baseline != "" {
 				fmt.Fprintf(b, " (15m earlier: %s)", s.Baseline)
 			}
 		}
