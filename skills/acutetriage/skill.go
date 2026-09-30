@@ -431,7 +431,8 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 		s.logger.Info("acutetriage: cause unconfirmed: no cited check tested this cause", "incident", inc.ID)
 	}
 	if ar.logs != nil && len(ar.logs.Contrast) > 0 {
-		claim := strings.Join(append([]string{resp.AnalysisName, resp.OverallIssue}, resp.CorrelationFindings...), " ")
+		claims := append([]string{resp.AnalysisName, resp.OverallIssue}, resp.CorrelationFindings...)
+		exclusive := regexp.MustCompile(`(?i)\b(?:only|exclusively)\b`)
 		for _, token := range inconclusiveTokens(ar.logs.Lines, ar.logs.Contrast) {
 			key, value, _ := strings.Cut(token, "=")
 			if len(value) < 3 {
@@ -441,8 +442,12 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 				continue
 			}
 			pattern := `(?i)(^|[^[:alnum:]_])` + regexp.QuoteMeta(value) + `($|[^[:alnum:]_])`
-			if regexp.MustCompile(pattern).MatchString(claim) {
-				reasons = append(reasons, "affected group not shown: comparison logs lack `"+key+"`")
+			valueMentioned := regexp.MustCompile(pattern)
+			for _, claim := range claims {
+				if valueMentioned.MatchString(claim) && exclusive.MatchString(claim) {
+					reasons = append(reasons, "affected group not shown: comparison logs lack `"+key+"`")
+					break
+				}
 			}
 		}
 	}
