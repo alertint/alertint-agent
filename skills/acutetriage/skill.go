@@ -430,7 +430,7 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 		reasons = append(reasons, "no check tested this cause")
 		s.logger.Info("acutetriage: cause unconfirmed: no cited check tested this cause", "incident", inc.ID)
 	}
-	if ar.logs != nil {
+	if ar.logs != nil && len(ar.logs.Contrast) > 0 {
 		claim := strings.Join(append([]string{resp.AnalysisName, resp.OverallIssue}, resp.CorrelationFindings...), " ")
 		for _, token := range inconclusiveTokens(ar.logs.Lines, ar.logs.Contrast) {
 			key, value, _ := strings.Cut(token, "=")

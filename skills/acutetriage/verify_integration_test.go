@@ -337,17 +337,42 @@ func TestCauseCheckShapesKeepCallTwoFinding(t *testing.T) {
 	}
 }
 
-type fixedComparisonLogs struct{ token string }
+type fixedComparisonLogs struct {
+	token      string
+	noContrast bool
+}
 
 func (fixedComparisonLogs) Name() string { return "loki" }
 func (f fixedComparisonLogs) FetchRecent(context.Context, logs.Selector, time.Time, time.Time, int) (logs.Fetched, error) {
-	return logs.Fetched{Filtered: true, Lines: []logs.Line{{Line: "request failed " + f.token}, {Line: "request failed " + f.token}}}, nil
+	return logs.Fetched{Filtered: !f.noContrast, Lines: []logs.Line{{Line: "request failed " + f.token}, {Line: "request failed " + f.token}}}, nil
 }
 func (fixedComparisonLogs) FetchContrast(context.Context, logs.Selector, time.Time, time.Time, int) (logs.Fetched, error) {
 	return logs.Fetched{Lines: []logs.Line{{Line: "request completed"}}}, nil
 }
 func (fixedComparisonLogs) QueryRange(context.Context, string, time.Time, time.Time, int, string) (json.RawMessage, error) {
 	return nil, nil
+}
+
+func TestNoComparisonSampleDoesNotFlagAffectedGroup(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-no-comparison", map[string]string{"alertname": "ServiceErrors", "service": "api", "severity": "critical"})
+	final := callTwoResp(t, "API errors", "api service failed", 0.68, "")
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "API errors", "draft cause", 0.82, nil)},
+		{raw: final},
+	}}
+	cfg := verifyConfig(promHealthy(t))
+	cfg.LogSource = fixedComparisonLogs{token: "service=api", noContrast: true}
+	cfg.LogParams = acutetriage.LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}
+	if err := acutetriage.New(cfg, st, scripted, nil, nil, nil).Run(ctx, inc); err != nil {
+		t.Fatal(err)
+	}
+	f := readFinding(t, st, inc.ID)
+	if want := "Unconfirmed (no check tested this cause): api service failed"; f.rootCause != want || f.output != string(final) {
+		t.Fatalf("finding=%+v, want %q and exact call-2 reply", f, want)
+	}
 }
 
 func TestInconclusiveGroupClaimGetsStoredReason(t *testing.T) {
