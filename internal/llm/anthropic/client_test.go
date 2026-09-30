@@ -155,6 +155,39 @@ func TestDefaultModelAndThinkingDisabled(t *testing.T) {
 	}
 }
 
+func TestThinkingModeForSonnet55(t *testing.T) {
+	for _, tc := range []struct{ model, mode string }{
+		{"claude-sonnet-5-5", "between_tools"},
+		{"claude-sonnet-5", "disabled"},
+		{"claude-haiku-4-5", "disabled"},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Thinking struct {
+						Type string `json:"type"`
+					} `json:"thinking"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body.Thinking.Type != tc.mode {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"unsupported thinking type"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, responseBody(`{"analysis_name":"t"}`, 1, 1))
+			}))
+			defer srv.Close()
+			c := anthropic.NewWithHTTPClient(anthropic.Config{APIKey: "k", Model: tc.model}, nil, nil, srv.URL)
+			if _, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name"}); err != nil {
+				t.Fatalf("model %s must accept the no-up-front-thinking request: %v", tc.model, err)
+			}
+		})
+	}
+}
+
 // TestDefaultModelIsCurrentSonnet pins the default triage model: Sonnet for
 // first-finding quality, with Haiku as the documented config opt-in.
 func TestDefaultModelIsCurrentSonnet(t *testing.T) {

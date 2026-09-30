@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Sonnet 5.5 requests use its supported `between_tools` mode to disable
+  up-front thinking; earlier models retain `disabled`.
 - Verification results label explicit rates per second and increases over their
   query window; the model is instructed not to report rates as percentages.
 - Cause checks include the referenced and nested Prometheus recording-rule
