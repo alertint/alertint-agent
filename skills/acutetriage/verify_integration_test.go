@@ -285,32 +285,55 @@ func TestUnconfirmedCauseLabelsStoredFindingWithoutChangingModelOutput(t *testin
 	}
 }
 
-func TestCitedFetchedCauseCheckPersistsWithoutLabel(t *testing.T) {
-	ctx := context.Background()
-	st := newTestStore(t)
-	inc := insertTestIncident(t, st, ctx)
-	insertTestAlert(t, st, ctx, inc.ID, "fp-service", map[string]string{"alertname": "ServiceErrors", "service": "api", "severity": "critical"})
-	var final map[string]any
-	if err := json.Unmarshal(callTwoResp(t, "Service errors", "upstream request failures", 0.68, ""), &final); err != nil {
-		t.Fatal(err)
-	}
-	final["cause_check"] = 3
-	finalRaw := mustJSON(t, final)
-	scripted := &scriptedLLM{responses: []scriptResp{
-		{raw: draftResp(t, "Service errors", "upstream request failures", 0.82, []map[string]any{{"kind": "promql", "expr": "service_errors_total", "why": "check errors"}})},
-		{raw: finalRaw},
-	}}
-	skill := acutetriage.New(verifyConfig(promHealthy(t)), st, scripted, nil, nil, nil)
-	if err := skill.Run(ctx, inc); err != nil {
-		t.Fatal(err)
-	}
-	f := readFinding(t, st, inc.ID)
-	if f.rootCause != "upstream request failures" || f.output != string(finalRaw) {
-		t.Fatalf("finding=%+v, want unqualified cause and exact model reply", f)
-	}
-	ver := verificationOf(t, f.enrichment)
-	if ver == nil || ver.CauseCheck == nil || *ver.CauseCheck != 3 {
-		t.Fatalf("citation not persisted: %+v", ver)
+func TestCauseCheckShapesKeepCallTwoFinding(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		cited       bool
+	}{
+		{name: "number", value: `3`, cited: true},
+		{name: "numeric string", value: `"3"`, cited: true},
+		{name: "bracketed string", value: `"[3]"`, cited: true},
+		{name: "invalid string", value: `"abc"`},
+		{name: "fraction", value: `3.5`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := newTestStore(t)
+			inc := insertTestIncident(t, st, ctx)
+			insertTestAlert(t, st, ctx, inc.ID, "fp-service", map[string]string{"alertname": "ServiceErrors", "service": "api", "severity": "critical"})
+			var final map[string]any
+			if err := json.Unmarshal(callTwoResp(t, "Service errors", "upstream request failures", 0.68, ""), &final); err != nil {
+				t.Fatal(err)
+			}
+			final["cause_check"] = json.RawMessage(tc.value)
+			finalRaw := mustJSON(t, final)
+			scripted := &scriptedLLM{responses: []scriptResp{
+				{raw: draftResp(t, "Service errors", "draft cause", 0.82, []map[string]any{{"kind": "promql", "expr": "service_errors_total", "why": "check errors"}})},
+				{raw: finalRaw},
+			}}
+			skill := acutetriage.New(verifyConfig(promHealthy(t)), st, scripted, nil, nil, nil)
+			if err := skill.Run(ctx, inc); err != nil {
+				t.Fatal(err)
+			}
+			f := readFinding(t, st, inc.ID)
+			want := "upstream request failures"
+			if !tc.cited {
+				want = "Unconfirmed (no check tested this cause): " + want
+			}
+			if f.rootCause != want || f.output != string(finalRaw) {
+				t.Fatalf("finding=%+v, want %q and exact call-2 reply", f, want)
+			}
+			ver := verificationOf(t, f.enrichment)
+			if ver == nil || ver.Outcome != "revised" {
+				t.Fatalf("call-2 outcome not retained: %+v", ver)
+			}
+			if tc.cited && (ver.CauseCheck == nil || *ver.CauseCheck != 3) {
+				t.Fatalf("citation not persisted: %+v", ver)
+			}
+			if !tc.cited && ver.CauseCheck != nil {
+				t.Fatalf("invalid citation should be absent: %+v", ver)
+			}
+		})
 	}
 }
 

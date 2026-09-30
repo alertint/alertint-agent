@@ -169,7 +169,9 @@ type llmResponse struct {
 	// unparseable/invalid all collapse to the same "absent" record there, the
 	// deterministic backstop clamps instead of failing triage.
 	OperatorRuling json.RawMessage `json:"operator_ruling,omitempty"`
-	CauseCheck     *int            `json:"cause_check,omitempty"`
+	// CauseCheck is soft-required like OperatorRuling: a wrong JSON shape must
+	// not discard the entire re-judged answer.
+	CauseCheck json.RawMessage `json:"cause_check,omitempty"`
 }
 
 // modelRuling is the model's raw operator_ruling reply — shaped exactly like
@@ -419,11 +421,12 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 	// it passed nil — only this deterministic post-call cap sees verification).
 	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
+	causeCheck := parseCauseCheck(resp.CauseCheck)
 	if ver != nil {
-		ver.CauseCheck = resp.CauseCheck
+		ver.CauseCheck = causeCheck
 	}
 	var reasons []string
-	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix, resp.CauseCheck) {
+	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix, causeCheck) {
 		reasons = append(reasons, "no check tested this cause")
 		s.logger.Info("acutetriage: cause unconfirmed: no cited check tested this cause", "incident", inc.ID)
 	}

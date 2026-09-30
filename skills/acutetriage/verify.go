@@ -98,6 +98,30 @@ type VerificationEnrichment struct {
 	DegradationReason string `json:"degradation_reason,omitempty"`
 }
 
+// parseCauseCheck accepts an index or the model's common string renderings of
+// the prompt's [n] notation. Invalid shapes are treated as an absent citation.
+func parseCauseCheck(raw json.RawMessage) *int {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var n int
+	if json.Unmarshal(raw, &n) == nil && n >= 0 {
+		return &n
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return nil
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		s = s[1 : len(s)-1]
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || s != strconv.Itoa(n) {
+		return nil
+	}
+	return &n
+}
+
 // causeUnconfirmed checks call 2's cited result in the round it saw.
 func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCheck *int) bool {
 	if ver == nil || !hasMetricSource {
