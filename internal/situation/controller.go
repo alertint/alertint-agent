@@ -1401,11 +1401,13 @@ func buildAuthoritativeAttempt(situationID string, result AssessmentResult, call
 func buildOutcomeAttempt(situationID, callID string, inputVersion, retryEpoch, workAttempt, sequence int, vr *ValidationResult, transportErr error, started model.ProviderRequestStarted, duration time.Duration, now time.Time) AssessmentAttempt {
 	status := "failed"
 	var proposalJSON, validationErrorsJSON json.RawMessage
-	if vr != nil {
-		status = "rejected"
-		if b, err := json.Marshal(vr.Proposal); err == nil {
+	if vr != nil && vr.RejectedProposal != nil {
+		if b, err := json.Marshal(vr.RejectedProposal); err == nil {
 			proposalJSON = b
 		}
+	}
+	if vr != nil {
+		status = "rejected"
 		if errs, err := json.Marshal(outcomeErrorCodes(vr.Errors)); err == nil {
 			validationErrorsJSON = errs
 		}
