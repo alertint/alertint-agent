@@ -249,6 +249,7 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 	b.WriteString("\n\n## Your draft verdict (your own prior output)\n")
 	b.Write(draftRaw)
 	renderVerificationResults(&b, round)
+	b.WriteString("\nPrometheus warnings and infos can limit a check’s meaning or completeness; account for them before using its value as proof.")
 	b.WriteString("\nValues marked [per second] are rates, not fractions; never present them as percentages.")
 	b.WriteString("\n\nThese results are computed facts: they outrank the draft, the evidence " +
 		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +

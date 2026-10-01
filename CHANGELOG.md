@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Prometheus verification evidence preserves bounded backend warnings and infos,
+  including on empty results and during replay.
+
 - Pack-selected triage prompts retain the change-evidence warning: an empty
   change history does not prove nothing changed.
 - PromQL verification results show values before labels so long series identities

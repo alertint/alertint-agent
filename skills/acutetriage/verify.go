@@ -69,8 +69,9 @@ type VerificationQuery struct {
 	Expr                 string         `json:"expr,omitempty"`
 	Params               map[string]any `json:"params,omitempty"`
 	Why                  string         `json:"why,omitempty"`
-	Outcome              Outcome        `json:"outcome,omitempty"` // fetched|empty|degraded|failed (evidence.go)
-	Result               string         `json:"result,omitempty"`  // rendered text, byte-identical to prompt (R8)
+	Outcome              Outcome        `json:"outcome,omitempty"`     // fetched|empty|degraded|failed (evidence.go)
+	Result               string         `json:"result,omitempty"`      // rendered text, byte-identical to prompt (R8)
+	Annotations          []string       `json:"annotations,omitempty"` // bounded, execution-owned backend notes
 	RequestAttempts      int            `json:"request_attempts,omitempty"`
 	RequestAttemptsKnown bool           `json:"request_attempts_known,omitempty"`
 }
@@ -353,11 +354,11 @@ func (p *verificationPlan) UnmarshalJSON(data []byte) error {
 // Prometheus-less install can't run it, and an always-failing query would
 // trigger the R15 clamp every re-judge (belt-and-suspenders on top of the
 // prompt no longer offering the kind, ADR-0034); every surviving query is
-// force-labeled Source: "model" and stripped of the two execution-owned
+// force-labeled Source: "model" and stripped of execution-owned
 // fields (see below); the list is capped at params.MaxQueries with the drop
 // count logged (no silent caps, R3).
 //
-// Outcome and Result are execution-owned: only this codebase's own executors
+// Outcome, Result, and Annotations are execution-owned: only this codebase's own executors
 // (runOneQuery, the Zabbix verifier, markInvalid, the snapshot executor) may
 // ever set them. They carry JSON tags because a round is persisted verbatim
 // (R8/R10) — which means a model's draft JSON can name them too, and
@@ -368,7 +369,7 @@ func (p *verificationPlan) UnmarshalJSON(data []byte) error {
 // Prometheus yet still fires the invalid-query caveat and the R15 clamp; and a
 // model-supplied Result is rendered verbatim by renderVerificationResults into
 // call 2's "computed, read-only" section, turning call 1's output into call
-// 2's prompt. Both are therefore reset to their zero value on every surviving
+// 2's prompt. All are therefore reset to their zero value on every surviving
 // query. Kind, Expr, Params, and Why stay model-controlled by design.
 func parseVerificationPlan(raw json.RawMessage, params VerificationParams, logger *slog.Logger, incidentID string) []VerificationQuery {
 	if logger == nil {
@@ -406,6 +407,7 @@ func parseVerificationPlan(raw json.RawMessage, params VerificationParams, logge
 		// Execution-owned, never model-supplied — see the doc comment above.
 		q.Outcome = ""
 		q.Result = ""
+		q.Annotations = nil
 		filtered = append(filtered, q)
 	}
 
@@ -703,11 +705,18 @@ func markInvalid(q *VerificationQuery) {
 	q.Result = "invalid query (not executed)"
 }
 
+// annotatedMetricQuerier is optional so existing query providers keep their
+// data-only contract. It does not add a second request.
+type annotatedMetricQuerier interface {
+	QueryInstantWithAnnotations(context.Context, string, time.Time, int) (*promclient.QueryResult, error)
+}
+
 // runPromQL executes one model-proposed promql query, server-side bounded by
 // maxSeries (prometheus.max_series — R3). Rendered as series-identity/value
 // pairs, capped at maxSnapshotsPerScope lines (mirrors the metric-enrichment
 // render cap).
 func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, maxSeries int, now time.Time, logger *slog.Logger, incidentID string) {
+	q.Annotations = nil
 	if prom == nil {
 		q.Outcome = OutcomeFailed
 		q.Result = renderUnavailable("prometheus not configured")
@@ -719,7 +728,32 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 		markInvalid(q)
 		return
 	}
-	data, err := prom.QueryInstant(ctx, q.Expr, now, maxSeries)
+	var data json.RawMessage
+	var err error
+	if annotated, ok := prom.(annotatedMetricQuerier); ok {
+		var result *promclient.QueryResult
+		result, err = annotated.QueryInstantWithAnnotations(ctx, q.Expr, now, maxSeries)
+		if err == nil {
+			data = result.Data
+			// At most two notes of each class, 200 runes per note. Persist the exact
+			// flattened text shown to the model, separately from the value cap.
+			for _, group := range []struct {
+				prefix string
+				notes  []string
+			}{
+				{"Prometheus warning: ", result.Warnings}, {"Prometheus info: ", result.Infos},
+			} {
+				for i, note := range group.notes {
+					if i == 2 {
+						break
+					}
+					q.Annotations = append(q.Annotations, capText(group.prefix+flattenRecalled(note), 199))
+				}
+			}
+		}
+	} else {
+		data, err = prom.QueryInstant(ctx, q.Expr, now, maxSeries)
+	}
 	if err != nil {
 		logger.Warn("acutetriage: verify: model promql query failed", "expr", q.Expr, "err", err, "incident", incidentID)
 		classifyErr(q, err)
@@ -1087,6 +1121,9 @@ func renderVerificationResults(b *strings.Builder, r *VerificationRound) {
 			fmt.Fprintf(b, " %s", q.Why)
 		}
 		fmt.Fprintf(b, "\n  %s", q.Result)
+		for _, annotation := range q.Annotations {
+			fmt.Fprintf(b, "\n  %s", annotation)
+		}
 	}
 }
 
@@ -1131,11 +1168,13 @@ func (e *snapshotExecutor) execute(_ context.Context, q *VerificationQuery) {
 	if f, ok := e.byKey[snapshotKey(*q)]; ok {
 		q.Outcome = f.Outcome
 		q.Result = f.Result
+		q.Annotations = append([]string(nil), f.Annotations...)
 		e.matched++
 		return
 	}
 	q.Outcome = OutcomeEmpty
 	q.Result = "no data (replay)"
+	q.Annotations = nil
 	e.missed++
 }
 
