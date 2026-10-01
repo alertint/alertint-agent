@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
@@ -166,6 +169,9 @@ type llmResponse struct {
 	// unparseable/invalid all collapse to the same "absent" record there, the
 	// deterministic backstop clamps instead of failing triage.
 	OperatorRuling json.RawMessage `json:"operator_ruling,omitempty"`
+	// CauseCheck is soft-required like OperatorRuling: a wrong JSON shape must
+	// not discard the entire re-judged answer.
+	CauseCheck json.RawMessage `json:"cause_check,omitempty"`
 }
 
 // modelRuling is the model's raw operator_ruling reply — shaped exactly like
@@ -415,6 +421,39 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 	// it passed nil — only this deterministic post-call cap sees verification).
 	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
+	causeCheck := parseCauseCheck(resp.CauseCheck)
+	if ver != nil {
+		ver.CauseCheck = causeCheck
+	}
+	var reasons []string
+	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix, causeCheck, ar.metrics, alerts) {
+		reasons = append(reasons, "no check tested this cause")
+		s.logger.Info("acutetriage: cause unconfirmed: no cited check tested this cause", "incident", inc.ID)
+	}
+	if ar.logs != nil && len(ar.logs.Contrast) > 0 {
+		claims := append([]string{resp.AnalysisName, resp.OverallIssue}, resp.CorrelationFindings...)
+		exclusive := regexp.MustCompile(`(?i)\b(?:only|exclusively)\b`)
+		for _, token := range inconclusiveTokens(ar.logs.Lines, ar.logs.Contrast) {
+			key, value, _ := strings.Cut(token, "=")
+			if len(value) < 3 {
+				continue
+			}
+			if _, err := strconv.ParseFloat(value, 64); err == nil {
+				continue
+			}
+			pattern := `(?i)(^|[^[:alnum:]_])` + regexp.QuoteMeta(value) + `($|[^[:alnum:]_])`
+			valueMentioned := regexp.MustCompile(pattern)
+			for _, claim := range claims {
+				if valueMentioned.MatchString(claim) && exclusive.MatchString(claim) {
+					reasons = append(reasons, "affected group not shown: comparison logs lack `"+key+"`")
+					break
+				}
+			}
+		}
+	}
+	if len(reasons) > 0 {
+		labelUnconfirmed(&resp, reasons)
+	}
 
 	// enrichmentJSON is what a successful persist stores, including the
 	// log-enrichment snapshot so the evidence pack can replay exactly what the
@@ -766,6 +805,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		zbxSeed    map[string]zabbix.Topology
 		memory     *MemoryEnrichment
 	)
+	//nolint:nestif // Live-only rule URL lookup stays beside the other live enrichment reads.
 	if replay != nil {
 		// Frozen inputs (persist-as-rendered envelope): no live fetch, no
 		// reconcile/disposition/classifier — the sections replay exactly as the
@@ -781,7 +821,26 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		zbx = replay.frozen.Zabbix
 		memory = replay.frozen.Memory
 	} else {
-		metrics = FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
+		var exprs []string
+		if s.st != nil {
+			ids := make([]string, 0, len(alerts))
+			for _, alert := range alerts {
+				ids = append(ids, alert.ID)
+			}
+			urlsByAlert, err := s.st.GeneratorURLsForAlerts(ctx, ids)
+			if err != nil {
+				s.logger.Warn("acutetriage: metrics: read alert rule urls failed", "err", err, "incident", inc.ID)
+			} else {
+				urls := make([]string, 0, len(urlsByAlert))
+				for _, alert := range alerts {
+					if url := urlsByAlert[alert.ID]; url != "" {
+						urls = append(urls, url)
+					}
+				}
+				exprs = ruleExpressions(urls)
+			}
+		}
+		metrics = FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, exprs, alerts, spanStart, inc.ID, s.logger)
 		// Best-effort log enrichment: never blocks or fails triage. end=now so a
 		// still-firing incident captures the freshest lines around analysis time.
 		enrichment = FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
@@ -1046,6 +1105,16 @@ func (s *Skill) verifyParams() VerificationParams {
 func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, replay *replayRun) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
 	vp := s.verifyParams()
+	if ar.metrics != nil {
+		merged := make(map[string]string, len(ar.metrics.LabelMap)+len(vp.LabelMap))
+		for source, target := range ar.metrics.LabelMap {
+			merged[source] = target
+		}
+		for source, target := range vp.LabelMap {
+			merged[source] = target
+		}
+		vp.LabelMap = merged
+	}
 	floor := composeFloor(vp, s.cfg.ZabbixParams.HostLabel, alerts)
 	modelQ := parseVerificationPlan(ar.raw, vp, s.logger, inc.ID)
 	// One bounded batch repair of the model's own invalid PromQL, before

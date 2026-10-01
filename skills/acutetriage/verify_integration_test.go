@@ -17,6 +17,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/logs"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
@@ -242,6 +243,183 @@ func verifyConfig(prom *promclient.Client) acutetriage.Config {
 	}
 }
 
+func TestUnconfirmedCauseLabelsStoredFindingWithoutChangingModelOutput(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-payment", map[string]string{
+		"alertname": "ServiceErrorRateHigh", "service": "payment", "severity": "critical",
+	})
+
+	final := callTwoResp(t, "Payment token failure", "payment auth defect affecting gold-tier users", 0.68, "")
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "Payment token failure", "payment auth defect affecting gold-tier users", 0.82, []map[string]any{
+			{"kind": "promql", "expr": "payment_requests_total", "why": "check traffic"},
+			{"kind": "promql", "expr": "payment_error_rate", "why": "check failures"},
+			{"kind": "promql", "expr": "payment_token_failures_total", "why": "check tokens"},
+		})},
+		{raw: final},
+	}}
+	prom := promServer(t, func(string) (int, string) { return 200, vectorEmpty })
+	skill := acutetriage.New(verifyConfig(prom), st, scripted, nil, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	var summary string
+	if err := st.DB().QueryRowContext(ctx, `SELECT summary FROM incidents WHERE id = ?`, inc.ID).Scan(&summary); err != nil {
+		t.Fatalf("read summary: %v", err)
+	}
+	if want := "Unconfirmed: Payment token failure"; summary != want {
+		t.Errorf("summary = %q, want %q", summary, want)
+	}
+	if want := "Unconfirmed (no check tested this cause): payment auth defect affecting gold-tier users"; f.rootCause != want {
+		t.Errorf("root_cause = %q, want %q", f.rootCause, want)
+	}
+	if f.output != string(final) {
+		t.Errorf("output_json changed: got %q, want byte-identical %q", f.output, final)
+	}
+	if ver := verificationOf(t, f.enrichment); ver == nil || ver.CauseCheck != nil {
+		t.Fatalf("missing citation should stay absent in enrichment: %+v", ver)
+	}
+}
+
+func TestCauseCheckShapesKeepCallTwoFinding(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		cited       bool
+	}{
+		{name: "number", value: `3`, cited: true},
+		{name: "numeric string", value: `"3"`, cited: true},
+		{name: "bracketed string", value: `"[3]"`, cited: true},
+		{name: "invalid string", value: `"abc"`},
+		{name: "fraction", value: `3.5`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := newTestStore(t)
+			inc := insertTestIncident(t, st, ctx)
+			insertTestAlert(t, st, ctx, inc.ID, "fp-service", map[string]string{"alertname": "ServiceErrors", "service": "api", "severity": "critical"})
+			var final map[string]any
+			if err := json.Unmarshal(callTwoResp(t, "Service errors", "upstream request failures", 0.68, ""), &final); err != nil {
+				t.Fatal(err)
+			}
+			final["cause_check"] = json.RawMessage(tc.value)
+			finalRaw := mustJSON(t, final)
+			scripted := &scriptedLLM{responses: []scriptResp{
+				{raw: draftResp(t, "Service errors", "draft cause", 0.82, []map[string]any{{"kind": "promql", "expr": "service_errors_total", "why": "check errors"}})},
+				{raw: finalRaw},
+			}}
+			skill := acutetriage.New(verifyConfig(promHealthy(t)), st, scripted, nil, nil, nil)
+			if err := skill.Run(ctx, inc); err != nil {
+				t.Fatal(err)
+			}
+			f := readFinding(t, st, inc.ID)
+			want := "upstream request failures"
+			if !tc.cited {
+				want = "Unconfirmed (no check tested this cause): " + want
+			}
+			if f.rootCause != want || f.output != string(finalRaw) {
+				t.Fatalf("finding=%+v, want %q and exact call-2 reply", f, want)
+			}
+			ver := verificationOf(t, f.enrichment)
+			if ver == nil || ver.Outcome != "revised" {
+				t.Fatalf("call-2 outcome not retained: %+v", ver)
+			}
+			if tc.cited && (ver.CauseCheck == nil || *ver.CauseCheck != 3) {
+				t.Fatalf("citation not persisted: %+v", ver)
+			}
+			if !tc.cited && ver.CauseCheck != nil {
+				t.Fatalf("invalid citation should be absent: %+v", ver)
+			}
+		})
+	}
+}
+
+type fixedComparisonLogs struct {
+	token      string
+	noContrast bool
+}
+
+func (fixedComparisonLogs) Name() string { return "loki" }
+func (f fixedComparisonLogs) FetchRecent(context.Context, logs.Selector, time.Time, time.Time, int) (logs.Fetched, error) {
+	return logs.Fetched{Filtered: !f.noContrast, Lines: []logs.Line{{Line: "request failed " + f.token}, {Line: "request failed " + f.token}}}, nil
+}
+func (fixedComparisonLogs) FetchContrast(context.Context, logs.Selector, time.Time, time.Time, int) (logs.Fetched, error) {
+	return logs.Fetched{Lines: []logs.Line{{Line: "request completed"}}}, nil
+}
+func (fixedComparisonLogs) QueryRange(context.Context, string, time.Time, time.Time, int, string) (json.RawMessage, error) {
+	return nil, nil
+}
+
+func TestNoComparisonSampleDoesNotFlagAffectedGroup(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-no-comparison", map[string]string{"alertname": "ServiceErrors", "service": "api", "severity": "critical"})
+	final := callTwoResp(t, "API errors", "api service failed", 0.68, "")
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "API errors", "draft cause", 0.82, nil)},
+		{raw: final},
+	}}
+	cfg := verifyConfig(promHealthy(t))
+	cfg.LogSource = fixedComparisonLogs{token: "service=api", noContrast: true}
+	cfg.LogParams = acutetriage.LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}
+	if err := acutetriage.New(cfg, st, scripted, nil, nil, nil).Run(ctx, inc); err != nil {
+		t.Fatal(err)
+	}
+	f := readFinding(t, st, inc.ID)
+	if want := "Unconfirmed (no check tested this cause): api service failed"; f.rootCause != want || f.output != string(final) {
+		t.Fatalf("finding=%+v, want %q and exact call-2 reply", f, want)
+	}
+}
+
+func TestInconclusiveGroupClaimGetsStoredReason(t *testing.T) {
+	for _, tc := range []struct {
+		name, title, cause, token, want string
+		findings                        []string
+	}{
+		{name: "exclusive group claim", title: "Request errors", cause: "gold-tier users are exclusively affected", token: "customer_segment=gold", want: "Unconfirmed (no check tested this cause; affected group not shown: comparison logs lack `customer_segment`): gold-tier users are exclusively affected"},
+		{name: "hedged group claim", title: "Request errors", cause: "comparison inconclusive for gold-tier", token: "customer_segment=gold", want: "Unconfirmed (no check tested this cause): comparison inconclusive for gold-tier"},
+		{name: "only group claim", title: "Request errors", cause: "only alpha users affected", token: "customer_segment=alpha", want: "Unconfirmed (no check tested this cause; affected group not shown: comparison logs lack `customer_segment`): only alpha users affected"},
+		{name: "nonexclusive group claim", title: "Request errors", cause: "alpha-tier users failed requests", token: "customer_segment=alpha", want: "Unconfirmed (no check tested this cause): alpha-tier users failed requests"},
+		{name: "headline case insensitive", title: "Only ALPHA requests failing", cause: "request validation failed", token: "customer_segment=alpha", want: "Unconfirmed (no check tested this cause; affected group not shown: comparison logs lack `customer_segment`): request validation failed"},
+		{name: "correlation finding", title: "Request errors", cause: "request validation failed", token: "customer_segment=alpha", findings: []string{"Only ALPHA users affected"}, want: "Unconfirmed (no check tested this cause; affected group not shown: comparison logs lack `customer_segment`): request validation failed"},
+		{name: "different entries", title: "Only requests failing", cause: "alpha users affected", token: "customer_segment=alpha", want: "Unconfirmed (no check tested this cause): alpha users affected"},
+		{name: "qualifier inside another word", title: "Request errors", cause: "onlyness among alpha users", token: "customer_segment=alpha", want: "Unconfirmed (no check tested this cause): onlyness among alpha users"},
+		{name: "partial word", title: "Request errors", cause: "alphabet requests failed", token: "customer_segment=alpha", want: "Unconfirmed (no check tested this cause): alphabet requests failed"},
+		{name: "numeric value", title: "Request errors", cause: "123 users affected", token: "customer_segment=123", want: "Unconfirmed (no check tested this cause): 123 users affected"},
+		{name: "short value", title: "Request errors", cause: "ab users affected", token: "customer_segment=ab", want: "Unconfirmed (no check tested this cause): ab users affected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := newTestStore(t)
+			inc := insertTestIncident(t, st, ctx)
+			insertTestAlert(t, st, ctx, inc.ID, "fp-"+tc.name, map[string]string{"alertname": "ServiceErrors", "service": "api", "severity": "critical"})
+			var payload map[string]any
+			if err := json.Unmarshal(callTwoResp(t, tc.title, tc.cause, 0.68, ""), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if tc.findings != nil {
+				payload["correlation_findings"] = tc.findings
+			}
+			final := mustJSON(t, payload)
+			scripted := &scriptedLLM{responses: []scriptResp{{raw: draftResp(t, tc.title, tc.cause, 0.82, nil)}, {raw: final}}}
+			cfg := verifyConfig(promServer(t, func(string) (int, string) { return 200, vectorEmpty }))
+			cfg.LogSource = fixedComparisonLogs{token: tc.token}
+			cfg.LogParams = acutetriage.LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}
+			if err := acutetriage.New(cfg, st, scripted, nil, nil, nil).Run(ctx, inc); err != nil {
+				t.Fatal(err)
+			}
+			f := readFinding(t, st, inc.ID)
+			if f.rootCause != tc.want || f.output != string(final) {
+				t.Fatalf("root cause=%q output=%q, want %q and exact reply", f.rootCause, f.output, tc.want)
+			}
+		})
+	}
+}
+
 // strongRecallReader returns a reader whose exact-key recall folds one strong
 // prior pointing at priorID, so a call-2 memory_verdict routes marks onto it.
 func strongRecallReader(priorID string) *stubMemoryReader {
@@ -294,8 +472,8 @@ func TestVerificationRevisesRegionalVerdict(t *testing.T) {
 	}
 
 	f := readFinding(t, st, inc.ID)
-	if f.rootCause != "single cluster reconcile loop" {
-		t.Errorf("persisted root cause = %q, want the REVISED verdict", f.rootCause)
+	if f.rootCause != "Unconfirmed (no check tested this cause): single cluster reconcile loop" {
+		t.Errorf("persisted root cause = %q, want the revised verdict marked unconfirmed without a cause check", f.rootCause)
 	}
 	if f.confidence != 0.80 {
 		t.Errorf("persisted confidence = %v, want 0.80 (revised)", f.confidence)
@@ -982,8 +1160,8 @@ func TestSteering_SupportedAdoptsUncapped(t *testing.T) {
 	if f.confidence != 0.85 {
 		t.Errorf("confidence = %v, want 0.85 (supported ruling never clamps)", f.confidence)
 	}
-	if f.rootCause != "pvc exhaustion on web1" {
-		t.Errorf("root cause = %q, want the adopted corrected cause", f.rootCause)
+	if f.rootCause != "Unconfirmed (no check tested this cause): pvc exhaustion on web1" {
+		t.Errorf("root cause = %q, want the adopted corrected cause marked unconfirmed without a cause check", f.rootCause)
 	}
 	ver := verificationOf(t, f.enrichment)
 	if ver == nil || ver.OperatorRuling == nil {
@@ -1137,7 +1315,7 @@ func TestSteering_AbsentRulingKeepsRevisionAndClamps(t *testing.T) {
 	}
 
 	f := readFinding(t, st, inc.ID)
-	if f.rootCause != "pvc exhaustion on web1" {
+	if f.rootCause != "Unconfirmed (no check tested this cause): pvc exhaustion on web1" {
 		t.Errorf("root cause = %q, want the revision KEPT despite the absent ruling (soft validation)", f.rootCause)
 	}
 	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
@@ -1209,7 +1387,7 @@ func TestSteering_MalformedRulingShapeKeepsRevisionAndClamps(t *testing.T) {
 	}
 
 	f := readFinding(t, st, inc.ID)
-	if f.rootCause != "pvc exhaustion on web1" {
+	if f.rootCause != "Unconfirmed (no check tested this cause): pvc exhaustion on web1" {
 		t.Errorf("root cause = %q, want the revision KEPT despite the malformed ruling shape (soft validation)", f.rootCause)
 	}
 	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {

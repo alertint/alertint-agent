@@ -278,7 +278,7 @@ func assessmentCapability(t *testing.T, tracker *llmhealth.Tracker) llmhealth.Ca
 // observer's mapping of the controller's final L2 outcome onto installation
 // LLM health: accepted/contradicted/stale are healthy; a transport failure
 // is a dependency-class failure (unhealthy at once); a malformed or
-// policy-invalid proposal is a content-class failure — recorded, but the
+// malformed proposal is a content-class failure — recorded, but the
 // capability turns unhealthy only once two DISTINCT Situations corroborate
 // it, which is why the Situation ID must be the observation subject.
 func TestLLMHealthAssessmentObserverReportsFinalTypedOutcome(t *testing.T) {
@@ -316,7 +316,7 @@ func TestLLMHealthAssessmentObserverReportsFinalTypedOutcome(t *testing.T) {
 			t.Fatalf("after two malformed proposals on ONE Situation: capability = %+v, want still healthy with response_malformed recorded", c)
 		}
 
-		obs.BeginAssessmentCall("sit-2").Finish(situation.L2OutcomePolicyRejected, nil)
+		obs.BeginAssessmentCall("sit-2").Finish(situation.L2OutcomeMalformed, nil)
 		c = assessmentCapability(t, tracker)
 		if c.Healthy {
 			t.Fatalf("after content failures on TWO distinct Situations: capability = %+v, want unhealthy", c)
@@ -328,6 +328,20 @@ func TestLLMHealthAssessmentObserverReportsFinalTypedOutcome(t *testing.T) {
 		obs.BeginAssessmentCall("sit-3").Finish(situation.L2OutcomeAccepted, nil)
 		if snap := tracker.Snapshot(); snap.State != llmhealth.StateHealthy {
 			t.Fatalf("installation state = %q, want healthy again after a real accepted proposal", snap.State)
+		}
+	})
+
+	t.Run("policy and capability rejections do not impair llm health", func(t *testing.T) {
+		tracker := newTestTracker(t)
+		obs := llmHealthAssessmentObserver{tracker: tracker}
+		for _, outcome := range []situation.L2Outcome{situation.L2OutcomePolicyRejected, situation.L2OutcomeCapabilityRejected} {
+			if err := assessmentHealthError(outcome, nil); err != nil {
+				t.Fatalf("%s health error = %v", outcome, err)
+			}
+			obs.BeginAssessmentCall("sit-"+string(outcome)).Finish(outcome, nil)
+		}
+		if snap := tracker.Snapshot(); snap.State != llmhealth.StateHealthy {
+			t.Fatalf("installation state = %q, want healthy", snap.State)
 		}
 	})
 }

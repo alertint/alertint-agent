@@ -6,12 +6,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/logs"
+	"github.com/alertint/alertint-agent/internal/logs/loki"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -29,6 +34,94 @@ type fakeSource struct {
 	hadDeadline bool
 	deadline    time.Time
 	calls       int
+}
+
+type fakeContrastSource struct {
+	*fakeSource
+
+	contrast         logs.Fetched
+	contrastErr      error
+	contrastCalls    int
+	contrastLimit    int
+	contrastDeadline time.Time
+}
+
+func (f *fakeContrastSource) FetchContrast(ctx context.Context, _ logs.Selector, _, _ time.Time, limit int) (logs.Fetched, error) {
+	f.contrastCalls++
+	f.contrastLimit = limit
+	f.contrastDeadline, _ = ctx.Deadline()
+	return f.contrast, f.contrastErr
+}
+
+func TestFetchLogs_ContrastOnlyAfterFilteredLines(t *testing.T) {
+	lines := []logs.Line{{Timestamp: time.Unix(1, 0), Line: "error loyalty_level=gold"}}
+	comparison := make([]logs.Line, 12)
+	for i := range comparison {
+		comparison[i] = logs.Line{Timestamp: time.Unix(int64(20-i), 0), Line: strings.Repeat("x", 600)}
+	}
+	for _, tc := range []struct {
+		name     string
+		filtered bool
+		lines    []logs.Line
+		want     int
+	}{
+		{"filtered", true, lines, 1},
+		{"fallback", false, lines, 0},
+		{"no lines", true, nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &fakeContrastSource{fakeSource: &fakeSource{name: "loki", fetched: logs.Fetched{Lines: tc.lines, Filtered: tc.filtered}},
+				contrast: logs.Fetched{Lines: comparison}}
+			e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50}, alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "inc", nil)
+			if src.contrastCalls != tc.want {
+				t.Fatalf("contrast calls = %d, want %d", src.contrastCalls, tc.want)
+			}
+			if tc.want == 1 && (src.contrastLimit != 20 || !src.contrastDeadline.Equal(src.deadline) || len(e.Contrast) != 10 || len([]rune(e.Contrast[0].Line)) != logs.MaxLineChars) {
+				t.Fatalf("contrast = %+v, limit %d, deadline %v/%v", e.Contrast, src.contrastLimit, src.contrastDeadline, src.deadline)
+			}
+		})
+	}
+}
+
+func TestFetchLogs_ContrastFailureIsBestEffort(t *testing.T) {
+	src := &fakeContrastSource{fakeSource: &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{{Line: "error"}}, Filtered: true}}, contrastErr: context.DeadlineExceeded}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50}, alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "inc", nil)
+	if e.Outcome != OutcomeFetched || e.ContrastNote == "" || len(e.Contrast) != 0 {
+		t.Fatalf("contrast failure changed main result: %+v", e)
+	}
+}
+
+func TestContrastSummary_Case014Inconclusive(t *testing.T) {
+	errors := make([]logs.Line, 14)
+	for i := range errors {
+		errors[i] = logs.Line{Line: "Payment request failed. Invalid token. demo.user_context.loyalty_level=gold"}
+	}
+	comparison := make([]logs.Line, 10)
+	for i := range comparison {
+		comparison[i] = logs.Line{Line: "Transaction complete."}
+	}
+	got := contrastSummary(errors, comparison)
+	if len(got) != 1 || got[0] != "`demo.user_context.loyalty_level=gold` is on all 14 error lines; the comparison lines don't carry `demo.user_context.loyalty_level`, so the affected group is unknown." {
+		t.Fatalf("summary = %v", got)
+	}
+	if tokens := inconclusiveTokens(errors, comparison); len(tokens) != 1 || tokens[0] != "demo.user_context.loyalty_level=gold" {
+		t.Fatalf("inconclusive tokens = %v", tokens)
+	}
+}
+
+func TestContrastSummary_CountsLinesAndCapsTokens(t *testing.T) {
+	errors := []logs.Line{{Line: "a=1 b=2 c=3 d=4"}, {Line: "a=1 b=2 c=3 d=4"}}
+	comparison := []logs.Line{{Line: "a=1 then a=1 b=9"}, {Line: "Transaction complete."}}
+	got := contrastSummary(errors, comparison)
+	if len(got) != 3 || got[0] != "`a=1`: on 2/2 error lines, on 1/2 comparison lines" || got[1] != "`b=2`: on 2/2 error lines, on 0/2 comparison lines" || got[2] != "`c=3` is on all 2 error lines; the comparison lines don't carry `c`, so the affected group is unknown." {
+		t.Fatalf("summary = %v", got)
+	}
+	if strings.Contains(strings.Join(got, "\n"), "d=4") || strings.Contains(strings.Join(got, "\n"), "key b is not") {
+		t.Fatalf("token cap or key-presence check failed: %v", got)
+	}
+	if missing := inconclusiveTokens(errors, comparison); len(missing) != 1 || missing[0] != "c=3" {
+		t.Fatalf("missing tokens = %v, want c=3 only", missing)
+	}
 }
 
 func (f *fakeSource) Name() string { return f.name }
@@ -401,5 +494,126 @@ func TestRenderLogs_ClampDisclosedWhenEmpty(t *testing.T) {
 	}
 	if !strings.Contains(out, "missing evidence") {
 		t.Errorf("empty-result prompt must keep the missing-evidence guidance, got %q", out)
+	}
+}
+
+func TestFetchLogs_SelectsAttributesAcrossErrorAndComparisonLines(t *testing.T) {
+	var entries []logs.Line
+	raw := `[
+ {"line":"Error one","attrs":{"service_name":"api","resource":"same","outcome":"failure","trace_id":"abcdef0123456789abcdef0123456789","span_id":"abcdef0123456789","transactionId":"123","multiline":"a\nb","long":"` + strings.Repeat("x", 65) + `","overflow":"1e999","decimal":"1.5"}},
+ {"line":"Error two","attrs":{"service_name":"api","resource":"same","outcome":"failure","trace_id":"bbbbbb0123456789abcdef0123456789","span_id":"bbbbbb0123456789","transactionId":"456","multiline":"b\rc","long":"` + strings.Repeat("y", 65) + `","overflow":"2e999","decimal":"2.5"}},
+ {"line":"Transaction complete.","attrs":{"service_name":"api","resource":"same","outcome":"success","loyalty_level":"gold","trace_id":"cccccc0123456789abcdef0123456789","span_id":"cccccc0123456789","transactionId":"01234567-89ab-cdef-0123-456789abcdef"}},
+ {"line":"Transaction complete.","attrs":{"service_name":"api","resource":"same","outcome":"success","loyalty_level":"silver","trace_id":"dddddd0123456789abcdef0123456789","span_id":"dddddd0123456789","transactionId":"fedcba98-7654-3210-fedc-ba9876543210"}}
+ ]`
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		t.Fatal(err)
+	}
+	src := &fakeContrastSource{fakeSource: &fakeSource{name: "loki", fetched: logs.Fetched{Lines: entries[:2], Filtered: true}}, contrast: logs.Fetched{Lines: entries[2:]}}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	var b strings.Builder
+	renderLogs(&b, e)
+	text := b.String()
+	for _, want := range []string{"Error one {outcome=failure}", "Error two {outcome=failure}", "Transaction complete. {loyalty_level=gold, outcome=success}", "Transaction complete. {loyalty_level=silver, outcome=success}"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in %s", want, text)
+		}
+	}
+	for _, key := range []string{"service_name=", "resource=", "trace_id=", "span_id=", "transactionId=", "multiline=", "long=", "decimal=", "overflow="} {
+		if strings.Contains(text, key) {
+			t.Errorf("unhelpful attribute %q in %s", key, text)
+		}
+	}
+	if got := contrastSummary(e.Lines, e.Contrast); len(got) != 0 {
+		t.Fatalf("attributes must not enter message token comparison: %v", got)
+	}
+	if got := inconclusiveTokens(e.Lines, e.Contrast); len(got) != 0 {
+		t.Fatalf("attributes must not enter missing-token comparison: %v", got)
+	}
+}
+
+func TestFetchLogs_AttributeLimitPrefersFewerDistinctValuesThenKey(t *testing.T) {
+	var entries []logs.Line
+	if err := json.Unmarshal([]byte(`[
+ {"line":"one","attrs":{"z":"red","a":"red","b":"red","c":"red","d":"red","e":"red","f":"red","g":"red","h":"red","i":"red"}},
+ {"line":"two","attrs":{"z":"blue","a":"blue","b":"blue","c":"blue","d":"blue","e":"blue","f":"blue","g":"blue","h":"blue","i":"blue"}},
+ {"line":"three","attrs":{"z":"blue","a":"green","b":"green","c":"green","d":"green","e":"green","f":"green","g":"green","h":"green","i":"green"}}
+ ]`), &entries); err != nil {
+		t.Fatal(err)
+	}
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: entries}}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	var b strings.Builder
+	renderLogs(&b, e)
+	if !strings.Contains(b.String(), "one {a=red, b=red, c=red, d=red, e=red, f=red, g=red, z=red}") || strings.Contains(b.String(), "h=") || strings.Contains(b.String(), "i=") {
+		t.Fatal(b.String())
+	}
+}
+
+func TestFetchLogs_ContrastLimitBeforeDedup(t *testing.T) {
+	for _, duplicate := range []bool{true, false} {
+		t.Run(fmt.Sprintf("duplicates_%v", duplicate), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				result := []map[string]any{{"stream": map[string]string{"service": "api"}, "values": [][2]string{{"200", "ERROR request failed"}}}}
+				if strings.Contains(r.URL.Query().Get("query"), "!~") {
+					limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+					if err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					n := limit
+					if duplicate {
+						n = limit / 2
+					}
+					entries := make([][2]string, 0, n)
+					for i := range n {
+						entries = append(entries, [2]string{strconv.Itoa(100 + i), "Transaction complete."})
+					}
+					result = []map[string]any{{"stream": map[string]string{"service": "api", "copy": "first"}, "values": entries}}
+					if duplicate {
+						result = append(result, map[string]any{"stream": map[string]string{"service": "api", "copy": "second"}, "values": entries})
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(map[string]any{"status": "success", "data": map[string]any{"resultType": "streams", "result": result}}); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer srv.Close()
+			src := loki.NewClient(loki.Config{BaseURL: srv.URL, LineFilter: `|~ "(?i)(error|warn|fatal|panic|fail)"`})
+			e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+			if len(e.Contrast) != 10 {
+				t.Fatalf("want 10 unique comparison lines, got %d", len(e.Contrast))
+			}
+			newest := int64(119)
+			if duplicate {
+				newest = 109
+			}
+			for i, line := range e.Contrast {
+				if line.Timestamp.UnixNano() != newest-int64(i) {
+					t.Fatalf("comparison order/uniqueness changed at %d: %+v", i, line)
+				}
+			}
+		})
+	}
+}
+
+func TestFetchLogs_AttributeLengthCountsCharacters(t *testing.T) {
+	value := strings.Repeat("\u754c", 64)
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{
+		{Line: "first", Attrs: map[string]string{"category": value}},
+		{Line: "second", Attrs: map[string]string{"category": value + "\u754c"}},
+	}}}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	if len(e.Lines) != 2 || e.Lines[0].Attrs["category"] != value {
+		t.Fatalf("64-character value omitted: %+v", e.Lines)
+	}
+	if len(e.Lines[1].Attrs) != 0 {
+		t.Fatalf("65-character value retained: %+v", e.Lines[1])
+	}
+	var b strings.Builder
+	renderLogs(&b, e)
+	if !strings.Contains(b.String(), "first {category="+value+"}") {
+		t.Fatal(b.String())
 	}
 }

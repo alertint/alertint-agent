@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Loki evidence includes selected entry attributes in error and comparison
+  lines, with bounded values, cardinality preference, and byte accounting.
+- Loki triage compares filtered failure lines with a small sample of lines the
+  default error filter excluded, marking absent message attributes inconclusive.
+- Triage can read and run a Prometheus alert's stored rule expression to obtain
+  metric evidence and learn a matching series label for the incident.
+- Prometheus `label_map` translates alert labels to metric series labels in
+  evidence and verification queries.
+
+### Changed
+
+- A triage cause stays unconfirmed unless the model cites one fetched check
+  that tested it; the cited result is stored with verification evidence.
+- Metric evidence ranks cumulative counters by changes in their increases
+  across two 15-minute intervals, handles resets, and renders both increases.
+  Gauges still compare values 15 minutes earlier; histogram count and sum
+  share a family cap.
+- Findings with no fetched model or operator metric checks identify their cause
+  as unconfirmed in the stored headline and Finding.
+
+### Fixed
+
+- Sonnet 5.5 requests use its supported `between_tools` mode to disable
+  up-front thinking; earlier models retain `disabled`.
+- Verification results label explicit rates per second and increases over their
+  query window; the model is instructed not to report rates as percentages.
+- Cause checks include the referenced and nested Prometheus recording-rule
+  definitions, so counting the alert's own error signal does not confirm a cause.
+- Claims naming a value absent from comparison messages are marked unconfirmed
+  only when the same text uses "only" or "exclusively"; no comparison sample
+  means no affected-group check. The log summary does not imply exclusivity
+  from zero matches.
+- PromQL checks that only repeat alert-rule metrics on the alert's own labels
+  no longer confirm a cause; label mapping is respected.
+- Loki comparison queries request 20 entries before deduplication and retain
+  up to 10 unique lines, preserving samples when streams duplicate entries.
+- Duplicate Loki entries with the same timestamp and text count once in evidence.
+- Recovery assessments keep rejected proposals visible for diagnosis and leave
+  LLM health healthy after policy or capability rejections.
+- Prometheus alert bookkeeping series no longer count as metric evidence or
+  prevent a physical-core retry from finding application metrics.
+
 ## [0.14.2] - 2026-09-30
 
 ### Fixed

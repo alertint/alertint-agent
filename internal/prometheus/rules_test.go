@@ -7,8 +7,45 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 )
+
+func TestRecordingRules(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		want       map[string]string
+		wantErr    bool
+	}{
+		{"recording only", `{"status":"success","data":{"groups":[{"name":"g","rules":[{"type":"recording","name":"service:errors","query":"sum(rate(errors_total[5m]))"},{"type":"alerting","name":"Failure","query":"service:errors > 1"}]}]}}`, 200, map[string]string{"service:errors": "sum(rate(errors_total[5m]))"}, false},
+		{"unsupported", `{"status":"error","error":"not supported"}`, 404, nil, true},
+		{"malformed", `{"status":"success","data":{"groups":42}}`, 200, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.Path != "/api/v1/rules" || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer test" || r.Header.Get("X-Scope-Orgid") != "tenant" {
+					t.Errorf("unexpected rules request: %s %s headers=%v", r.Method, r.URL, r.Header)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			reader, ok := any(NewClient(Config{BaseURL: server.URL, BearerToken: "test", OrgID: "tenant"})).(interface {
+				RecordingRules(ctx context.Context) (map[string]string, error)
+			})
+			if !ok {
+				t.Fatal("client does not expose recording rules")
+			}
+			got, err := reader.RecordingRules(context.Background())
+			if (err != nil) != tc.wantErr || !reflect.DeepEqual(got, tc.want) || calls != 1 {
+				t.Fatalf("definitions=%v error=%v calls=%d; want %v error=%v", got, err, calls, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
 
 func TestRuleDefinitionObservedBoundedDoesNotSettleWhenReservationFails(t *testing.T) {
 	rules := `{"status":"success","data":{"groups":[{"name":"jobs","interval":15,"rules":[{"type":"alerting","name":"Load","query":"up == 0","labels":{},"alerts":[]}]}]}}`

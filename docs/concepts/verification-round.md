@@ -76,6 +76,12 @@ the draft, revise; don't defend it. The result is the finding that persists —
 confidence caps and the memory verdict apply to this final judgment, not the
 draft.
 
+When a metric source is configured, call 2 names the numbered check that
+directly tested its proposed cause. The stored headline and Finding begin with
+"Unconfirmed" unless that cited model or operator check fetched data. Floor
+checks, unrelated results, and absent citations do not confirm the cause. The
+raw model reply remains available unchanged.
+
 ### Locally invalid PromQL
 
 Every PromQL check this pipeline runs is parsed locally before it can

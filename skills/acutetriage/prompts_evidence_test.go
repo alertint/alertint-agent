@@ -85,9 +85,12 @@ func TestUserPrompt_FailedMetricsStillAnnotationsOnly(t *testing.T) {
 
 func TestRenderMetrics_SeriesAndNote(t *testing.T) {
 	var b strings.Builder
-	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeFetched, Snapshots: []MetricSnapshot{
+	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeFetched, RuleExprs: []string{"up"}, Snapshots: []MetricSnapshot{
 		{Series: `{namespace="checkout",pod="api-7f9x"}`, Metric: "cpu", Value: "0.9"},
 	}})
+	if strings.Count(b.String(), "Alert rule expression: up") != 1 || strings.Index(b.String(), "Alert rule expression: up") > strings.Index(b.String(), "cpu{") {
+		t.Errorf("rule expression should precede snapshots once: %q", b.String())
+	}
 	if !strings.Contains(b.String(), `cpu{namespace="checkout",pod="api-7f9x"} = 0.9`) {
 		t.Errorf("metric line missing: %q", b.String())
 	}
@@ -96,6 +99,20 @@ func TestRenderMetrics_SeriesAndNote(t *testing.T) {
 	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeEmpty, Note: "no metric series matched the incident selector"})
 	if !strings.Contains(b.String(), "no metric series matched") {
 		t.Errorf("empty note missing: %q", b.String())
+	}
+}
+
+func TestRenderMetricsShowsBaselineOnlyWhenKnown(t *testing.T) {
+	var b strings.Builder
+	renderMetrics(&b, &MetricEnrichment{Snapshots: []MetricSnapshot{
+		{Metric: "requests_total", Series: `{job="api"}`, Value: "8", Baseline: "4"},
+		{Metric: "errors_total", Series: `{job="api"}`, Value: "2", Baseline: "none"},
+		{Metric: "up", Series: `{job="api"}`, Value: "1"},
+	}})
+	for _, want := range []string{`requests_total{job="api"} = 8 (15m earlier: 4)`, `errors_total{job="api"} = 2 (15m earlier: none)`, `up{job="api"} = 1`} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("missing %q in %q", want, b.String())
+		}
 	}
 }
 

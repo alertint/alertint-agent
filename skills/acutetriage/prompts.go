@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -40,6 +41,7 @@ Rules:
 - analysis_name is the channel headline: summarize the final overall_issue in one short sentence (at most 80 characters). Preserve causal qualifiers such as "likely" or "may"; never make the title more certain than the finding. Revise it when verification changes the finding. Omit "Earlier report", time windows, and percentages unless essential to identify the issue.
 - Separate direct observations from hypotheses: correlation_findings must state only facts visible in the supplied evidence, with their source and scope. Put possible causes and interpretations in overall_issue.
 - Sampled errors do not establish uniform failure across users. Alerts on other group keys in the incident-window lookup rule out claims that no other services have alerts; a shared cause remains unconfirmed.
+- If the comparison lines don't carry an attribute, don't say which group is affected — no "only", "exclusively", or "all".
 - Reconcile every draft claim with the verification results before retaining it. Remove or qualify contradicted scope claims.
 - severity must be one of: "low", "medium", or "high" based on business impact and urgency.
 - confidence is a float in [0.0, 1.0] reflecting how certain you are about the correlation and root cause.
@@ -247,6 +249,7 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 	b.WriteString("\n\n## Your draft verdict (your own prior output)\n")
 	b.Write(draftRaw)
 	renderVerificationResults(&b, round)
+	b.WriteString("\nValues marked [per second] are rates, not fractions; never present them as percentages.")
 	b.WriteString("\n\nThese results are computed facts: they outrank the draft, the evidence " +
 		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +
 		"If they contradict it, revise — do not defend the draft. A query that returned no " +
@@ -264,6 +267,9 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 		"hypothesis formed now is itself unverified: keep its confidence moderate. Respond " +
 		"with the SAME JSON schema as before, complete (do NOT include the \"verification\" " +
 		"key again).")
+	b.WriteString(" Add \"cause_check\": the [n] of the one result that directly measured your " +
+		"proposed cause, or 0 if none did. A result that only shows the symptom, " +
+		"other services, or throughput does not test the cause.")
 	if memory != nil && memory.Strong != nil {
 		b.WriteString("\n\nAfter weighing the verification results, add a \"memory_verdict\" field " +
 			"judging the folded prior hypothesis in the Memory section: \"confirms\", \"refutes\", " +
@@ -392,10 +398,18 @@ func renderMetrics(b *strings.Builder, m *MetricEnrichment) {
 	if m == nil {
 		return
 	}
+	for _, expr := range m.RuleExprs {
+		fmt.Fprintf(b, "\nAlert rule expression: %s", expr)
+	}
 	if len(m.Snapshots) > 0 {
 		b.WriteString("\n\nLive metrics (Prometheus, at incident time):")
 		for _, s := range m.Snapshots {
 			fmt.Fprintf(b, "\n  %s%s = %s", s.Metric, s.Series, s.Value)
+			if s.Increase != "" && s.PriorIncrease != "" {
+				fmt.Fprintf(b, " (+%s in last 15m, +%s in prior 15m)", s.Increase, s.PriorIncrease)
+			} else if s.Baseline != "" {
+				fmt.Fprintf(b, " (15m earlier: %s)", s.Baseline)
+			}
 		}
 		return
 	}
@@ -656,7 +670,16 @@ func renderLogs(b *strings.Builder, e *LogEnrichment) {
 			fmt.Fprintf(b, "\n\nRecent logs (%s, most recent first, around incident time):", e.Source)
 		}
 		for _, ln := range e.Lines {
-			fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line)
+			fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line+logs.FormatAttrs(ln.Attrs))
+		}
+		if len(e.Contrast) > 0 {
+			b.WriteString("\nComparison sample (lines the error filter excluded, same selector and window):")
+			for _, ln := range e.Contrast {
+				fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line+logs.FormatAttrs(ln.Attrs))
+			}
+			for _, line := range contrastSummary(e.Lines, e.Contrast) {
+				b.WriteString("\n  " + line)
+			}
 		}
 		return
 	}
@@ -716,5 +739,6 @@ func formatLabels(m map[string]string) string {
 const operatorEvidenceInstructions = `- Separate direct observations from hypotheses: correlation_findings must state only facts visible in the supplied evidence, with their source and scope. Put possible causes and interpretations in overall_issue.
 - analysis_name is the channel headline: summarize the final overall_issue in one short sentence (at most 80 characters). Preserve causal qualifiers such as "likely" or "may"; never make the title more certain than the finding. Revise it when verification changes the finding. Omit "Earlier report", time windows, and percentages unless essential to identify the issue.
 - Sampled errors do not establish uniform failure across users. Alerts on other group keys in the incident-window lookup rule out claims that no other services have alerts; a shared cause remains unconfirmed.
+- If the comparison lines don't carry an attribute, don't say which group is affected — no "only", "exclusively", or "all".
 - Reconcile every draft claim with the verification results before retaining it. Remove or qualify contradicted scope claims.
 `

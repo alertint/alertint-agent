@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"testing"
 	"time"
 
@@ -120,6 +121,38 @@ func TestValidateAssessmentProposalAcceptsValidProposal(t *testing.T) {
 	}
 }
 
+func TestRejectedProposalRetainsParsedCandidateOnlyForDiagnostics(t *testing.T) {
+	snap := snapshotFor(t, baseSnapshotInput(t))
+	p := validPlainProposal()
+	p.Impact = model.ImpactConfirmed
+	vr := ValidateAssessmentProposal(marshalRaw(t, p), snap, callFor(snap), time.Now())
+	if vr.Outcome != ProposalOutcomePolicyRejected || !reflect.DeepEqual(vr.Proposal, model.AssessmentProposal{}) {
+		t.Fatalf("outcome=%s proposal=%+v", vr.Outcome, vr.Proposal)
+	}
+	if vr.RejectedProposal == nil || vr.RejectedProposal.Impact != model.ImpactConfirmed {
+		t.Fatalf("rejected proposal=%+v", vr.RejectedProposal)
+	}
+	attempt := buildOutcomeAttempt("s", "c", 1, 0, 1, 1, &vr, nil, model.ProviderRequestStarted("true"), time.Second, time.Now())
+	if !json.Valid(attempt.Proposal) || !jsonContainsImpact(attempt.Proposal, "confirmed") {
+		t.Fatalf("attempt proposal=%s", attempt.Proposal)
+	}
+	malformed := ValidateAssessmentProposal(json.RawMessage(`{`), snap, callFor(snap), time.Now())
+	if malformed.RejectedProposal != nil {
+		t.Fatalf("malformed retained proposal=%+v", malformed.RejectedProposal)
+	}
+	malformedAttempt := buildOutcomeAttempt("s", "c", 1, 0, 1, 2, &malformed, nil, model.ProviderRequestStarted("true"), time.Second, time.Now())
+	if len(malformedAttempt.Proposal) != 0 {
+		t.Fatalf("malformed attempt proposal=%s, want empty", malformedAttempt.Proposal)
+	}
+}
+
+func jsonContainsImpact(raw json.RawMessage, want string) bool {
+	var value struct {
+		Impact string `json:"impact"`
+	}
+	return json.Unmarshal(raw, &value) == nil && value.Impact == want
+}
+
 func TestValidateAssessmentProposalRejectsUnknownSchemaVersion(t *testing.T) {
 	snap := snapshotFor(t, criticalInput(t))
 	call := callFor(snap)
@@ -155,6 +188,9 @@ func TestValidateAssessmentProposalRejectsUnknownReasonID(t *testing.T) {
 	got := ValidateAssessmentProposal(raw, snap, call, time.Now())
 	if got.Outcome != ProposalOutcomeCapabilityRejected {
 		t.Fatalf("Outcome = %q, want capability_rejected", got.Outcome)
+	}
+	if got.RejectedProposal == nil || got.RejectedProposal.SufficientReason == nil || got.RejectedProposal.SufficientReason.CandidateID != "not-a-real-candidate-id" {
+		t.Fatalf("RejectedProposal = %+v, want parsed candidate", got.RejectedProposal)
 	}
 }
 

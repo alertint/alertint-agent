@@ -812,10 +812,11 @@ type ValidationIssue struct {
 // classification, the (possibly safely-adjusted) proposal when accepted, and
 // the rejection/adjustment issues.
 type ValidationResult struct {
-	Outcome     ProposalOutcome
-	Proposal    model.AssessmentProposal
-	Errors      []ValidationIssue
-	Adjustments []ValidationIssue
+	Outcome          ProposalOutcome
+	Proposal         model.AssessmentProposal
+	RejectedProposal *model.AssessmentProposal `json:"-"`
+	Errors           []ValidationIssue
+	Adjustments      []ValidationIssue
 }
 
 // allowedProposalTopLevelKeys is the exact, closed set of top-level JSON
@@ -1041,7 +1042,11 @@ func ValidateAssessmentProposal(raw json.RawMessage, snap Snapshot, call Assessm
 		return malformedResult("unbounded_text", "", "summary/detail text exceeds the bounded length")
 	}
 
-	return validateProposalContent(proposal, snap)
+	result := validateProposalContent(proposal, snap)
+	if result.Outcome == ProposalOutcomePolicyRejected || result.Outcome == ProposalOutcomeCapabilityRejected {
+		result.RejectedProposal = &proposal
+	}
+	return result
 }
 
 // ----------------------------------------------------------------------

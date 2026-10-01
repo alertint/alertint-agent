@@ -17,6 +17,9 @@ import (
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 // VerificationParams carries the skill-side tunables (from config Task 1).
@@ -38,6 +41,7 @@ type VerificationParams struct {
 	// ExtraSelectorLabels joins the floor's peer scope (ADR-0035): a peer
 	// ratio computed across the operator's partitions is not a peer ratio.
 	ExtraSelectorLabels []string
+	LabelMap            map[string]string
 	// HasPromQL / HasZabbix are presence flags stamped by the skill
 	// (verifyParams()), never parsed from config: they select which floor
 	// sources contribute (ADR-0034) and which query kinds the model may be
@@ -85,8 +89,9 @@ type DraftRef struct {
 
 // VerificationEnrichment is the envelope key "verification" (R8).
 type VerificationEnrichment struct {
-	Outcome string              `json:"outcome"` // supported | revised | degraded
-	Rounds  []VerificationRound `json:"rounds"`
+	Outcome    string              `json:"outcome"` // supported | revised | degraded
+	Rounds     []VerificationRound `json:"rounds"`
+	CauseCheck *int                `json:"cause_check,omitempty"`
 	// OperatorRuling records call 2's judgment on the governing correction
 	// (ADR-0029) when one is steering; nil when no correction governs this
 	// triage at all.
@@ -94,6 +99,144 @@ type VerificationEnrichment struct {
 	// DegradationReason names why a degraded round shipped the draft: empty
 	// when Outcome != degraded, otherwise one of the Degradation* constants.
 	DegradationReason string `json:"degradation_reason,omitempty"`
+}
+
+// parseCauseCheck accepts an index or the model's common string renderings of
+// the prompt's [n] notation. Invalid shapes are treated as an absent citation.
+func parseCauseCheck(raw json.RawMessage) *int {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var n int
+	if json.Unmarshal(raw, &n) == nil && n >= 0 {
+		return &n
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return nil
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		s = s[1 : len(s)-1]
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || s != strconv.Itoa(n) {
+		return nil
+	}
+	return &n
+}
+
+// causeUnconfirmed checks call 2's cited result in the round it saw.
+//
+//nolint:gocyclo // Keep the conservative cause predicate and its rule/selector checks together.
+func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCheck *int, metrics *MetricEnrichment, alerts []store.Alert) bool {
+	if ver == nil || !hasMetricSource {
+		return false
+	}
+	if causeCheck == nil || *causeCheck < 1 || len(ver.Rounds) == 0 {
+		return true
+	}
+	queries := ver.Rounds[len(ver.Rounds)-1].Queries
+	if *causeCheck > len(queries) {
+		return true
+	}
+	q := queries[*causeCheck-1]
+	metricKind := q.Kind == kindPromQL || q.Kind == kindZabbixReachability || q.Kind == kindZabbixNeighborProblems
+	if (q.Source != "model" && q.Source != "operator") || !metricKind || q.Outcome != OutcomeFetched {
+		return true
+	}
+	if q.Kind != kindPromQL || metrics == nil || len(metrics.RuleExprs) == 0 {
+		return false
+	}
+	ruleMetrics := make(map[string]bool)
+	rulePairs := make(map[string]bool)
+	rules := append([]string(nil), metrics.RuleExprs...)
+	for _, definition := range metrics.RecordingRules {
+		rules = append(rules, definition)
+	}
+	for _, rule := range rules {
+		expr, err := parser.NewParser(parser.Options{}).ParseExpr(rule)
+		if err != nil {
+			return false
+		}
+		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+			if sel, ok := node.(*parser.VectorSelector); ok {
+				if name := vectorMetricName(sel); name != "" {
+					ruleMetrics[name] = true
+				}
+				for _, matcher := range sel.LabelMatchers {
+					if matcher.Name != "__name__" && matcher.Type == labels.MatchEqual {
+						rulePairs[matcher.Name+"\x00"+matcher.Value] = true
+					}
+				}
+			}
+			return nil
+		})
+	}
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(q.Expr)
+	if err != nil {
+		return false
+	}
+	pairs := make(map[string]bool)
+	for _, alert := range alerts {
+		for key, value := range alert.Labels {
+			if mapped, ok := metrics.LabelMap[key]; ok {
+				key = mapped
+			}
+			if key != "" {
+				pairs[key+"\x00"+value] = true
+			}
+		}
+	}
+	allInRule, allMatchersInScope, hasMetric, ownLabel := true, true, false, false
+	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+		if sel, ok := node.(*parser.VectorSelector); ok {
+			hasMetric = true
+			name := vectorMetricName(sel)
+			if name == "" || !ruleMetrics[name] {
+				allInRule = false
+			}
+			for _, matcher := range sel.LabelMatchers {
+				if matcher.Name == "__name__" {
+					continue
+				}
+				pair := matcher.Name + "\x00" + matcher.Value
+				switch {
+				case matcher.Type != labels.MatchEqual:
+					allMatchersInScope = false
+				case pairs[pair]:
+					ownLabel = true
+				case !rulePairs[pair]:
+					allMatchersInScope = false
+				}
+			}
+		}
+		return nil
+	})
+	return hasMetric && allInRule && allMatchersInScope && ownLabel
+}
+
+// vectorMetricName also accepts PromQL's exact metric-name selector form.
+func vectorMetricName(sel *parser.VectorSelector) string {
+	if sel.Name != "" {
+		return sel.Name
+	}
+	for _, matcher := range sel.LabelMatchers {
+		if matcher.Name == "__name__" && matcher.Type == labels.MatchEqual {
+			return matcher.Value
+		}
+	}
+	return ""
+}
+
+// labelUnconfirmed qualifies the stored headline and Finding. The raw
+// model response remains unchanged for output_json and its attempt digest.
+func labelUnconfirmed(resp *llmResponse, reasons []string) {
+	if !strings.HasPrefix(strings.ToLower(resp.AnalysisName), "unconfirmed") {
+		resp.AnalysisName = "Unconfirmed: " + resp.AnalysisName
+	}
+	if !strings.HasPrefix(strings.ToLower(resp.OverallIssue), "unconfirmed") {
+		resp.OverallIssue = "Unconfirmed (" + strings.Join(reasons, "; ") + "): " + resp.OverallIssue
+	}
 }
 
 // Degradation reasons for a degraded VerificationEnrichment.Outcome: the
@@ -146,7 +289,7 @@ var broadScopeKeys = []string{"namespace", "service", "job"}
 // shared, so a host-only alert yields "" (unscoped — the caller falls back to
 // a global ratio) rather than a matcher that is really just the incident's
 // own target.
-func parentScope(alerts []store.Alert, extras []string) string {
+func parentScope(alerts []store.Alert, extras []string, labelMap map[string]string) string {
 	shared := sharedLabelValues(alerts)
 	scope := map[string][]string{}
 	for _, k := range mergeSelectorKeys(broadScopeKeys, extras) {
@@ -154,7 +297,7 @@ func parentScope(alerts []store.Alert, extras []string) string {
 			scope[k] = vs
 		}
 	}
-	return renderPromMatcher(scope)
+	return renderPromMatcher(translateSelector(scope, labelMap))
 }
 
 // composeFloor assembles the deterministic floor from the applicable floor
@@ -165,7 +308,7 @@ func parentScope(alerts []store.Alert, extras []string) string {
 func composeFloor(p VerificationParams, hostLabel string, alerts []store.Alert) []VerificationQuery {
 	var qs []VerificationQuery
 	if p.HasPromQL {
-		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts, p.ExtraSelectorLabels),
+		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts, p.ExtraSelectorLabels, p.LabelMap),
 			Why: "peer-scope health: is the wider world up?"})
 	}
 	if p.HasZabbix {
@@ -596,7 +739,53 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 		lines = append(lines, fmt.Sprintf("%s %s", r.Series, r.Value))
 	}
 	q.Outcome = OutcomeFetched
-	q.Result = capText(flattenRecalled(strings.Join(lines, "; ")), 400)
+	q.Result = capText(promQLResultUnit(q.Expr)+flattenRecalled(strings.Join(lines, "; ")), 400)
+}
+
+// promQLResultUnit labels only explicit rate/count values whose outer
+// operations preserve units. Arithmetic and recording-rule names are unknown.
+func promQLResultUnit(query string) string {
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
+	if err != nil {
+		return ""
+	}
+	var unit func(parser.Expr) string
+	unit = func(expr parser.Expr) string {
+		switch e := expr.(type) {
+		case *parser.ParenExpr:
+			return unit(e.Expr)
+		case *parser.AggregateExpr:
+			// Counts, grouping and variance do not preserve the input's unit.
+			if e.Op != parser.COUNT && e.Op != parser.COUNT_VALUES && e.Op != parser.GROUP && e.Op != parser.STDVAR {
+				return unit(e.Expr)
+			}
+		case *parser.BinaryExpr:
+			if e.Op.IsComparisonOperator() && !e.ReturnBool {
+				if e.LHS.Type() == parser.ValueTypeScalar {
+					return unit(e.RHS)
+				}
+				return unit(e.LHS)
+			}
+		case *parser.Call:
+			switch e.Func.Name {
+			case "rate", "irate":
+				return "[per second] "
+			case "increase":
+				var window time.Duration
+				switch arg := e.Args[0].(type) {
+				case *parser.MatrixSelector:
+					window = arg.Range
+				case *parser.SubqueryExpr:
+					window = arg.Range
+				}
+				if window > 0 {
+					return "[count over " + model.Duration(window).String() + "] "
+				}
+			}
+		}
+		return ""
+	}
+	return unit(expr)
 }
 
 // isHardErr reports whether err is more than a mere timeout — the shared
@@ -892,8 +1081,8 @@ func renderVerificationResults(b *strings.Builder, r *VerificationRound) {
 		return
 	}
 	b.WriteString("\n\n## Verification results (computed, read-only)")
-	for _, q := range r.Queries {
-		fmt.Fprintf(b, "\n\n- [%s/%s]", q.Source, q.Kind)
+	for i, q := range r.Queries {
+		fmt.Fprintf(b, "\n\n- [%d] [%s/%s]", i+1, q.Source, q.Kind)
 		if q.Why != "" {
 			fmt.Fprintf(b, " %s", q.Why)
 		}

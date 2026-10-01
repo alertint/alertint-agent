@@ -37,6 +37,21 @@ func TestUserPrompt_RendersLogLinesNewestFirst(t *testing.T) {
 	}
 }
 
+func TestRenderLogs_ContrastAfterMainLines(t *testing.T) {
+	e := &LogEnrichment{Source: "loki", Lines: []logs.Line{{Line: "error loyalty_level=gold"}}, Contrast: []logs.Line{{Line: "Transaction complete."}}}
+	out := UserPrompt(basePack(), "{}", nil, e, nil, nil, nil, nil, VerificationParams{})
+	first := strings.Index(out, "error loyalty_level=gold")
+	heading := strings.Index(out, "Comparison sample (lines the error filter excluded, same selector and window):")
+	if first < 0 || heading < first || !strings.Contains(out, "the comparison lines don't carry `loyalty_level`, so the affected group is unknown") {
+		t.Fatalf("comparison missing or out of order: %s", out)
+	}
+	e.Contrast = nil
+	out = UserPrompt(basePack(), "{}", nil, e, nil, nil, nil, nil, VerificationParams{})
+	if strings.Contains(out, "Comparison sample") {
+		t.Fatal("absent sample rendered a comparison")
+	}
+}
+
 func TestUserPrompt_RendersNoteWhenEmpty(t *testing.T) {
 	e := &LogEnrichment{
 		Source: "loki",
@@ -68,5 +83,9 @@ func TestSystemPrompt_CarriesAbsentLogsGuidance(t *testing.T) {
 	}
 	if !strings.Contains(SystemPrompt, "Recent logs") {
 		t.Error("SystemPrompt should reference the Recent logs section")
+	}
+	guidance := "If the comparison lines don't carry an attribute, don't say which group is affected"
+	if !strings.Contains(SystemPrompt, guidance) || !strings.Contains(operatorEvidenceInstructions, guidance) {
+		t.Fatal("both prompt variants need comparison guidance")
 	}
 }

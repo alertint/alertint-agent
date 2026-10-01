@@ -163,6 +163,13 @@ func TestCallTwoContinuationShape(t *testing.T) {
 	}
 }
 
+func TestCallTwoContinuationAsksForCauseCheck(t *testing.T) {
+	c2 := callTwoContinuation(json.RawMessage(`{"overall_issue":"x"}`), minimalRound(), nil)
+	if !strings.Contains(c2, `"cause_check"`) || !strings.Contains(c2, "directly measured your proposed cause") || !strings.Contains(c2, "or 0 if none did") {
+		t.Fatalf("call 2 lacks cause citation instruction: %s", c2)
+	}
+}
+
 // callTwoContinuation must not ask for a memory_verdict when there is no
 // strong recall to judge.
 func TestCallTwoContinuationOmitsMemoryVerdictWhenNoMemory(t *testing.T) {

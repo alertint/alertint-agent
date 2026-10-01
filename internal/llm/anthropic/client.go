@@ -266,10 +266,9 @@ type messagesRequest struct {
 }
 
 // thinkingConfig is the extended-thinking selector on the Messages API.
-// Triage is a single-shot JSON extraction, so thinking is always disabled
-// explicitly: on models where an omitted thinking field means "adaptive
-// thinking on" (claude-sonnet-5 and newer), thinking output would count
-// against MaxTokens and truncate the required-keys JSON reply.
+// Triage is a single-shot JSON extraction, so up-front thinking is disabled
+// explicitly to avoid spending MaxTokens on thinking instead of the JSON reply.
+// Sonnet 5.5 uses "between_tools" for this mode; earlier models use "disabled".
 type thinkingConfig struct {
 	Type string `json:"type"`
 }
@@ -361,12 +360,16 @@ func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Pr
 // doRequest performs a single HTTP call to the Messages API.
 func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
 	maxTokens := prompt.OutputTokenLimit(c.cfg.MaxTokens)
+	thinkingType := "disabled"
+	if c.cfg.Model == "claude-sonnet-5-5" {
+		thinkingType = "between_tools"
+	}
 	body := messagesRequest{
 		Model:     c.cfg.Model,
 		MaxTokens: maxTokens,
 		System:    system,
 		Messages:  []message{{Role: "user", Content: userContent(prompt)}},
-		Thinking:  &thinkingConfig{Type: "disabled"},
+		Thinking:  &thinkingConfig{Type: thinkingType},
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {

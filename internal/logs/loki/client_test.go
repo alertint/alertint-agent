@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -158,6 +159,26 @@ func TestFetchRecent_MultiStreamMergeNewestFirst(t *testing.T) {
 	}
 }
 
+func TestParseStreamsDeduplicatesExactTimestampAndLine(t *testing.T) {
+	raw := json.RawMessage(`{"resultType":"streams","result":[
+		{"stream":{"pod":"a"},"values":[["3","newest"],["2","same"],["1","same"]]},
+		{"stream":{"pod":"b"},"values":[["2","same"],["2","different"],["1","same"]]}
+	]}`)
+	got, err := parseStreams(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []logs.Line{
+		{Timestamp: time.Unix(0, 3).UTC(), Line: "newest", Attrs: map[string]string{"pod": "a"}},
+		{Timestamp: time.Unix(0, 2).UTC(), Line: "same", Attrs: map[string]string{"pod": "a"}},
+		{Timestamp: time.Unix(0, 2).UTC(), Line: "different", Attrs: map[string]string{"pod": "b"}},
+		{Timestamp: time.Unix(0, 1).UTC(), Line: "same", Attrs: map[string]string{"pod": "a"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("lines = %+v, want %+v", got, want)
+	}
+}
+
 func TestFetchRecent_LabelMapTranslation(t *testing.T) {
 	rec := &recorder{}
 	srv := newServer(t, rec, streamsBody(stream([2]string{"1", "x"})))
@@ -273,6 +294,9 @@ func TestFetchRecent_FilteredThenFallback(t *testing.T) {
 		if len(rec.paths) != 1 {
 			t.Fatalf("expected exactly 1 call, got %d", len(rec.paths))
 		}
+		if !got.Filtered {
+			t.Fatal("filtered hit must report Filtered")
+		}
 		if !strings.Contains(got.Query, `|~ "error"`) {
 			t.Errorf("Fetched.Query should be the filtered query: %q", got.Query)
 		}
@@ -301,6 +325,9 @@ func TestFetchRecent_FilteredThenFallback(t *testing.T) {
 		if len(got.Lines) != 1 {
 			t.Errorf("fallback lines = %d, want 1", len(got.Lines))
 		}
+		if got.Filtered {
+			t.Fatal("fallback lines must not report Filtered")
+		}
 	})
 
 	t.Run("line_filter empty: single call, no fallback", func(t *testing.T) {
@@ -317,7 +344,52 @@ func TestFetchRecent_FilteredThenFallback(t *testing.T) {
 		if got.Query != `{namespace="prod"}` {
 			t.Errorf("Query = %q", got.Query)
 		}
+		if got.Filtered {
+			t.Fatal("unfiltered query must not report Filtered")
+		}
 	})
+}
+
+func TestFetchRecentBounded_FilteredFlag(t *testing.T) {
+	rec := &recorder{}
+	srv := newServer(t, rec, streamsBody(stream([2]string{"1", "ERROR x"})))
+	c := NewClient(Config{BaseURL: srv.URL, LineFilter: `|~ "error"`})
+	got, err := c.FetchRecentBounded(context.Background(), sel("namespace", "prod"), time.Unix(0, 0), time.Now(), 50,
+		func() error { return nil }, func(bool, error) {})
+	if err != nil || !got.Filtered || len(rec.queries) != 1 {
+		t.Fatalf("bounded filtered result = %+v, calls %v, err %v", got, rec.queries, err)
+	}
+}
+
+func TestFetchContrast_OnlyDefaultSingleRegex(t *testing.T) {
+	const pattern = `(?i)(error|warn|fatal|panic|fail)`
+	for _, tc := range []struct {
+		name, filter, wantQuery string
+	}{
+		{"quoted", `|~ "` + pattern + `"`, `{namespace="prod"} !~ "` + pattern + `"`},
+		{"backtick", "|~ `" + pattern + "`", "{namespace=\"prod\"} !~ `" + pattern + "`"},
+		{"multi-stage", `|~ "` + pattern + `" |= "payment"`, ""},
+		{"different regex", `|~ "error"`, ""},
+		{"exact filter", `|= "error"`, ""},
+		{"empty", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			srv := newServer(t, rec, streamsBody(stream([2]string{"1", "Transaction complete."})))
+			c := NewClient(Config{BaseURL: srv.URL, LineFilter: tc.filter})
+			got, err := c.FetchContrast(context.Background(), sel("namespace", "prod"), time.Unix(0, 0), time.Now(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantQuery == "" {
+				if len(rec.queries) != 0 || len(got.Lines) != 0 {
+					t.Fatalf("unsupported filter queried: %v, %+v", rec.queries, got)
+				}
+			} else if len(rec.queries) != 1 || rec.queries[0] != tc.wantQuery || got.Query != tc.wantQuery || len(got.Lines) != 1 || rec.limits[0] != "10" {
+				t.Fatalf("contrast = %+v, queries %v, limits %v", got, rec.queries, rec.limits)
+			}
+		})
+	}
 }
 
 // TestFetchRecent_FilteredBudgetExhaustedNoFallback proves the filtered and
@@ -454,5 +526,26 @@ func TestQueryRange_DefaultsDirectionBackward(t *testing.T) {
 	}
 	if rec.limits[0] != "" {
 		t.Errorf("limit should be omitted when 0, got %q", rec.limits[0])
+	}
+}
+
+func TestParseStreams_PreservesFirstAttributesWhenDeduplicating(t *testing.T) {
+	raw := json.RawMessage(`{"resultType":"streams","result":[
+ {"stream":{"service_name":"api","loyalty_level":"gold"},"values":[["1718630591000000000","Transaction complete."]]},
+ {"stream":{"service_name":"api","loyalty_level":"silver"},"values":[["1718630591000000000","Transaction complete."]]}
+ ]}`)
+	lines, err := parseStreams(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("duplicate streams produced %d lines", len(lines))
+	}
+	encoded, err := json.Marshal(lines[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"attrs":{"loyalty_level":"gold","service_name":"api"}`) {
+		t.Fatalf("first stream attributes lost: %s", encoded)
 	}
 }

@@ -466,6 +466,7 @@ presence-based: setting `base_url` turns the connector on; an explicit
 | `timeout_seconds` | int | `10` | Total budget for one incident's metric enrichment fetch. Shared across every scope queried, each of which gets an equal slice so a slow query cannot starve the rest |
 | `default_range_minutes` | int | `60` | Default lookback window for range queries |
 | `max_series` | int | `1000` | Server-side cap on the number of series each enrichment query may return, bounding the payload a broad selector pulls during an alert storm |
+| `label_map` | map | — | Optional alert-label to series-label names, e.g. `service: service_name`; an empty target drops the label |
 
 `max_series` keeps metric enrichment from self-inflicting timeouts during a
 storm: a bare `{instance="…"}` selector can otherwise pull every series for a

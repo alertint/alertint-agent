@@ -571,11 +571,11 @@ func (o llmHealthAssessmentObservation) Finish(outcome situation.L2Outcome, tran
 // llmhealth.Classify reads: nil for a healthy call (accepted, contradicted,
 // or a correctly discarded stale completion), the real transport error for
 // a dependency-class failure, and a reason-bearing content-class error for
-// a malformed (ErrResponseMalformed) or contract-violating
-// (llm.ErrSchemaViolation) proposal.
+// a malformed proposal (ErrResponseMalformed). Policy and capability
+// rejections are valid provider responses and do not impair LLM health.
 func assessmentHealthError(outcome situation.L2Outcome, transportErr error) error {
 	switch outcome {
-	case situation.L2OutcomeAccepted, situation.L2OutcomeContradicted, situation.L2OutcomeStaleBasis:
+	case situation.L2OutcomeAccepted, situation.L2OutcomeContradicted, situation.L2OutcomeStaleBasis, situation.L2OutcomePolicyRejected, situation.L2OutcomeCapabilityRejected:
 		return nil
 	case situation.L2OutcomeTransportFailure, situation.L2OutcomeRateLimited:
 		if transportErr != nil {
@@ -584,8 +584,6 @@ func assessmentHealthError(outcome situation.L2Outcome, transportErr error) erro
 		return errors.New("assessment: transport-class outcome without a typed transport error")
 	case situation.L2OutcomeMalformed:
 		return fmt.Errorf("%w: assessment proposal did not parse as the required semantic proposal shape", llmhealth.ErrResponseMalformed)
-	case situation.L2OutcomePolicyRejected, situation.L2OutcomeCapabilityRejected:
-		return fmt.Errorf("%w: assessment proposal %s", llm.ErrSchemaViolation, outcome)
 	default:
 		return fmt.Errorf("%w: unrecognized assessment outcome %q", llm.ErrSchemaViolation, outcome)
 	}

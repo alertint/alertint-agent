@@ -4,10 +4,15 @@ package acutetriage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/logs"
@@ -19,12 +24,14 @@ import (
 // can replay exactly what the LLM saw. The same value feeds both the prompt and
 // persistence — one fetch, two uses.
 type LogEnrichment struct {
-	Source string      `json:"source"`          // src.Name()
-	Query  string      `json:"query,omitempty"` // the native query that ran ("" if none built)
-	Start  time.Time   `json:"start"`
-	End    time.Time   `json:"end"`
-	Lines  []logs.Line `json:"lines,omitempty"` // normalized, newest-first
-	Note   string      `json:"note,omitempty"`  // why Lines is empty (queried-empty / timeout / error / no-selector)
+	Source       string      `json:"source"`          // src.Name()
+	Query        string      `json:"query,omitempty"` // the native query that ran ("" if none built)
+	Start        time.Time   `json:"start"`
+	End          time.Time   `json:"end"`
+	Lines        []logs.Line `json:"lines,omitempty"` // normalized, newest-first
+	Note         string      `json:"note,omitempty"`  // why Lines is empty (queried-empty / timeout / error / no-selector)
+	Contrast     []logs.Line `json:"contrast,omitempty"`
+	ContrastNote string      `json:"contrast_note,omitempty"`
 	// SpanStart is the requested window start before any max_window_minutes
 	// clamp; zero when no clamp applied. Lets the prompt say "recent-only".
 	SpanStart            time.Time `json:"span_start,omitzero"`
@@ -139,8 +146,7 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		}
 	}
 
-	lines := logs.Normalize(fetched.Lines, logs.MaxBytes, logs.MaxLineChars)
-	if len(lines) == 0 {
+	if len(fetched.Lines) == 0 {
 		// Queried but empty — the most likely first-run failure (selector/schema
 		// mismatch). Name the real query so the operator can fix loki.label_map.
 		logger.Info("acutetriage: logs: query returned no lines — check label_map / line_filter",
@@ -156,6 +162,22 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		}
 	}
 
+	var contrast []logs.Line
+	var contrastNote string
+	contrastSource, canContrast := src.(logs.ContrastSource)
+	if fetched.Filtered && canContrast {
+		sample, contrastErr := contrastSource.FetchContrast(ctx, sel, start, end, 20)
+		if contrastErr != nil {
+			contrastNote = "comparison sample unavailable: " + contrastErr.Error()
+		} else {
+			contrast = sample.Lines[:min(len(sample.Lines), 10)]
+		}
+	}
+
+	combined := append(append([]logs.Line(nil), fetched.Lines...), contrast...)
+	selectLogAttrs(combined)
+	lines := logs.Normalize(combined[:len(fetched.Lines)], logs.MaxBytes, logs.MaxLineChars)
+	contrast = logs.Normalize(combined[len(fetched.Lines):], logs.MaxBytes, logs.MaxLineChars)
 	// Action-trail success line: one INFO per fetch that returned lines, the
 	// happy-path sibling of the three absence breadcrumbs above.
 	logger.Info("loki fetched",
@@ -167,14 +189,129 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	)
 
 	return &LogEnrichment{
-		Source:    source,
-		Query:     fetched.Query,
-		Start:     start,
-		End:       end,
-		SpanStart: spanStart,
-		Lines:     lines,
-		Outcome:   OutcomeFetched,
+		Source:       source,
+		Query:        fetched.Query,
+		Start:        start,
+		End:          end,
+		SpanStart:    spanStart,
+		Lines:        lines,
+		Contrast:     contrast,
+		ContrastNote: contrastNote,
+		Outcome:      OutcomeFetched,
 	}
+}
+
+var contrastTokenRe = regexp.MustCompile(`[A-Za-z_][\w.]*=[\w.:-]+`)
+
+// inconclusiveTokens finds shared error tokens whose key is absent from the
+// comparison sample. It uses the same sorted, three-token limit as the prompt.
+func inconclusiveTokens(errLines, cmpLines []logs.Line) []string {
+	if len(errLines) == 0 {
+		return nil
+	}
+	common := map[string]bool{}
+	for i, line := range errLines {
+		present := map[string]bool{}
+		for _, token := range contrastTokenRe.FindAllString(line.Line, -1) {
+			present[token] = true
+		}
+		if i == 0 {
+			common = present
+		} else {
+			for token := range common {
+				if !present[token] {
+					delete(common, token)
+				}
+			}
+		}
+	}
+	tokens := make([]string, 0, len(common))
+	for token := range common {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	if len(tokens) > 3 {
+		tokens = tokens[:3]
+	}
+	var missing []string
+	for _, token := range tokens {
+		key, _, _ := strings.Cut(token, "=")
+		found := false
+		for _, line := range cmpLines {
+			for _, candidate := range contrastTokenRe.FindAllString(line.Line, -1) {
+				if strings.HasPrefix(candidate, key+"=") {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, token)
+		}
+	}
+	return missing
+}
+
+// contrastSummary compares message tokens present in every error line with
+// the sampled lines the default error filter excluded.
+func contrastSummary(errLines, cmpLines []logs.Line) []string {
+	if len(errLines) == 0 {
+		return nil
+	}
+	common := map[string]bool{}
+	for i, line := range errLines {
+		present := map[string]bool{}
+		for _, token := range contrastTokenRe.FindAllString(line.Line, -1) {
+			present[token] = true
+		}
+		if i == 0 {
+			common = present
+		} else {
+			for token := range common {
+				if !present[token] {
+					delete(common, token)
+				}
+			}
+		}
+	}
+	tokens := make([]string, 0, len(common))
+	for token := range common {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	if len(tokens) > 3 {
+		tokens = tokens[:3]
+	}
+	missing := make(map[string]bool)
+	for _, token := range inconclusiveTokens(errLines, cmpLines) {
+		missing[token] = true
+	}
+	var summary []string
+	for _, token := range tokens {
+		key, _, _ := strings.Cut(token, "=")
+		if missing[token] {
+			summary = append(summary, fmt.Sprintf("`%s` is on all %d error lines; the comparison lines don't carry `%s`, so the affected group is unknown.", token, len(errLines), key))
+			continue
+		}
+		count := 0
+		for _, line := range cmpLines {
+			lineTokens := contrastTokenRe.FindAllString(line.Line, -1)
+			onLine := false
+			for _, candidate := range lineTokens {
+				if candidate == token {
+					onLine = true
+				}
+			}
+			if onLine {
+				count++
+			}
+		}
+		summary = append(summary, fmt.Sprintf("`%s`: on %d/%d error lines, on %d/%d comparison lines", token, len(errLines), len(errLines), count, len(cmpLines)))
+	}
+	return summary
 }
 
 // buildLogSelector builds the incident's generic log selector: for each
@@ -235,4 +372,60 @@ func sharedLabelValues(alerts []store.Alert) map[string][]string {
 		out[k] = vs
 	}
 	return out
+}
+
+// selectLogAttrs keeps varying, small categorical attributes across both
+// samples. Absence is distinct from an empty value when counting categories.
+func selectLogAttrs(lines []logs.Line) {
+	type value struct {
+		text    string
+		present bool
+	}
+	values := make(map[string]map[value]bool)
+	counts := make(map[string]int)
+	for _, line := range lines {
+		for key, text := range line.Attrs {
+			if values[key] == nil {
+				values[key] = make(map[value]bool)
+			}
+			values[key][value{text, true}] = true
+			counts[key]++
+		}
+	}
+	keys := make([]string, 0, len(values))
+	for key, distinct := range values {
+		if counts[key] < len(lines) {
+			distinct[value{}] = true
+		}
+		if len(distinct) > 1 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(values[keys[i]]) != len(values[keys[j]]) {
+			return len(values[keys[i]]) < len(values[keys[j]])
+		}
+		return keys[i] < keys[j]
+	})
+	hexID := regexp.MustCompile(`(?i)^[0-9a-f]{16,}$`)
+	for i := range lines {
+		var attrs map[string]string
+		for _, key := range keys {
+			text, ok := lines[i].Attrs[key]
+			if !ok || utf8.RuneCountInString(text) > 64 || strings.ContainsAny(text, "\r\n") || hexID.MatchString(strings.ReplaceAll(text, "-", "")) {
+				continue
+			}
+			if _, err := strconv.ParseFloat(text, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+				continue
+			}
+			if attrs == nil {
+				attrs = make(map[string]string)
+			}
+			attrs[key] = text
+			if len(attrs) == 8 {
+				break
+			}
+		}
+		lines[i].Attrs = attrs
+	}
 }

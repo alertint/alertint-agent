@@ -17,6 +17,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 // metricPhysicalKeys are the physical-identity allowlist keys — the ones that
@@ -24,6 +25,10 @@ import (
 // alerting rules and commonly exist on no series, so the R9 retry drops them.
 var metricPhysicalKeys = map[string]bool{
 	"namespace": true, "pod": true, "container": true, "instance": true,
+}
+
+var alertBookkeepingMetrics = map[string]bool{
+	"ALERTS": true, "ALERTS_FOR_STATE": true,
 }
 
 // buildMetricSelector builds the incident's generic metric selector: for each
@@ -124,7 +129,7 @@ func extraSelectorValues(shared map[string][]string, extras []string) map[string
 // machines. extraSel empty (no extras configured or none shared) keeps the
 // pre-existing bare shape. The no-regression guard holds: the member alert
 // carries the extra label itself, so its own series still match.
-func instanceSupplements(alerts []store.Alert, extraSel map[string][]string) []string {
+func instanceSupplements(alerts []store.Alert, extraSel map[string][]string, labelMap map[string]string) []string {
 	instances := uniqueInstances(alerts)
 	out := make([]string, 0, len(instances))
 	for _, inst := range instances {
@@ -132,7 +137,9 @@ func instanceSupplements(alerts []store.Alert, extraSel map[string][]string) []s
 		for k, vs := range extraSel {
 			sel[k] = vs
 		}
-		out = append(out, renderPromMatcher(sel))
+		if matcher := renderPromMatcher(translateSelector(sel, labelMap)); matcher != "" {
+			out = append(out, matcher)
+		}
 	}
 	return out
 }
@@ -144,15 +151,20 @@ func instanceSupplements(alerts []store.Alert, extraSel map[string][]string) []s
 // that alerting rules attach but that exist on no series. Returns "" when the
 // shared selector has no built-in logical key — a retry would then equal the
 // primary, so there is nothing to rescue.
-func renderPhysicalCore(shared map[string][]string, extras []string) string {
+func renderPhysicalCore(shared map[string][]string, extras []string, labelMap map[string]string) string {
 	extraSet := make(map[string]bool, len(extras))
 	for _, k := range extras {
 		extraSet[k] = true
 	}
+	for _, target := range labelMap {
+		if target != "" {
+			extraSet[target] = true
+		}
+	}
 	core := make(map[string][]string)
 	hasLogical := false
 	for k, vs := range shared {
-		if metricPhysicalKeys[k] || extraSet[k] {
+		if metricPhysicalKeys[k] || extraSet[k] || labelMap[k] != "" {
 			core[k] = vs
 		} else {
 			hasLogical = true
@@ -161,7 +173,7 @@ func renderPhysicalCore(shared map[string][]string, extras []string) string {
 	if !hasLogical {
 		return ""
 	}
-	return renderPromMatcher(core)
+	return renderPromMatcher(translateSelector(core, labelMap))
 }
 
 // memberLabelPairs collects every non-empty (key,value) label pair across all
@@ -183,20 +195,24 @@ func memberLabelPairs(alerts []store.Alert) map[string]bool {
 // __name__) — renamed from the old instance-only Instance field, since scope is
 // no longer instance-only (Outstanding Q3).
 type MetricSnapshot struct {
-	Series string `json:"series"`
-	Metric string `json:"metric"`
-	Value  string `json:"value"`
+	Series        string `json:"series"`
+	Metric        string `json:"metric"`
+	Value         string `json:"value"`
+	Baseline      string `json:"baseline,omitempty"`
+	Increase      string `json:"increase,omitempty"`
+	PriorIncrease string `json:"prior_increase,omitempty"`
 }
 
 // rankSeries parses a Prometheus instant-vector data blob (the "data" field of
-// the API envelope), filters system metrics, and returns at most limit snapshots
-// ranked by (overlap desc, metric asc, numeric-value desc within family,
+// the API envelope), filters system metrics and alert bookkeeping series, and
+// returns at most limit snapshots ranked by (overlap desc, change desc, metric asc,
+// numeric-value desc within family,
 // series-identity asc) — a total, response-order-independent order (R5/R11,
 // ADR-0025). overlap counts a series' (k,v) label pairs (excluding __name__)
 // that a member alert also carries.
 //
-//nolint:unparam // limit is a general cap parameter exercised directly by unit tests; production callers happen to share one constant (maxSnapshotsPerScope) today.
-func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []MetricSnapshot {
+//nolint:unparam,gocyclo // bounded ranking keeps filtering, overlap, baseline change, and family cap together; limit is also exercised by unit tests.
+func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int, baseline, prior map[string]string) []MetricSnapshot {
 	var d struct {
 		Result []struct {
 			Metric map[string]string `json:"metric"`
@@ -211,11 +227,12 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 		overlap int
 		value   float64
 		numeric bool
+		change  float64
 	}
 	cands := make([]cand, 0, len(d.Result))
 	for _, r := range d.Result {
 		name := r.Metric["__name__"]
-		if name == "" || isSystemMetric(name) {
+		if name == "" || isSystemMetric(name) || alertBookkeepingMetrics[name] || strings.HasSuffix(name, "_bucket") {
 			continue
 		}
 		val, ok := r.Value[1].(string)
@@ -236,16 +253,54 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 		// a literal "+Inf"/"-Inf" sample already is.
 		f, err := strconv.ParseFloat(val, 64)
 		numericErr := err == nil || errors.Is(err, strconv.ErrRange)
+		snap := MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val}
+		var change float64
+		//nolint:nestif // Counter resets and both intervals stay beside gauge baseline ranking.
+		if baseline != nil {
+			before, found := baseline[name+"\x00"+snap.Series]
+			if !found {
+				snap.Baseline = "none"
+				change = math.Inf(1)
+			} else {
+				snap.Baseline = before
+				if b, parseErr := strconv.ParseFloat(before, 64); parseErr == nil && numericErr && !math.IsNaN(f) && !math.IsNaN(b) && !math.IsInf(f, 0) && !math.IsInf(b, 0) {
+					change = math.Abs(f-b) / math.Max(math.Abs(b), 1e-9)
+					if strings.HasSuffix(name, "_total") || strings.HasSuffix(name, "_count") || strings.HasSuffix(name, "_sum") {
+						if p, err := strconv.ParseFloat(prior[name+"\x00"+snap.Series], 64); err == nil && !math.IsNaN(p) && !math.IsInf(p, 0) {
+							nowDelta, prevDelta := f-b, b-p
+							if nowDelta < 0 {
+								nowDelta = f
+							}
+							if prevDelta < 0 {
+								prevDelta = b
+							}
+							snap.Increase = strconv.FormatFloat(nowDelta, 'g', -1, 64)
+							snap.PriorIncrease = strconv.FormatFloat(prevDelta, 'g', -1, 64)
+							change = 0
+							if prevDelta > 0 {
+								change = math.Abs(nowDelta-prevDelta) / prevDelta
+							} else if nowDelta > 0 {
+								change = math.Inf(1)
+							}
+						}
+					}
+				}
+			}
+		}
 		cands = append(cands, cand{
-			snap:    MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val},
+			snap:    snap,
 			overlap: overlap,
 			value:   f,
 			numeric: numericErr && !math.IsNaN(f),
+			change:  change,
 		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		if cands[i].overlap != cands[j].overlap {
 			return cands[i].overlap > cands[j].overlap
+		}
+		if cands[i].change != cands[j].change {
+			return cands[i].change > cands[j].change
 		}
 		if cands[i].snap.Metric != cands[j].snap.Metric {
 			return cands[i].snap.Metric < cands[j].snap.Metric
@@ -269,14 +324,35 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 			break
 		}
 		if c.overlap <= comparatorMaxOverlap {
-			if perFamily[c.snap.Metric] >= maxSeriesPerFamily {
+			family := strings.TrimSuffix(strings.TrimSuffix(c.snap.Metric, "_count"), "_sum")
+			if perFamily[family] >= maxSeriesPerFamily {
 				continue
 			}
-			perFamily[c.snap.Metric]++
+			perFamily[family]++
 		}
 		out = append(out, c.snap)
 	}
 	return out
+}
+
+func metricBaseline(raw json.RawMessage) map[string]string {
+	var d struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string `json:"metric"`
+			Value  [2]any            `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil || d.ResultType != "vector" {
+		return nil
+	}
+	values := make(map[string]string, len(d.Result))
+	for _, r := range d.Result {
+		if value, ok := r.Value[1].(string); ok {
+			values[r.Metric["__name__"]+"\x00"+formatSeriesIdentity(r.Metric)] = value
+		}
+	}
+	return values
 }
 
 // formatSeriesIdentity renders a series' identifying labels (all but __name__) as
@@ -346,6 +422,7 @@ type MetricParams struct {
 	TimeoutSeconds      int
 	MaxSeries           int      // server-side per-query series cap (0 = unbounded)
 	ExtraSelectorLabels []string // operator-configured allowlist extension (ADR-0035)
+	LabelMap            map[string]string
 }
 
 // metricQuerier is the narrow read surface FetchMetrics needs. *prometheus.Client
@@ -356,19 +433,57 @@ type metricQuerier interface {
 	QueryInstant(ctx context.Context, expr string, t time.Time, limit int) (json.RawMessage, error)
 }
 
+type recordingRuleReader interface {
+	RecordingRules(ctx context.Context) (map[string]string, error)
+}
+
+// usedRecordingRules retains only dependencies of the alert expressions.
+func usedRecordingRules(exprs []string, definitions map[string]string) map[string]string {
+	used := make(map[string]string)
+	visited := make(map[string]bool)
+	var visit func(string)
+	visit = func(query string) {
+		expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
+		if err != nil {
+			return
+		}
+		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+			if sel, ok := node.(*parser.VectorSelector); ok {
+				name := vectorMetricName(sel)
+				if definition, ok := definitions[name]; ok && !visited[name] {
+					visited[name] = true
+					used[name] = definition
+					visit(definition)
+				}
+			}
+			return nil
+		})
+	}
+	for _, expr := range exprs {
+		visit(expr)
+	}
+	if len(used) == 0 {
+		return nil
+	}
+	return used
+}
+
 // MetricEnrichment is the live-metric context attached to a triage prompt and
 // persisted under the "metrics" envelope key. Mirrors LogEnrichment: the same
 // value feeds both the prompt and persistence (one fetch, two uses), and its
 // Outcome makes fetched / queried-empty / no-selector / backend-failed
 // distinguishable in logs, the audit trail, and the notification card (R4/R8).
 type MetricEnrichment struct {
-	At                   time.Time        `json:"at"`
-	Selector             string           `json:"selector,omitempty"`  // rendered matcher(s) that ran (breadcrumb/replay)
-	Snapshots            []MetricSnapshot `json:"snapshots,omitempty"` // ranked, capped
-	Note                 string           `json:"note,omitempty"`      // why Snapshots is empty
-	Outcome              Outcome          `json:"outcome,omitempty"`
-	RequestAttempts      int              `json:"request_attempts,omitempty"`
-	RequestAttemptsKnown bool             `json:"request_attempts_known,omitempty"`
+	At                   time.Time         `json:"at"`
+	Selector             string            `json:"selector,omitempty"` // rendered matcher(s) that ran (breadcrumb/replay)
+	RuleExprs            []string          `json:"rule_exprs,omitempty"`
+	RecordingRules       map[string]string `json:"recording_rules,omitempty"`
+	LabelMap             map[string]string `json:"label_map,omitempty"`
+	Snapshots            []MetricSnapshot  `json:"snapshots,omitempty"` // ranked, capped
+	Note                 string            `json:"note,omitempty"`      // why Snapshots is empty
+	Outcome              Outcome           `json:"outcome,omitempty"`
+	RequestAttempts      int               `json:"request_attempts,omitempty"`
+	RequestAttemptsKnown bool              `json:"request_attempts_known,omitempty"`
 }
 
 // FetchMetrics queries Prometheus for the incident's series at time t using the
@@ -388,7 +503,9 @@ type MetricEnrichment struct {
 // TimeoutSeconds. A scope that is reachable-but-slow yields OutcomeDegraded, kept
 // distinct from a genuine outage (OutcomeFailed) so a self-inflicted timeout does
 // not read as "unreachable" or cap confidence.
-func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (out *MetricEnrichment) {
+//
+//nolint:gocyclo // Rule-expression and selector queries share one bounded fetch and outcome decision.
+func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, ruleExprs []string, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (out *MetricEnrichment) {
 	if prom == nil {
 		return nil
 	}
@@ -401,12 +518,108 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			out.RequestAttempts, out.RequestAttemptsKnown = requestCounter.Attempts(), true
 		}
 	}()
+	fetchCtx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
+	defer cancel()
+	// Spend only the remaining metric budget on optional definitions, so a
+	// slow or unsupported rules endpoint cannot starve the metric queries.
+	defer func() {
+		reader, ok := prom.(recordingRuleReader)
+		if !ok || out == nil || len(ruleExprs) == 0 {
+			return
+		}
+		definitions, err := reader.RecordingRules(fetchCtx)
+		if err != nil {
+			logger.Warn("acutetriage: metrics: recording rules unavailable", "err", err, "incident", incidentID)
+			return
+		}
+		out.RecordingRules = usedRecordingRules(ruleExprs, definitions)
+	}()
 
 	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
 	logDroppedSelectorKeys(ctx, logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
+	memberPairs := memberLabelPairs(alerts)
+	var snapshots []MetricSnapshot
+	learned := make(map[string]map[string]bool)
+	ambiguous := make(map[string]bool)
+	var perRule time.Duration
+	if len(ruleExprs) > 0 {
+		perRule = time.Duration(params.TimeoutSeconds) * time.Second / 2 / time.Duration(len(ruleExprs))
+	}
+	for _, expr := range ruleExprs {
+		ruleCtx, ruleCancel := context.WithTimeout(fetchCtx, perRule)
+		data, err := prom.QueryInstant(ruleCtx, expr, t, params.MaxSeries)
+		ruleCancel()
+		if err != nil {
+			logger.Warn("acutetriage: metrics: alert rule query failed", "err", err, "incident", incidentID)
+			continue
+		}
+		var result struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Metric map[string]string `json:"metric"`
+				Value  [2]any            `json:"value"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(data, &result) != nil || result.ResultType != "vector" {
+			continue
+		}
+		joined := result.Result[:0]
+		for _, series := range result.Result {
+			matchesAlert := true
+			for key, value := range series.Metric {
+				if key != "__name__" && !memberPairs[key+"\x00"+value] {
+					matchesAlert = false
+					break
+				}
+			}
+			if !matchesAlert {
+				continue
+			}
+			for source, values := range shared {
+				if len(values) != 1 {
+					continue
+				}
+				var match string
+				for target, value := range series.Metric {
+					if target != "__name__" && value == values[0] {
+						if match != "" {
+							ambiguous[source] = true
+						}
+						match = target
+					}
+				}
+				if match != "" {
+					if learned[source] == nil {
+						learned[source] = make(map[string]bool)
+					}
+					learned[source][match] = true
+				}
+			}
+			if series.Metric["__name__"] == "" {
+				series.Metric["__name__"] = "alert_rule_expr"
+			}
+			joined = append(joined, series)
+		}
+		result.Result = joined
+		filtered, err := json.Marshal(result)
+		if err == nil {
+			snapshots = append(snapshots, rankSeries(filtered, memberPairs, maxSnapshotsPerScope, nil, nil)...)
+		}
+	}
+	labelMap := make(map[string]string)
+	for source, targets := range learned {
+		if !ambiguous[source] && len(targets) == 1 {
+			for target := range targets {
+				labelMap[source] = target
+			}
+		}
+	}
+	for source, target := range params.LabelMap {
+		labelMap[source] = target
+	}
 	extraSel := extraSelectorValues(shared, params.ExtraSelectorLabels)
-	primary := renderPromMatcher(shared)
-	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels)
+	primary := renderPromMatcher(translateSelector(shared, labelMap))
+	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels, labelMap)
 
 	// Ordered, deduped scope list: primary first (it alone gets the retry), then
 	// the per-instance supplements not already equal to the primary, capped at
@@ -418,7 +631,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		scopes = append(scopes, primary)
 		seen[primary] = true
 	}
-	supplements := instanceSupplements(alerts, extraSel)
+	supplements := instanceSupplements(alerts, extraSel, labelMap)
 	added := 0
 	for _, sup := range supplements {
 		if seen[sup] {
@@ -434,29 +647,39 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		added++
 	}
 
-	if len(scopes) == 0 {
+	if len(scopes) == 0 && len(snapshots) == 0 {
 		logger.Info("acutetriage: metrics: no usable selector for this incident",
 			"shared_labels", formatLabels(sharedLabels(alerts)), "incident", incidentID)
-		return &MetricEnrichment{At: t, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector, RequestAttemptsKnown: true}
+		return &MetricEnrichment{At: t, RuleExprs: ruleExprs, LabelMap: labelMap, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector, RequestAttemptsKnown: true}
 	}
-
-	fetchCtx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
-	defer cancel()
 
 	// Give each scope its own slice of the budget: a slow query then times out on
 	// its own sub-deadline instead of consuming the whole budget and starving the
 	// remaining scopes into a false "backend failed" (the storm cascade). The
 	// outer fetchCtx still caps total added latency at ~TimeoutSeconds; this only
 	// shares that budget out so no single scope can monopolize it.
-	perScope := time.Duration(params.TimeoutSeconds) * time.Second / time.Duration(len(scopes))
-	queryScope := func(scope string) (json.RawMessage, error) {
+	var perScope time.Duration
+	if len(scopes) > 0 {
+		perScope = time.Duration(params.TimeoutSeconds) * time.Second / time.Duration(len(scopes))
+	}
+	queryScope := func(scope string) (json.RawMessage, map[string]string, map[string]string, error) {
 		scopeCtx, scopeCancel := context.WithTimeout(fetchCtx, perScope)
 		defer scopeCancel()
-		return prom.QueryInstant(scopeCtx, scope, t, params.MaxSeries)
+		data, err := prom.QueryInstant(scopeCtx, scope, t, params.MaxSeries)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		before, err := prom.QueryInstant(scopeCtx, scope, t.Add(-15*time.Minute), params.MaxSeries)
+		if err != nil {
+			return data, nil, nil, nil
+		}
+		prior, err := prom.QueryInstant(scopeCtx, scope, t.Add(-30*time.Minute), params.MaxSeries)
+		if err != nil {
+			return data, metricBaseline(before), nil, nil
+		}
+		return data, metricBaseline(before), metricBaseline(prior), nil
 	}
 
-	memberPairs := memberLabelPairs(alerts)
-	var snapshots []MetricSnapshot
 	// Track the two failure kinds apart: a per-scope deadline (backend reachable
 	// but slow) is a self-inflicted timeout, distinct from a genuine outage
 	// (connection refused / DNS / non-200). classify records each.
@@ -473,27 +696,28 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			"selector", scope, "err", err, "incident", incidentID)
 	}
 	for i, scope := range scopes {
-		data, err := queryScope(scope)
+		data, baseline, prior, err := queryScope(scope)
 		if err != nil {
 			classify(scope, err)
 			continue
 		}
-		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope)
-		// R9 physical-core rescue — primary scope only, when it matched nothing and
+		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope, baseline, prior)
+		// R9 physical-core rescue — primary scope only, when no usable series
+		// remain (including when only alert bookkeeping series matched) and
 		// dropping the logical keys yields a distinct selector.
 		if i == 0 && scope == primary && len(ranked) == 0 && physicalFallback != "" && physicalFallback != primary {
-			data2, err2 := queryScope(physicalFallback)
+			data2, baseline2, prior2, err2 := queryScope(physicalFallback)
 			if err2 != nil {
 				classify(physicalFallback, err2)
 			} else {
-				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope)
+				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope, baseline2, prior2)
 			}
 		}
 		snapshots = append(snapshots, ranked...)
 	}
 	snapshots = dedupeSnapshots(snapshots)
 
-	enr := &MetricEnrichment{At: t, Selector: strings.Join(scopes, ", ")}
+	enr := &MetricEnrichment{At: t, Selector: strings.Join(scopes, ", "), RuleExprs: ruleExprs, LabelMap: labelMap}
 	switch {
 	case len(snapshots) > 0:
 		enr.Snapshots = snapshots

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -46,6 +47,53 @@ func TestRunPromQLRejectsInvalidLocally(t *testing.T) {
 	runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "inc-62")
 	if calls != 0 || q.Outcome != OutcomeInvalid || q.Result != "invalid query (not executed)" {
 		t.Fatalf("calls=%d query=%+v", calls, q)
+	}
+}
+
+func TestRunPromQL_Units(t *testing.T) {
+	for _, tc := range []struct{ expr, prefix string }{
+		{`rate(x[5m])`, "[per second] "},
+		{`sum by (service) (rate(x[5m]))`, "[per second] "},
+		{`irate(x[5m])`, "[per second] "},
+		{`rate(x[5m]) > 0.1`, "[per second] "},
+		{`(sum(rate(x[5m]))) > 0.1`, "[per second] "},
+		{`increase(x[15m])`, "[count over 15m] "},
+		{`sum(increase(x[1h]))`, "[count over 1h] "},
+		{`rate(x[5m]) / rate(y[5m])`, ""},
+		{`rate(x[5m]) * 60`, ""},
+		{`x`, ""},
+		{`service:span_error_ratio:5m`, ""},
+		{`rate(x[5m]) > bool 0.1`, ""},
+		{`count(rate(x[5m]))`, ""},
+		{`stdvar(rate(x[5m]))`, ""},
+	} {
+		t.Run(tc.expr, func(t *testing.T) {
+			prom := fakeQuerier(func(string) (json.RawMessage, error) {
+				return vector(s(map[string]string{"service": "api"}, "0.063")), nil
+			})
+			q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: tc.expr}
+			runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "units")
+			want := tc.prefix + `{service="api"} 0.063`
+			if q.Outcome != OutcomeFetched || q.Result != want {
+				t.Fatalf("outcome=%s result=%q, want %q", q.Outcome, q.Result, want)
+			}
+		})
+	}
+}
+
+func TestRunPromQL_UnitPrefixSurvivesCap(t *testing.T) {
+	prom := fakeQuerier(func(string) (json.RawMessage, error) {
+		return vector(s(map[string]string{"service": strings.Repeat("a", 600)}, "0.063")), nil
+	})
+	q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: `rate(x[5m])`}
+	runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "units")
+	// The existing cap retains 400 characters plus its ellipsis marker.
+	if utf8.RuneCountInString(q.Result) > 401 || !strings.HasPrefix(q.Result, "[per second] ") {
+		t.Fatalf("unit lost at cap: %q", q.Result)
+	}
+	continuation := callTwoContinuation(json.RawMessage(`{}`), &VerificationRound{Queries: []VerificationQuery{q}}, nil)
+	if !strings.Contains(continuation, q.Result) || !strings.Contains(continuation, "Values marked [per second] are rates, not fractions; never present them as percentages.") {
+		t.Fatalf("verification prompt lost unit or instruction: %s", continuation)
 	}
 }
 
@@ -133,7 +181,7 @@ func TestParentScopeBroadKeys(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{
 		"namespace": "paysvc-sandbox-staging", "pod": "stolon-0", "instance": "10.0.0.1:9100",
 	})}
-	if got := parentScope(alerts, nil); got != `{namespace="paysvc-sandbox-staging"}` {
+	if got := parentScope(alerts, nil, nil); got != `{namespace="paysvc-sandbox-staging"}` {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -141,7 +189,7 @@ func TestParentScopeBroadKeys(t *testing.T) {
 // Host-only alert → unscoped global ratio (spec R2).
 func TestParentScopeInstanceOnlyIsUnscoped(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"instance": "10.0.0.1:9100"})}
-	if got := parentScope(alerts, nil); got != "" {
+	if got := parentScope(alerts, nil, nil); got != "" {
 		t.Fatalf("want unscoped, got %q", got)
 	}
 }
@@ -565,6 +613,74 @@ func TestAnyUnfetched_IncidentsInWindowOnlyCountsAsUnfetched(t *testing.T) {
 	}
 }
 
+func TestCauseUnconfirmed(t *testing.T) {
+	index := func(n int) *int { return &n }
+	checks := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{
+		{Source: "floor", Kind: kindUpRatio, Outcome: OutcomeFetched},
+		{Source: "floor", Kind: kindIncidentsInWindow, Outcome: OutcomeFetched},
+		{Source: "model", Kind: kindPromQL, Outcome: OutcomeFetched},
+		{Source: "operator", Kind: kindZabbixReachability, Outcome: OutcomeFetched},
+		{Source: "model", Kind: kindPromQL, Outcome: OutcomeEmpty},
+	}}}}
+	tests := []struct {
+		name            string
+		ver             *VerificationEnrichment
+		hasMetricSource bool
+		causeCheck      *int
+		want            bool
+	}{
+		{name: "no citation", ver: checks, hasMetricSource: true, want: true},
+		{name: "zero", ver: checks, hasMetricSource: true, causeCheck: index(0), want: true},
+		{name: "out of range", ver: checks, hasMetricSource: true, causeCheck: index(6), want: true},
+		{name: "floor", ver: checks, hasMetricSource: true, causeCheck: index(1), want: true},
+		{name: "incidents", ver: checks, hasMetricSource: true, causeCheck: index(2), want: true},
+		{name: "model fetched", ver: checks, hasMetricSource: true, causeCheck: index(3), want: false},
+		{name: "operator zabbix fetched", ver: checks, hasMetricSource: true, causeCheck: index(4), want: false},
+		{name: "model empty", ver: checks, hasMetricSource: true, causeCheck: index(5), want: true},
+		{name: "no verification", hasMetricSource: true, want: false},
+		{name: "no metric source", ver: checks, causeCheck: index(3), want: false},
+		{name: "last round only", ver: &VerificationEnrichment{Rounds: []VerificationRound{checks.Rounds[0], {Queries: []VerificationQuery{{Source: "model", Kind: kindPromQL, Outcome: OutcomeEmpty}}}}}, hasMetricSource: true, causeCheck: index(3), want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := causeUnconfirmed(tc.ver, tc.hasMetricSource, tc.causeCheck, nil, nil); got != tc.want {
+				t.Errorf("causeUnconfirmed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLabelUnconfirmed(t *testing.T) {
+	tests := []struct {
+		name         string
+		analysisName string
+		overallIssue string
+		wantName     string
+		wantIssue    string
+	}{
+		{"plain", "Token failure", "auth defect", "Unconfirmed: Token failure", "Unconfirmed (no check tested this cause): auth defect"},
+		{"already labeled any case", "UNCONFIRMED: Token failure", "Unconfirmed (no check tested this cause): auth defect", "UNCONFIRMED: Token failure", "Unconfirmed (no check tested this cause): auth defect"},
+		{"one field labeled", "Unconfirmed: Token failure", "auth defect", "Unconfirmed: Token failure", "Unconfirmed (no check tested this cause): auth defect"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := llmResponse{
+				AnalysisName: tc.analysisName, OverallIssue: tc.overallIssue,
+				Severity: "high", Confidence: 0.68,
+				CorrelationFindings: []string{"checkout also failing"},
+				MemoryVerdict:       "silent", OperatorRuling: json.RawMessage(`{"ruling":"unverifiable"}`),
+			}
+			want := resp
+			want.AnalysisName, want.OverallIssue = tc.wantName, tc.wantIssue
+			labelUnconfirmed(&resp, []string{"no check tested this cause"})
+			labelUnconfirmed(&resp, []string{"no check tested this cause"})
+			if !reflect.DeepEqual(resp, want) {
+				t.Errorf("labeled response = %+v, want %+v", resp, want)
+			}
+		})
+	}
+}
+
 func TestVerificationLive(t *testing.T) {
 	if verificationLive(nil) {
 		t.Fatal("nil enrichment must not be live")
@@ -631,7 +747,7 @@ func TestRenderVerificationResults(t *testing.T) {
 	if !strings.Contains(out, "peer-scope health") {
 		t.Fatalf("render missing why: %q", out)
 	}
-	if !strings.Contains(out, "- [operator/promql]") {
+	if !strings.Contains(out, "- [3] [operator/promql]") || !strings.Contains(out, "- [1] [floor/up_ratio]") {
 		t.Fatalf("render must tag operator-sourced queries, got %q", out)
 	}
 }
@@ -770,5 +886,93 @@ func TestRunVerificationWith_PerQueryFloor_FullElevenQueryCase(t *testing.T) {
 		if d < minPerQueryTimeout-tolerance {
 			t.Errorf("query %d: per-query slice %v below the floor %v", i, d, minPerQueryTimeout)
 		}
+	}
+}
+
+func TestCauseUnconfirmed_AlertSignalIsNotCause(t *testing.T) {
+	rule := `service:span_error_ratio:5m > 0.05 and sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])) > 0.02`
+	for _, tc := range []struct {
+		name, expr, service string
+		rules               []string
+		want                bool
+	}{
+		{"own signal", `service:span_error_ratio:5m{service_name="payment"} > 0.05`, "payment", []string{rule}, true},
+		{"own signal with shared cluster", `service:span_error_ratio:5m{service_name="payment",cluster="alertint-lab"} > 0.05`, "payment", []string{rule}, true},
+		{"own signal with rule matcher", `rate(traces_span_metrics_calls_total{service_name="payment",span_kind="SPAN_KIND_SERVER"}[5m])`, "payment", []string{rule}, true},
+		{"other service with shared cluster", `service:span_error_ratio:5m{service_name="payment",cluster="alertint-lab"}`, "checkout", []string{rule}, false},
+		{"client span cause check", `sum(rate(traces_span_metrics_calls_total{service_name="checkout",span_kind="SPAN_KIND_CLIENT",span_name="oteldemo.PaymentService/Charge",status_code="STATUS_CODE_ERROR"}[5m]))`, "checkout", []string{rule}, false},
+		{"unrelated label", `service:span_error_ratio:5m{service_name="payment",zone="east"}`, "payment", []string{rule}, false},
+		{"regex with own label", `service:span_error_ratio:5m{service_name="payment",cluster=~"alertint-lab"}`, "payment", []string{rule}, false},
+		{"inequality with own label", `service:span_error_ratio:5m{service_name="payment",cluster!="other"}`, "payment", []string{rule}, false},
+		{"rule matcher without alert label", `rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])`, "payment", []string{rule}, false},
+		{"explicit metric name in query", `{__name__="service:span_error_ratio:5m",service_name="payment"} > 0.05`, "payment", []string{rule}, true},
+		{"explicit metric name in rule", `service:span_error_ratio:5m{service_name="payment"}`, "payment", []string{`{__name__="service:span_error_ratio:5m"} > 0.05`}, true},
+		{"explicit other metric", `{__name__="token_errors_total",service_name="payment"}`, "payment", []string{rule}, false},
+		{"broad metric name", `{__name__=~"service:.*",service_name="payment"}`, "payment", []string{rule}, false},
+
+		{"other service", `service:span_error_ratio:5m{service_name="payment"}`, "checkout", []string{rule}, false},
+		{"different metric", `token_errors_total{service_name="payment"}`, "payment", []string{rule}, false},
+		{"mixed metrics", `service:span_error_ratio:5m{service_name="payment"} + token_errors_total{service_name="payment"}`, "payment", []string{rule}, false},
+		{"translated label", `service:span_error_ratio:5m{service_name="payment"}`, "payment", []string{rule}, true},
+		{"no rule", `service:span_error_ratio:5m{service_name="payment"}`, "payment", nil, false},
+		{"invalid rule", `service:span_error_ratio:5m{service_name="payment"}`, "payment", []string{"bad("}, false},
+		{"invalid query", "bad(", "payment", []string{rule}, false},
+		{"regex is not equality", `service:span_error_ratio:5m{service_name=~"payment"}`, "payment", []string{rule}, false},
+		{"unnamed selector", `{service_name="payment"}`, "payment", []string{rule}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			labels := map[string]string{
+				"alertname": "ServiceErrorRatio", "cluster": "alertint-lab", "environment": "lab",
+				"service": tc.service, "service_name": tc.service, "severity": "critical", "team": "shop",
+			}
+			if tc.name == "translated label" {
+				delete(labels, "service_name")
+			}
+			ver := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{{Source: "model", Kind: kindPromQL, Outcome: OutcomeFetched, Expr: tc.expr}}}}}
+			n := 1
+			metrics := &MetricEnrichment{RuleExprs: tc.rules, LabelMap: map[string]string{"service": "service_name"}}
+			got := causeUnconfirmed(ver, true, &n, metrics, []store.Alert{{Labels: labels}})
+			if got != tc.want {
+				t.Fatalf("causeUnconfirmed=%v, want %v", got, tc.want)
+			}
+			if got {
+				resp := llmResponse{AnalysisName: "Token failure", OverallIssue: "Token failure"}
+				labelUnconfirmed(&resp, []string{"no check tested this cause"})
+				if resp.AnalysisName != "Unconfirmed: Token failure" {
+					t.Fatal(resp.AnalysisName)
+				}
+			}
+		})
+	}
+}
+
+func TestCauseUnconfirmed_RecordingRuleSignal(t *testing.T) {
+	const rule = `service:span_error_ratio:5m > 0.05 and sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m])) > 0.02`
+	const recording = `sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}[5m])) / sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m]))`
+	for _, tc := range []struct {
+		name, service, expr string
+		definitions         map[string]string
+		want                bool
+	}{
+		{"own error spans", "payment", `sum by (service_name) (rate(traces_span_metrics_calls_total{service_name="payment",status_code="STATUS_CODE_ERROR",span_kind="SPAN_KIND_SERVER"}[5m]))`, map[string]string{"service:span_error_ratio:5m": recording}, true},
+		{"specific client spans", "checkout", `sum(rate(traces_span_metrics_calls_total{service_name="checkout",span_kind="SPAN_KIND_CLIENT",span_name="oteldemo.PaymentService/Charge",status_code="STATUS_CODE_ERROR"}[5m]))`, map[string]string{"service:span_error_ratio:5m": recording}, false},
+		{"no definitions", "payment", `sum by (service_name) (rate(traces_span_metrics_calls_total{service_name="payment",status_code="STATUS_CODE_ERROR",span_kind="SPAN_KIND_SERVER"}[5m]))`, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// JSON exercises the persisted input consumed by replay, too.
+			raw, err := json.Marshal(map[string]any{"rule_exprs": []string{rule}, "recording_rules": tc.definitions, "label_map": map[string]string{"service": "service_name"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metrics MetricEnrichment
+			if err := json.Unmarshal(raw, &metrics); err != nil {
+				t.Fatal(err)
+			}
+			ver := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{{Source: "model", Kind: kindPromQL, Outcome: OutcomeFetched, Expr: tc.expr}}}}}
+			n := 1
+			if got := causeUnconfirmed(ver, true, &n, &metrics, []store.Alert{{Labels: map[string]string{"service": tc.service}}}); got != tc.want {
+				t.Fatalf("causeUnconfirmed=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }

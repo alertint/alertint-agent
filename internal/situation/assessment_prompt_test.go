@@ -59,6 +59,18 @@ func TestAssessmentPromptCarriesPriorSemanticAssessment(t *testing.T) {
 	}
 }
 
+func TestAssessmentPromptDoesNotPreserveUnsupportedPriorClaims(t *testing.T) {
+	p, err := BuildAssessmentPrompt(snapshotFor(t, baseSnapshotInput(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"or the value is no longer allowed", `impact "confirmed" and causality "supported" require a`, `When eligible_reasons is empty, impact must not be "confirmed" and causality must not be "supported", even if prior_assessment used them.`} {
+		if !strings.Contains(p.Prefix, want) {
+			t.Errorf("missing grounding instruction %q", want)
+		}
+	}
+}
+
 func TestAssessmentPromptBuildStatesForbiddenFields(t *testing.T) {
 	snap := snapshotFor(t, baseSnapshotInput(t))
 	p, err := BuildAssessmentPrompt(snap)

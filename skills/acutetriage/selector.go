@@ -21,6 +21,31 @@ func mergeSelectorKeys(base, extras []string) []string {
 	return append(append(make([]string, 0, len(base)+len(extras)), base...), extras...)
 }
 
+// translateSelector applies alert-label to series-label names without changing
+// the caller's selector. Multiple source keys targeting one series label merge.
+func translateSelector(sel map[string][]string, m map[string]string) map[string][]string {
+	out := make(map[string][]string, len(sel))
+	if len(m) == 0 {
+		for key, values := range sel {
+			out[key] = append([]string(nil), values...)
+		}
+		return out
+	}
+	for key, values := range sel {
+		if target, ok := m[key]; ok {
+			if target == "" {
+				continue
+			}
+			key = target
+		}
+		out[key] = append(out[key], values...)
+	}
+	for key, values := range out {
+		out[key] = dedupeSortedValues(values)
+	}
+	return out
+}
+
 // allowedSelectorKeys returns the effective selector allowlist: the built-in
 // keys plus the operator-configured extra selector labels (ADR-0035). Extras
 // arrive pre-validated (syntax, no duplicates against the built-ins), so a
