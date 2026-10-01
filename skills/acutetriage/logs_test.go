@@ -558,7 +558,7 @@ func TestFetchLogs_ContrastLimitBeforeDedup(t *testing.T) {
 					limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
 					if err != nil {
 						t.Error(err)
-						w.WriteHeader(400)
+						w.WriteHeader(http.StatusBadRequest)
 						return
 					}
 					n := limit
@@ -599,10 +599,10 @@ func TestFetchLogs_ContrastLimitBeforeDedup(t *testing.T) {
 }
 
 func TestFetchLogs_AttributeLengthCountsCharacters(t *testing.T) {
-	value := strings.Repeat("界", 64)
+	value := strings.Repeat("\u754c", 64)
 	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{
 		{Line: "first", Attrs: map[string]string{"category": value}},
-		{Line: "second", Attrs: map[string]string{"category": value + "界"}},
+		{Line: "second", Attrs: map[string]string{"category": value + "\u754c"}},
 	}}}
 	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
 	if len(e.Lines) != 2 || e.Lines[0].Attrs["category"] != value {

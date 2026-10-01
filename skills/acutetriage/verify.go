@@ -126,6 +126,8 @@ func parseCauseCheck(raw json.RawMessage) *int {
 }
 
 // causeUnconfirmed checks call 2's cited result in the round it saw.
+//
+//nolint:gocyclo // Keep the conservative cause predicate and its rule/selector checks together.
 func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCheck *int, metrics *MetricEnrichment, alerts []store.Alert) bool {
 	if ver == nil || !hasMetricSource {
 		return false
@@ -198,11 +200,12 @@ func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool, causeCh
 					continue
 				}
 				pair := matcher.Name + "\x00" + matcher.Value
-				if matcher.Type != labels.MatchEqual {
+				switch {
+				case matcher.Type != labels.MatchEqual:
 					allMatchersInScope = false
-				} else if pairs[pair] {
+				case pairs[pair]:
 					ownLabel = true
-				} else if !rulePairs[pair] {
+				case !rulePairs[pair]:
 					allMatchersInScope = false
 				}
 			}

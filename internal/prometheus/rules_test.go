@@ -26,7 +26,7 @@ func TestRecordingRules(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls++
-				if r.URL.Path != "/api/v1/rules" || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer test" || r.Header.Get("X-Scope-OrgID") != "tenant" {
+				if r.URL.Path != "/api/v1/rules" || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer test" || r.Header.Get("X-Scope-Orgid") != "tenant" {
 					t.Errorf("unexpected rules request: %s %s headers=%v", r.Method, r.URL, r.Header)
 				}
 				w.WriteHeader(tc.status)
@@ -34,7 +34,7 @@ func TestRecordingRules(t *testing.T) {
 			}))
 			defer server.Close()
 			reader, ok := any(NewClient(Config{BaseURL: server.URL, BearerToken: "test", OrgID: "tenant"})).(interface {
-				RecordingRules(context.Context) (map[string]string, error)
+				RecordingRules(ctx context.Context) (map[string]string, error)
 			})
 			if !ok {
 				t.Fatal("client does not expose recording rules")

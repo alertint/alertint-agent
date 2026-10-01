@@ -23,10 +23,6 @@ import (
 type LocalStore interface {
 	PriorTerminalSituationSummaries(ctx context.Context, groupKey, excludeSituationID string, limit int) ([]model.LocalSituationSummary, error)
 	RecentFindingsForGroup(ctx context.Context, groupKey string, since time.Time, limit int) ([]model.LocalFinding, error)
-	// SourceLifecycleObservations derives the Situation's per-member
-	// authoritative lifecycle observations from its durable deliveries,
-	// with deadlines anchored at each observation plus the horizon tier.
-	SourceLifecycleObservations(ctx context.Context, situationID, horizonTier string) ([]model.SourceLifecycleObservation, error)
 }
 
 // StoreReadExecutor implements observation.Executor for store_read: bounded
@@ -45,9 +41,7 @@ type StoreReadExecutor struct {
 // out of its "prior Situations" evidence.
 type storeReadParameters struct {
 	GroupKey           string `json:"group_key"`
-	SituationID        string `json:"situation_id,omitempty"`
 	ExcludeSituationID string `json:"exclude_situation_id,omitempty"`
-	HorizonTier        string `json:"horizon_tier,omitempty"`
 }
 
 func (e *StoreReadExecutor) clock() time.Time {
@@ -89,49 +83,43 @@ func (e *StoreReadExecutor) Execute(ctx context.Context, plan model.Plan, _ obse
 
 	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
 	var facts []model.Fact
-	// The lifecycle phase's authoritative evidence (review F1): one
-	// source_lifecycle fact carrying every member's latest delivery
-	// observation, so the controller's reducer folds real firing/resolved
-	// truth with observation-anchored deadlines. Non-material: the
-	// Situation's symptoms already cover lifecycle state in the material
-	// hash, and an observation clock must never churn it.
-	if plan.Phase == model.PhaseLifecycle && params.SituationID != "" {
-		observations, err := e.Store.SourceLifecycleObservations(ctx, params.SituationID, params.HorizonTier)
+	omitted := 0
+	if len(situations) > 0 {
+		f, kept, err := situationSummaryFact(plan, situations, now, expiresAt)
 		if err != nil {
-			return model.Run{}, fmt.Errorf("connectors: store_read source lifecycle: %w", err)
+			return model.Run{}, err
 		}
-		if len(observations) > 0 {
-			f, err := sourceLifecycleFact(plan, observations, now, expiresAt)
-			if err != nil {
-				return model.Run{}, err
-			}
+		omitted += len(situations) - kept
+		if kept > 0 {
 			facts = append(facts, f)
 		}
 	}
-	if len(situations) > 0 {
-		f, err := situationSummaryFact(plan, situations, now, expiresAt)
-		if err != nil {
-			return model.Run{}, err
-		}
-		facts = append(facts, f)
-	}
 	if len(findings) > 0 {
-		f, err := findingsFact(plan, findings, now, expiresAt)
+		f, kept, err := findingsFact(plan, findings, now, expiresAt)
 		if err != nil {
 			return model.Run{}, err
 		}
-		facts = append(facts, f)
+		omitted += len(findings) - kept
+		if kept > 0 {
+			facts = append(facts, f)
+		}
 	}
 
 	status := model.ResultConfirmedEmpty
 	if len(facts) > 0 {
 		status = model.ResultConfirmedValue
 	}
+	var limitations []string
+	if omitted > 0 {
+		status = model.ResultTruncated
+		limitations = []string{limitationFactBytesCapped}
+	}
 	return model.Run{
 		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:   model.Coverage{Start: plan.Start, End: plan.End, Complete: true, Returned: len(facts)},
-		Facts:      facts,
-		ObservedAt: now, ExpiresAt: expiresAt,
+		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: omitted == 0, Returned: len(facts), Omitted: omitted},
+		Facts:           facts,
+		LimitationCodes: limitations,
+		ObservedAt:      now, ExpiresAt: expiresAt,
 	}, nil
 }
 
@@ -144,53 +132,46 @@ func unresolvedRun(plan model.Plan, now time.Time) model.Run {
 	}
 }
 
-// situationSummaryFact uses Kind "capability_result" — the same generic kind
-// findingsFact below uses — never "source_lifecycle": that kind is reserved
-// for Plan 4 Task 6's own per-Alert firing/resolved SourceObservation
-// evidence, which store_read has none of.
-func situationSummaryFact(plan model.Plan, situations []model.LocalSituationSummary, now, expiresAt time.Time) (model.Fact, error) {
-	value, err := json.Marshal(situations)
+// situationSummaryFact keeps the newest prior rows that fit one fact.
+func situationSummaryFact(plan model.Plan, situations []model.LocalSituationSummary, now, expiresAt time.Time) (model.Fact, int, error) {
+	value, kept, err := fitFactValue(len(situations), func(n int) ([]byte, error) {
+		return json.Marshal(situations[:n])
+	})
 	if err != nil {
-		return model.Fact{}, fmt.Errorf("connectors: marshal prior situation summaries: %w", err)
+		return model.Fact{}, 0, fmt.Errorf("connectors: marshal prior situation summaries: %w", err)
 	}
-	return model.Fact{
-		ID: factID(plan.ID, "prior_situation", value), RunID: "run:" + plan.ID,
-		Kind: "capability_result", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: model.ResultConfirmedValue, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}, nil
+	if kept == 0 {
+		return model.Fact{}, 0, nil
+	}
+	return storeReadFact(plan, "prior_situation", value, kept < len(situations), now, expiresAt), kept, nil
 }
 
-func findingsFact(plan model.Plan, findings []model.LocalFinding, now, expiresAt time.Time) (model.Fact, error) {
-	value, err := json.Marshal(findings)
+// findingsFact keeps the newest findings that fit one fact.
+func findingsFact(plan model.Plan, findings []model.LocalFinding, now, expiresAt time.Time) (model.Fact, int, error) {
+	value, kept, err := fitFactValue(len(findings), func(n int) ([]byte, error) {
+		return json.Marshal(findings[:n])
+	})
 	if err != nil {
-		return model.Fact{}, fmt.Errorf("connectors: marshal recent findings: %w", err)
+		return model.Fact{}, 0, fmt.Errorf("connectors: marshal recent findings: %w", err)
 	}
-	return model.Fact{
-		ID: factID(plan.ID, "prior_finding", value), RunID: "run:" + plan.ID,
-		Kind: "capability_result", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: model.ResultConfirmedValue, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}, nil
+	if kept == 0 {
+		return model.Fact{}, 0, nil
+	}
+	return storeReadFact(plan, "prior_finding", value, kept < len(findings), now, expiresAt), kept, nil
 }
 
-// sourceLifecycleFact carries the lifecycle phase's per-member
-// observations (kind "source_lifecycle", the JSON array shape internal/
-// situation's reload decodes).
-func sourceLifecycleFact(plan model.Plan, observations []model.SourceLifecycleObservation, now, expiresAt time.Time) (model.Fact, error) {
-	value, err := json.Marshal(observations)
-	if err != nil {
-		return model.Fact{}, fmt.Errorf("connectors: marshal source lifecycle observations: %w", err)
+func storeReadFact(plan model.Plan, label string, value []byte, truncated bool, now, expiresAt time.Time) model.Fact {
+	status := model.ResultConfirmedValue
+	if truncated {
+		status = model.ResultTruncated
 	}
 	return model.Fact{
-		ID: factID(plan.ID, "source_lifecycle", value), RunID: "run:" + plan.ID,
-		Kind: "source_lifecycle", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
+		ID: factID(plan.ID, label, value), RunID: "run:" + plan.ID,
+		Kind: "capability_result", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
 		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: model.ResultConfirmedValue, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: false,
-	}, nil
+		ResultStatus: status, Freshness: model.FreshnessFresh,
+		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
+	}
 }
 
 func digestOf(value []byte) string {

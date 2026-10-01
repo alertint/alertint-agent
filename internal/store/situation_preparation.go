@@ -1631,13 +1631,9 @@ func (s *Store) AccrueInvestigationCredit(ctx context.Context, situationID strin
 // documented "no preparer configured, or no cycle has begun yet" meaning.
 //
 // Runs carry a bounded latest-per-subject view across compatible cycles.
-// Lifecycle decodes fresh "source_lifecycle"-kind Fact Values —
-// each one a JSON array of situation.SourceObservation (the same
-// one-fact-per-run-holds-an-array convention situationSummaryFact/
-// findingsFact already use) — into ReduceSourceLifecycle's own input shape.
-// No connector in this build writes that kind yet (Task 9 wires the real
-// adapter); this decode path is exercised here by direct fixture only,
-// exactly like RecoveryGraceDuration's own not-yet-reachable polling branch.
+// Fresh "source_lifecycle" facts decode into ReduceSourceLifecycle's input
+// shape. Since issue 126 no connector writes that kind; the decoder remains
+// for older stored facts and future real source adapters.
 func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, now time.Time) (situation.PreparedState, error) {
 	sourceViews, err := loadCurrentZabbixSourceObservationsTx(ctx, tx, situationID, now)
 	if err != nil {

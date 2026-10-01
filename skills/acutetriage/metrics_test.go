@@ -16,6 +16,7 @@ import (
 
 type rulesProm struct {
 	fakeProm
+
 	rules      map[string]string
 	err        error
 	rulesCalls int

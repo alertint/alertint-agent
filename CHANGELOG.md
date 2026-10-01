@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prometheus alert bookkeeping series no longer count as metric evidence or
   prevent a physical-core retry from finding application metrics.
 
+## [0.14.2] - 2026-09-30
+
+### Fixed
+
+- Situations with many distinct alerts no longer get stuck retrying with
+  `value exceeds 16384 bytes`. The redundant lifecycle copy is removed, and
+  oversized past findings and prior situations are trimmed and marked
+  truncated. Stuck Situations resume on their next retry after upgrade.
+
 ## [0.14.1] - 2026-09-29
 
 ### Fixed
@@ -987,7 +996,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.2...HEAD
+[0.14.2]: https://github.com/alertint/alertint-agent/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/alertint/alertint-agent/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0
 [0.13.9]: https://github.com/alertint/alertint-agent/compare/v0.13.8...v0.13.9

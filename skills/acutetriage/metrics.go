@@ -255,6 +255,7 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int, bas
 		numericErr := err == nil || errors.Is(err, strconv.ErrRange)
 		snap := MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val}
 		var change float64
+		//nolint:nestif // Counter resets and both intervals stay beside gauge baseline ranking.
 		if baseline != nil {
 			before, found := baseline[name+"\x00"+snap.Series]
 			if !found {
@@ -433,7 +434,7 @@ type metricQuerier interface {
 }
 
 type recordingRuleReader interface {
-	RecordingRules(context.Context) (map[string]string, error)
+	RecordingRules(ctx context.Context) (map[string]string, error)
 }
 
 // usedRecordingRules retains only dependencies of the alert expressions.
