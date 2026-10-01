@@ -736,7 +736,7 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 	}
 	lines := make([]string, 0, len(results))
 	for _, r := range results {
-		lines = append(lines, fmt.Sprintf("%s %s", r.Series, r.Value))
+		lines = append(lines, fmt.Sprintf("%s %s", r.Value, r.Series))
 	}
 	q.Outcome = OutcomeFetched
 	q.Result = capText(promQLResultUnit(q.Expr)+flattenRecalled(strings.Join(lines, "; ")), 400)

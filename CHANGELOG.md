@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PromQL verification results show values before labels so long series identities
+  do not truncate the first displayed value.
 - Sonnet 5.5 requests use its supported `between_tools` mode to disable
   up-front thinking; earlier models retain `disabled`.
 - Verification results label explicit rates per second and increases over their

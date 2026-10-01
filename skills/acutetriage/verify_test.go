@@ -73,7 +73,7 @@ func TestRunPromQL_Units(t *testing.T) {
 			})
 			q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: tc.expr}
 			runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "units")
-			want := tc.prefix + `{service="api"} 0.063`
+			want := tc.prefix + `0.063 {service="api"}`
 			if q.Outcome != OutcomeFetched || q.Result != want {
 				t.Fatalf("outcome=%s result=%q, want %q", q.Outcome, q.Result, want)
 			}
@@ -94,6 +94,31 @@ func TestRunPromQL_UnitPrefixSurvivesCap(t *testing.T) {
 	continuation := callTwoContinuation(json.RawMessage(`{}`), &VerificationRound{Queries: []VerificationQuery{q}}, nil)
 	if !strings.Contains(continuation, q.Result) || !strings.Contains(continuation, "Values marked [per second] are rates, not fractions; never present them as percentages.") {
 		t.Fatalf("verification prompt lost unit or instruction: %s", continuation)
+	}
+}
+
+func TestRunPromQL_ValueSurvivesLabelCap(t *testing.T) {
+	for _, tc := range []struct{ expr, value, unit string }{
+		{`rate(requests_total[5m])`, "0.063", "[per second] "},
+		{`increase(requests_total[15m])`, "12", "[count over 15m] "},
+		{`temperature`, "-3.5", ""},
+	} {
+		t.Run(tc.expr, func(t *testing.T) {
+			prom := fakeQuerier(func(string) (json.RawMessage, error) {
+				return vector(s(map[string]string{"resource": strings.Repeat("a", 600)}, tc.value)), nil
+			})
+			q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: tc.expr}
+			runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "value-cap")
+			if q.Outcome != OutcomeFetched || !strings.Contains(q.Result, tc.value) ||
+				!strings.HasPrefix(q.Result, tc.unit) || !strings.HasSuffix(q.Result, "…") ||
+				utf8.RuneCountInString(q.Result) > 401 {
+				t.Fatalf("value or unit lost at label cap: %+v", q)
+			}
+			continuation := callTwoContinuation(json.RawMessage(`{}`), &VerificationRound{Queries: []VerificationQuery{q}}, nil)
+			if !strings.Contains(continuation, q.Result) {
+				t.Fatalf("verification prompt lost the retained result: %s", continuation)
+			}
+		})
 	}
 }
 
