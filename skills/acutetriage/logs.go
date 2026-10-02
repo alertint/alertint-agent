@@ -374,8 +374,8 @@ func sharedLabelValues(alerts []store.Alert) map[string][]string {
 	return out
 }
 
-// selectLogAttrs keeps varying, small categorical attributes across both
-// samples. Absence is distinct from an empty value when counting categories.
+// selectLogAttrs keeps bounded exception details and varying, small categorical
+// attributes across both samples. Absence counts as a distinct category.
 func selectLogAttrs(lines []logs.Line) {
 	type value struct {
 		text    string
@@ -397,11 +397,14 @@ func selectLogAttrs(lines []logs.Line) {
 		if counts[key] < len(lines) {
 			distinct[value{}] = true
 		}
-		if len(distinct) > 1 {
+		if len(distinct) > 1 || exceptionLogAttr(key) {
 			keys = append(keys, key)
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool {
+		if exceptionLogAttr(keys[i]) != exceptionLogAttr(keys[j]) {
+			return exceptionLogAttr(keys[i])
+		}
 		if len(values[keys[i]]) != len(values[keys[j]]) {
 			return len(values[keys[i]]) < len(values[keys[j]])
 		}
@@ -412,11 +415,18 @@ func selectLogAttrs(lines []logs.Line) {
 		var attrs map[string]string
 		for _, key := range keys {
 			text, ok := lines[i].Attrs[key]
-			if !ok || utf8.RuneCountInString(text) > 64 || strings.ContainsAny(text, "\r\n") || hexID.MatchString(strings.ReplaceAll(text, "-", "")) {
+			if !ok {
 				continue
 			}
-			if _, err := strconv.ParseFloat(text, 64); err == nil || errors.Is(err, strconv.ErrRange) {
-				continue
+			if exceptionLogAttr(key) {
+				text = capText(flattenRecalled(text), 255) // Include the truncation ellipsis within 256 runes.
+			} else {
+				if utf8.RuneCountInString(text) > 64 || strings.ContainsAny(text, "\r\n") || hexID.MatchString(strings.ReplaceAll(text, "-", "")) {
+					continue
+				}
+				if _, err := strconv.ParseFloat(text, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+					continue
+				}
 			}
 			if attrs == nil {
 				attrs = make(map[string]string)
@@ -428,4 +438,10 @@ func selectLogAttrs(lines []logs.Line) {
 		}
 		lines[i].Attrs = attrs
 	}
+}
+
+// OTel exception details are log content, even when identical across the sample.
+// Loki's translated keys and original semantic-convention keys are both accepted.
+func exceptionLogAttr(key string) bool {
+	return key == "exception_message" || key == "exception.message" || key == "exception_type" || key == "exception.type"
 }
