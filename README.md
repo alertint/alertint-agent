@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/alertint-logo.svg" alt="AlertINT" width="110">
+  <img src="docs/assets/alertint-logo.svg" alt="AlertINT" width="96">
 </p>
 
 <h1 align="center">AlertINT</h1>
@@ -13,100 +13,105 @@
   <a href="https://artifacthub.io/packages/helm/alertint-agent/alertint-agent"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/alertint-agent" alt="Artifact Hub"></a>
 </p>
 
+<p align="center">
+  <a href="https://alertint.com/docs/getting-started/quickstart">Quickstart</a> ·
+  <a href="https://alertint.com/docs">Docs</a> ·
+  <a href="https://github.com/alertint/alertint-agent/discussions">Discussions</a> ·
+  <a href="#design-partners-wanted">Design partners wanted</a>
+</p>
+
 > AlertINT turns infrastructure alerts into investigated incidents and serves them to the AI tools you already use, over MCP — a self-hosted agent that runs inside your own network.
 
-A single Go binary that sits between your monitoring stack and your AI agent. It ingests alert webhooks from Alertmanager and Zabbix, correlates them into incidents through an open rule engine, and runs an LLM triage that falsifies its own draft verdict before the finding ships. Findings go to stdout and, when configured, to one Slack channel; the incident state — plus read-only Prometheus, Loki, and Zabbix access — is exposed to any MCP client. Corrections your agent captures over MCP steer the next triage of the same failure. Read-only by design. Local state. You bring the LLM key.
-
-**Full documentation: [alertint.com/docs](https://alertint.com/docs)**
-
-## Get started
-
-Install the binary with Go:
-
-```bash
-go install github.com/alertint/alertint-agent/cmd/alertint@latest
-```
-
-The released multi-architecture Docker image is
-`ghcr.io/alertint/alertint-agent:latest`. The
-**[Quickstart](https://alertint.com/docs/getting-started/quickstart)** is the
-canonical walkthrough for the bundled Docker Compose stack, configuration,
-and proving the whole pipeline with one command:
-
-```bash
-alertint drill --config config.yaml
-```
-
-For Kubernetes, install the official Helm chart. It is published as an OCI
-artifact on GHCR and listed on
-[Artifact Hub](https://artifacthub.io/packages/helm/alertint-agent/alertint-agent)
-as an Official repository, published by AlertINT as a verified publisher;
-every release is cosign-signed and ships a values schema:
-
-```bash
-helm install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
-  --set secret.create=true \
-  --set secret.data.ALERTINT_WEBHOOK_TOKEN="$(openssl rand -hex 32)" \
-  --set secret.data.ANTHROPIC_API_KEY=sk-ant-...
-```
-
-For a production installation, manage the Secret outside Helm and use a
-reviewed values file. The
-**[Kubernetes (Helm)](https://alertint.com/docs/getting-started/kubernetes)**
-guide covers that layout and signature verification; the
-[chart README](charts/alertint-agent/README.md) documents every value.
-
-The built-in incident drill plants a fake deploy, fires a burst of
-clearly-marked synthetic alerts through the production ingress, and polls
-until triage prints the finding — a causal analysis naming the planted
-deploy. From zero to that finding takes about ten minutes; then connect an
-MCP client to investigate it, and point Alertmanager or
-[Zabbix](https://alertint.com/docs/integrations/zabbix) at the agent for real
-alerts.
+<p align="center">
+  <img src=".github/assets/incident-story.gif" alt="Twelve alerts become one Slack Situation. AlertINT checks deploys, logs and metrics and names the cause. The engineer's AI agent reads the finding over MCP and adds an operator note, then recovery is detected." width="100%">
+  <br>
+  <sub>Illustrative incident. The services, times and cause are invented.</sub>
+</p>
 
 ## How it works
 
-Two loops close on the triage step: the **[verification
-round](https://alertint.com/docs/concepts/verification-round)** gathers evidence
-chosen to disprove the model's own draft and makes it re-judge before anything
-persists, and an operator correction captured over MCP lands in **[incident
-memory](https://alertint.com/docs/concepts/incident-memory)**, where it steers
-the next triage of that failure group.
+1. **Groups** an alert storm into one Situation.
+2. **Investigates** with read-only evidence: recent changes, logs and metrics. A
+   [verification round](https://alertint.com/docs/concepts/verification-round)
+   challenges the draft before the finding is posted.
+3. **Posts** one evolving Slack thread per Situation.
+4. **Hands off** the full record to Claude Code, Codex or any MCP client.
+   Corrections captured there steer the next triage of the same failure.
 
-The whole pipeline — receivers, correlation, the evidence pack, both loops, and
-the MCP surface — is diagrammed and walked through step by step in
-**[Architecture](https://alertint.com/docs/concepts/architecture)**.
+Read-only by design. Local state. You bring the LLM key.
 
-In the v0.14 release line, a durable **Situation** owns each failure group's
-history: every authoritative
-material change commits one immutable transition and one version of a current
-episode summary, and Slack shows one evolving Situation root plus an
-immutable ordered journal thread instead of a per-incident card. Delivery is
-driven from durable intents that retry indefinitely, open a visible gap after
-five continuous minutes of Slack failure, and replay every affected episode
-in order once Slack returns — see
-**[Slack](https://alertint.com/docs/notifications/slack)**.
-The [Situation workflow](https://alertint.com/docs/concepts/situation-workflow)
-shows the lifecycle and investigation handoff visually.
+## At a glance
+
+| | |
+|---|---|
+| **Alert sources** | Alertmanager, Zabbix |
+| **Read-only evidence** | Prometheus, Loki, Zabbix, Sentry, change-event webhooks (deploys, config, flags) |
+| **Correlation rules** | Open YAML schema, built-in baseline pack, your own local packs |
+| **LLM** | Anthropic, or a self-hosted OpenAI-compatible endpoint (vLLM, SGLang, Ollama, LM Studio) |
+| **Delivers to** | Slack, stdout JSON, and MCP clients (Claude Code, Codex, Cursor, Windsurf) |
+| **Runs as** | Single Go binary, Docker image, or signed Helm chart |
+| **State** | Local SQLite with a hash-chained, verifiable audit log |
+
+## Get started
+
+Docker Compose bundles AlertINT with Prometheus and Alertmanager:
+
+```bash
+git clone https://github.com/alertint/alertint-agent && cd alertint-agent
+cp .env.example .env   # set the ALERTINT_* tokens and your LLM key
+docker compose -f docker/docker-compose.yaml --env-file .env up
+```
+
+Then fire the built-in drill. It plants a fake deploy, sends synthetic alerts
+through the real ingress, and prints the finding:
+
+```bash
+docker compose -f docker/docker-compose.yaml exec agent /alertint drill --config /etc/alertint/config.yaml
+```
+
+Other installs:
+
+- **Kubernetes:** signed Helm chart on Artifact Hub, see the
+  [Helm guide](https://alertint.com/docs/getting-started/kubernetes).
+- **Binary:** `go install github.com/alertint/alertint-agent/cmd/alertint@latest`
+
+Next, [connect an MCP client](https://alertint.com/docs/integrations/mcp-clients)
+and point Alertmanager or
+[Zabbix](https://alertint.com/docs/integrations/zabbix) at the agent. The
+[Quickstart](https://alertint.com/docs/getting-started/quickstart) walks through
+every step.
 
 ## Documentation
 
-- **[Docs home](https://alertint.com/docs)** — quickstart, configuration reference
-- **[Architecture](https://alertint.com/docs/concepts/architecture)** — how the pipeline is built
-- **[Integrations](https://alertint.com/docs/integrations/mcp-clients)** — MCP clients, [Zabbix](https://alertint.com/docs/integrations/zabbix), [Prometheus](https://alertint.com/docs/integrations/prometheus), [Loki](https://alertint.com/docs/integrations/loki), [Slack](https://alertint.com/docs/notifications/slack)
-- **[Verification round](https://alertint.com/docs/concepts/verification-round)** and **[incident memory](https://alertint.com/docs/concepts/incident-memory)** — how triage checks itself and learns from corrections
-- **[Scope and limits](https://alertint.com/docs/concepts/scope-and-limits)** — what it will and won't do
-- **[FAQ](https://alertint.com/docs/concepts/faq)**
-- **[Changelog](CHANGELOG.md)** — notable changes and upgrade notes by release
+- [Quickstart](https://alertint.com/docs/getting-started/quickstart) ·
+  [Configuration](https://alertint.com/docs/getting-started/configuration)
+- [Architecture](https://alertint.com/docs/concepts/architecture) ·
+  [Situation workflow](https://alertint.com/docs/concepts/situation-workflow) ·
+  [Incident memory](https://alertint.com/docs/concepts/incident-memory)
+- [Integrations](https://alertint.com/docs/integrations/mcp-clients) ·
+  [Scope and limits](https://alertint.com/docs/concepts/scope-and-limits) ·
+  [FAQ](https://alertint.com/docs/concepts/faq)
+- [Changelog](CHANGELOG.md)
 
-The [`/docs`](docs/) folder in this repo is the canonical source for those pages — the website renders it at build time. Documentation PRs are welcome here; see [`docs/README.md`](docs/README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+The [`docs/`](docs/) folder is the source of alertint.com/docs. Documentation
+PRs are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Questions and support
+## Design partners wanted
 
-- **Questions** — [GitHub Discussions](https://github.com/alertint/alertint-agent/discussions) (Q&A for "does it work with X", Ideas for what you wish it did)
-- **Bugs** — [Issues](https://github.com/alertint/alertint-agent/issues/new/choose)
-- **Security** — never in public; see [SECURITY.md](SECURITY.md)
+Running Alertmanager or Zabbix in production? We're looking for a few teams to
+run AlertINT on a real stack for a couple of weeks and tell us honestly whether
+the findings hold up.
+[How to join](https://github.com/alertint/alertint-agent/discussions/categories/announcements)
+
+## Community
+
+- **Questions and ideas:** [GitHub Discussions](https://github.com/alertint/alertint-agent/discussions)
+- **Bugs:** [Issues](https://github.com/alertint/alertint-agent/issues/new/choose)
+- **Security:** never in public, see [SECURITY.md](SECURITY.md)
 
 ## License
 
-AlertINT is **[Fair Source](https://fair.io)**, licensed under [FSL-1.1-ALv2](LICENSE) (Functional Source License). Free to read, use, modify, and self-host at any scale. The only restriction is offering the software to others as a competing commercial product or service. Each release converts to Apache 2.0 — full open source — two years after publication. See [fsl.software](https://fsl.software) for the license text.
+[Fair Source](https://fair.io) under [FSL-1.1-ALv2](LICENSE). Free to use,
+modify and self-host at any scale. The only restriction is offering it as a
+competing commercial product. Each release becomes Apache 2.0 two years after
+publication.
