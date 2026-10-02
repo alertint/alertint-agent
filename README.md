@@ -17,7 +17,7 @@
   <a href="https://alertint.com/docs/getting-started/quickstart">Quickstart</a> ·
   <a href="https://alertint.com/docs">Docs</a> ·
   <a href="https://github.com/alertint/alertint-agent/discussions">Discussions</a> ·
-  <a href="#design-partners-wanted">Design partners wanted</a>
+  <a href="#-design-partners-wanted">Design partners wanted</a>
 </p>
 
 > AlertINT turns infrastructure alerts into investigated incidents and serves them to the AI tools you already use, over MCP — a self-hosted agent that runs inside your own network.
