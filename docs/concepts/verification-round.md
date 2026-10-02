@@ -72,7 +72,14 @@ Before call 2, a runner executes:
 
 **Call 2** is a full continuation of call 1 — the same prompt prefix, the
 draft as the model's own prior turn, then every query's result appended
-verbatim. The instruction is explicit: verification results outrank the
+verbatim. Numeric range-vector results are bounded summaries: sample count,
+first and last values with UTC timestamps, finite minimum and maximum,
+decreasing steps between adjacent finite samples, and a nonfinite sample count.
+These summaries are not a full trajectory or proof of a cause. Scalar results
+are retained too; unsupported sample shapes are unavailable rather than empty.
+The existing result length and series limits still apply.
+
+The instruction is explicit: verification results outrank the
 draft, the evidence pack, and any recalled memory. If the checks contradict
 the draft, revise; don't defend it. The result is the finding that persists —
 confidence caps and the memory verdict apply to this final judgment, not the

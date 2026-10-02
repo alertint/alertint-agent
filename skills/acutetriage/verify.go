@@ -759,7 +759,12 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 		classifyErr(q, err)
 		return
 	}
-	results := decodeInstantResults(data)
+	results, decodeErr := decodeVerificationResults(data)
+	if decodeErr != nil {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("unsupported Prometheus result shape")
+		return
+	}
 	if len(results) == 0 {
 		q.Outcome = OutcomeEmpty
 		q.Result = "(no data)"

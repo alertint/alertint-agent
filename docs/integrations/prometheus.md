@@ -138,7 +138,7 @@ that the metric does not exist. System and alert-bookkeeping names are omitted.
 
 Explicit conventional metric suffixes supply base-unit labels such as bytes,
 seconds and nanoseconds. Rate and increase checks preserve these units through
-aggregations and comparison filters. Explicit CPU-time rates also show their
+aggregations and comparison filters. Explicit instant CPU-time rates also show their
 CPU-core equivalent, retaining the original value. Arbitrary arithmetic,
 recording-rule names and ambiguous suffixes do not receive guessed unit labels.
 

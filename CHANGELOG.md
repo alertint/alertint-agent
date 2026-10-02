@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PromQL verification preserves scalar results and summarizes range-vector
+  samples instead of reporting them as empty. Unsupported sample shapes remain
+  explicitly unavailable.
 - Verification distinguishes scrape-target health from application health and
   keeps unmatched target scopes unknown without broadening the query.
 - Metric evidence and checks retain conventional base units; CPU-time rates

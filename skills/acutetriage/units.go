@@ -57,6 +57,10 @@ func expressionUnit(expr parser.Expr) (string, float64) {
 		if unit := metricBaseUnit(vectorMetricName(e)); unit != "" {
 			return "[" + unit + "] ", 0
 		}
+	case *parser.MatrixSelector:
+		return expressionUnit(e.VectorSelector)
+	case *parser.SubqueryExpr:
+		return expressionUnit(e.Expr)
 	case *parser.Call:
 		if e.Func.Name != "rate" && e.Func.Name != "irate" && e.Func.Name != "increase" {
 			return "", 0
