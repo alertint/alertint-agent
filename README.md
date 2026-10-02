@@ -101,8 +101,8 @@ PRs are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Running Alertmanager or Zabbix in production? We're looking for a few teams to
 run AlertINT on a real stack and tell us honestly whether the findings hold up.
-Email [ernests@alertint.com](mailto:ernests@alertint.com) or say hello in
-[Discussions](https://github.com/alertint/alertint-agent/discussions).
+[Read what we'd ask](https://github.com/alertint/alertint-agent/discussions/133)
+and reply there, or email [ernests@alertint.com](mailto:ernests@alertint.com).
 
 ## <img src=".github/assets/icons/community.svg" width="22" height="22" align="absmiddle" alt=""> Community
 
