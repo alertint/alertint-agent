@@ -98,6 +98,8 @@ func TestUserPromptVerificationInstructionQueryGuidance(t *testing.T) {
 	for _, want := range []string{
 		"single-metric",
 		"reuse exact metric names and label keys",
+		"observed metric names alone do not establish their label schema",
+		"matcher keys and values shown together on that metric's own series",
 		"mismatched label schemas returns empty",
 	} {
 		if !strings.Contains(got, want) {
@@ -137,6 +139,8 @@ func TestCallTwoPromptEmptyResultFraming(t *testing.T) {
 	c2 := callTwoContinuation(json.RawMessage(`{"a":1}`), minimalRound(), nil)
 	for _, want := range []string{
 		"confirmed absence",
+		"metric and matcher keys and values were confirmed together on that metric's own series",
+		"a catalog name or labels from another metric or alert do not establish this",
 		"inconclusive",
 		"do NOT lower confidence",
 	} {

@@ -77,6 +77,9 @@ func expressionUnit(expr parser.Expr) (string, float64) {
 		case *parser.SubqueryExpr:
 			window = arg.Range
 			inner, _ := expressionUnit(arg.Expr)
+			if inner == "" {
+				return "", 0
+			}
 			unit = strings.TrimSuffix(strings.TrimPrefix(inner, "["), "] ")
 		}
 		if name != "" {

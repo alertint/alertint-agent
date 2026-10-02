@@ -134,6 +134,8 @@ func TestRunPromQL_BaseUnits(t *testing.T) {
 		{`increase(http_request_duration_seconds_sum[5m])`, "3", `[seconds over 5m] 3 {}`},
 		{`rate(payload_bytes_sum[5m])`, "400", `[bytes per second] 400 {}`},
 		{`increase((sum(worker_memory_bytes))[15m:])`, "32", `[bytes over 15m] 32 {}`},
+		{`increase((worker_memory_bytes * 2)[15m:])`, "32", `32 {}`},
+		{`rate((worker_memory_bytes * 2)[15m:])`, "2", `2 {}`},
 		{`rate((sum(worker_cpu_usage_seconds_total))[5m:])`, "0.2", `[seconds per second] 0.2 {}`},
 
 		{`rate(worker_cpu_usage_nanoseconds_total[5m])`, "0.1", `[nanoseconds per second] 0.1 (1e-10 CPU cores) {}`},

@@ -31,6 +31,11 @@ func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
 		if len(results) != len(entries) {
 			return nil, errors.New("unsupported vector sample")
 		}
+		for _, result := range results {
+			if _, err := strconv.ParseFloat(result.Value, 64); err != nil {
+				return nil, err
+			}
+		}
 		return results, nil
 	case "scalar":
 		var sample [2]any
@@ -38,8 +43,12 @@ func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
 			return nil, err
 		}
 		value, ok := sample[1].(string)
-		if !ok {
+		timestamp, timestampOK := sample[0].(float64)
+		if !ok || !timestampOK || math.IsNaN(timestamp) || math.IsInf(timestamp, 0) {
 			return nil, errors.New("unsupported scalar sample")
+		}
+		if _, err := strconv.ParseFloat(value, 64); err != nil {
+			return nil, err
 		}
 		return []MetricSnapshot{{Series: "{}", Value: value}}, nil
 	case "matrix":

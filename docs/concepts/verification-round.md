@@ -93,6 +93,11 @@ the query matches nothing: at most two of each, with each note limited to
 a result as proof. A missing change record also does not prove that nothing
 changed.
 
+An empty metric query is inconclusive unless the queried metric and its matcher
+keys and values were observed together on that metric's own series. A discovered
+metric name alone does not establish its labels. Malformed numerical results are
+unavailable, not empty; valid `NaN` and infinite values remain visible.
+
 When a metric source is configured, call 2 names the numbered check that
 directly tested its proposed cause. The stored headline and Finding begin with
 "Unconfirmed" unless that cited model or operator check fetched data. Floor

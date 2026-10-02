@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Verification treats empty queries with unconfirmed metric-label combinations
+  as inconclusive and rejects malformed numerical results as unavailable.
 - PromQL verification preserves scalar results and summarizes range-vector
   samples instead of reporting them as empty. Unsupported sample shapes remain
   explicitly unavailable.

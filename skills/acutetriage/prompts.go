@@ -213,8 +213,9 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 	if verify.HasPromQL {
 		b.WriteString(" Write queries that can actually return data: prefer single-metric " +
 			"expressions; reuse exact metric names and label keys visible in the Live metrics " +
-			"section, including its observed metric names; use label keys actually shown on " +
-			"series or alert labels. Unlisted names are unknown, not proven absent; avoid combining two metrics (ratios, and/unless, " +
+			"section; observed metric names alone do not establish their label schema. Use " +
+			"matcher keys and values shown together on that metric's own series, not borrowed " +
+			"from another metric or alert. Unlisted names are unknown, not proven absent; avoid combining two metrics (ratios, and/unless, " +
 			"group_left joins) unless both carry the same label keys — an expression joining " +
 			"metrics with mismatched label schemas returns empty regardless of what is true, " +
 			"and proves nothing.")
@@ -256,8 +257,8 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 	b.WriteString("\n\nThese results are computed facts: they outrank the draft, the evidence " +
 		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +
 		"If they contradict it, revise — do not defend the draft. A query that returned no " +
-		"data weighs against the draft ONLY if it reused metric names and label keys " +
-		"confirmed present in the evidence above (a confirmed absence). A deterministic " +
+		"data weighs against the draft ONLY if the queried metric and matcher keys and values were confirmed together on that metric's own series " +
+		"in the evidence above (a confirmed absence); a catalog name or labels from another metric or alert do not establish this. A deterministic " +
 		"floor check reporting zero problems for a named, resolved scope (its result line " +
 		"names the groups and peer count it searched) is likewise a confirmed absence — " +
 		"except when it reports no peer hosts, which means the check had nothing to " +

@@ -49,6 +49,11 @@ func TestRunPromQL_ResultShapes(t *testing.T) {
 		outcome                Outcome
 	}{
 		{"scalar", `scalar(up)`, `{"resultType":"scalar","result":[100,"0.125"]}`, "0.125", OutcomeFetched},
+		{"scalar_nan", `scalar(up)`, `{"resultType":"scalar","result":[100,"NaN"]}`, "NaN", OutcomeFetched},
+		{"vector_infinite", `up`, `{"resultType":"vector","result":[{"metric":{},"value":[100,"+Inf"]}]}`, "+Inf", OutcomeFetched},
+		{"scalar_text", `scalar(up)`, `{"resultType":"scalar","result":[100,"hello"]}`, "unavailable", OutcomeFailed},
+		{"scalar_timestamp", `scalar(up)`, `{"resultType":"scalar","result":[null,"1"]}`, "unavailable", OutcomeFailed},
+		{"vector_text", `up`, `{"resultType":"vector","result":[{"metric":{},"value":[100,"hello"]}]}`, "unavailable", OutcomeFailed},
 		{"empty_matrix", `queue_depth[1h]`, `{"resultType":"matrix","result":[]}`, "(no data)", OutcomeEmpty},
 		{"string", `"hello"`, `{"resultType":"string","result":[100,"hello"]}`, "unavailable", OutcomeFailed},
 		{"native_histogram", `histogram_metric[1h]`, `{"resultType":"matrix","result":[{"metric":{},"histograms":[[100,{"count":"3","sum":"6","buckets":[]}]]}]}`, "unavailable", OutcomeFailed},

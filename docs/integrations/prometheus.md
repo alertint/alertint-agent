@@ -135,6 +135,9 @@ snapshot ranking, including constant metrics omitted from the ten snapshots.
 This adds no backend requests and stays within the existing fetch deadline.
 The persisted list is a bounded sample: an unlisted name is unknown, not proof
 that the metric does not exist. System and alert-bookkeeping names are omitted.
+Names alone do not establish a metric's label schema. Verification queries use
+matcher keys and values shown together on that metric's own series; borrowing
+labels from another metric or alert can return empty data without disproving a claim.
 
 Explicit conventional metric suffixes supply base-unit labels such as bytes,
 seconds and nanoseconds. Rate and increase checks preserve these units through
