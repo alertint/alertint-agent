@@ -90,3 +90,15 @@ func TestOperatorUsefulnessPromptSeparatesInference(t *testing.T) {
 		t.Fatal("missing evidence-fidelity instruction")
 	}
 }
+
+func TestSystemPrompt_ChangeAbsenceGuidanceInPackTemplates(t *testing.T) {
+	s := &Skill{cfg: Config{Rules: testEngine(t)}}
+	for _, template := range []string{"single_alert", "correlated", "storm", "recovery"} {
+		t.Run(template, func(t *testing.T) {
+			prompt := s.systemPrompt(rules.Decision{TemplateName: template}, 1)
+			if !strings.Contains(prompt, "Absence of changes is NOT proof nothing changed") {
+				t.Fatalf("pack-selected prompt lost the fallback's change-evidence limit: %s", prompt)
+			}
+		})
+	}
+}

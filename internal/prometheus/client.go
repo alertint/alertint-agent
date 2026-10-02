@@ -122,6 +122,23 @@ func (c *Client) DefaultRangeMinutes() int { return c.defaultRangeMinutes }
 // the raw "data" field from the Prometheus API response, i.e.
 // {"resultType":"vector","result":[...]}.
 func (c *Client) QueryInstant(ctx context.Context, expr string, t time.Time, limit int) (json.RawMessage, error) {
+	result, err := c.QueryInstantWithAnnotations(ctx, expr, t, limit)
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
+}
+
+// QueryResult retains successful API annotations alongside the raw result.
+type QueryResult struct {
+	Data     json.RawMessage
+	Warnings []string
+	Infos    []string
+}
+
+// QueryInstantWithAnnotations executes the same single request as QueryInstant,
+// retaining backend warnings and infos for callers that display evidence.
+func (c *Client) QueryInstantWithAnnotations(ctx context.Context, expr string, t time.Time, limit int) (*QueryResult, error) {
 	params := url.Values{"query": {expr}}
 	if !t.IsZero() {
 		params.Set("time", formatTS(t))
@@ -129,7 +146,7 @@ func (c *Client) QueryInstant(ctx context.Context, expr string, t time.Time, lim
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
 	}
-	return c.apiGet(ctx, "/api/v1/query", params)
+	return c.doAPIGet(ctx, "/api/v1/query", params, false)
 }
 
 // QueryRange executes a range PromQL query. A zero step is auto-computed from
@@ -169,7 +186,11 @@ func (c *Client) QueryRangeBounded(ctx context.Context, expr string, start, end 
 // This is the legacy (MCP passthrough / Acute Triage) path: its body read
 // is unbounded and its redirect policy is http.Client's default.
 func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
-	return c.doAPIGet(ctx, path, params, false)
+	result, err := c.doAPIGet(ctx, path, params, false)
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
 }
 
 // apiGetBounded is apiGet for the proactive preparation path: the decoded
@@ -177,10 +198,14 @@ func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (js
 // it) so one wide response can never allocate unboundedly inside a single
 // reserved request.
 func (c *Client) apiGetBounded(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
-	return c.doAPIGet(ctx, path, params, true)
+	result, err := c.doAPIGet(ctx, path, params, true)
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
 }
 
-func (c *Client) doAPIGet(ctx context.Context, path string, params url.Values, bounded bool) (json.RawMessage, error) {
+func (c *Client) doAPIGet(ctx context.Context, path string, params url.Values, bounded bool) (*QueryResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path+"?"+params.Encode(), nil)
 	if err != nil {
 		return nil, err
@@ -227,6 +252,8 @@ func (c *Client) doAPIGet(ctx context.Context, path string, params url.Values, b
 		Data      json.RawMessage `json:"data"`
 		ErrorType string          `json:"errorType"`
 		Error     string          `json:"error"`
+		Warnings  []string        `json:"warnings"`
+		Infos     []string        `json:"infos"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, fmt.Errorf("prometheus: decode response: %w", err)
@@ -238,7 +265,7 @@ func (c *Client) doAPIGet(ctx context.Context, path string, params url.Values, b
 			Message:    envelope.Error,
 		}
 	}
-	return envelope.Data, nil
+	return &QueryResult{Data: envelope.Data, Warnings: envelope.Warnings, Infos: envelope.Infos}, nil
 }
 
 // noRedirectClient returns a shallow copy of base whose redirect policy
