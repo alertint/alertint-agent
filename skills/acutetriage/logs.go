@@ -374,8 +374,8 @@ func sharedLabelValues(alerts []store.Alert) map[string][]string {
 	return out
 }
 
-// selectLogAttrs keeps bounded exception details and varying, small categorical
-// attributes across both samples. Absence counts as a distinct category.
+// selectLogAttrs keeps bounded message parameters, exception details and varying,
+// small categorical attributes across both samples. Absence counts as a category.
 func selectLogAttrs(lines []logs.Line) {
 	type value struct {
 		text    string
@@ -383,8 +383,13 @@ func selectLogAttrs(lines []logs.Line) {
 	}
 	values := make(map[string]map[value]bool)
 	counts := make(map[string]int)
+	content := make(map[string]bool)
 	for _, line := range lines {
 		for key, text := range line.Attrs {
+			// An explicit message parameter is log content, not a category.
+			if exceptionLogAttr(key) || strings.Contains(line.Line, "{"+key+"}") {
+				content[key] = true
+			}
 			if values[key] == nil {
 				values[key] = make(map[value]bool)
 			}
@@ -397,13 +402,13 @@ func selectLogAttrs(lines []logs.Line) {
 		if counts[key] < len(lines) {
 			distinct[value{}] = true
 		}
-		if len(distinct) > 1 || exceptionLogAttr(key) {
+		if len(distinct) > 1 || content[key] {
 			keys = append(keys, key)
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		if exceptionLogAttr(keys[i]) != exceptionLogAttr(keys[j]) {
-			return exceptionLogAttr(keys[i])
+		if content[keys[i]] != content[keys[j]] {
+			return content[keys[i]]
 		}
 		if len(values[keys[i]]) != len(values[keys[j]]) {
 			return len(values[keys[i]]) < len(values[keys[j]])
@@ -418,7 +423,7 @@ func selectLogAttrs(lines []logs.Line) {
 			if !ok {
 				continue
 			}
-			if exceptionLogAttr(key) {
+			if content[key] {
 				text = capText(flattenRecalled(text), 255) // Include the truncation ellipsis within 256 runes.
 			} else {
 				if utf8.RuneCountInString(text) > 64 || strings.ContainsAny(text, "\r\n") || hexID.MatchString(strings.ReplaceAll(text, "-", "")) {
