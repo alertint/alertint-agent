@@ -28,7 +28,7 @@
   <sub>Illustrative incident. The services, times and cause are invented.</sub>
 </p>
 
-## How it works
+## <img src=".github/assets/icons/how-it-works.svg" width="22" height="22" alt=""> How it works
 
 1. **Groups** an alert storm into one Situation.
 2. **Investigates** with read-only evidence: recent changes, logs and metrics. A
@@ -40,7 +40,7 @@
 
 Read-only by design. Local state. You bring the LLM key.
 
-## At a glance
+## <img src=".github/assets/icons/at-a-glance.svg" width="22" height="22" alt=""> At a glance
 
 | Area | Supported today |
 |---|---|
@@ -52,7 +52,7 @@ Read-only by design. Local state. You bring the LLM key.
 | **Runs as** | Single Go binary, Docker image, or signed Helm chart |
 | **State** | Local SQLite with a hash-chained, verifiable audit log |
 
-## Get started
+## <img src=".github/assets/icons/get-started.svg" width="22" height="22" alt=""> Get started
 
 Docker Compose bundles AlertINT with Prometheus and Alertmanager:
 
@@ -82,7 +82,7 @@ and point Alertmanager or
 [Quickstart](https://alertint.com/docs/getting-started/quickstart) walks through
 every step.
 
-## Documentation
+## <img src=".github/assets/icons/documentation.svg" width="22" height="22" alt=""> Documentation
 
 - [Quickstart](https://alertint.com/docs/getting-started/quickstart) ·
   [Configuration](https://alertint.com/docs/getting-started/configuration)
@@ -97,20 +97,20 @@ every step.
 The [`docs/`](docs/) folder is the source of alertint.com/docs. Documentation
 PRs are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Design partners wanted
+## <img src=".github/assets/icons/design-partners.svg" width="22" height="22" alt=""> Design partners wanted
 
 Running Alertmanager or Zabbix in production? We're looking for a few teams to
-run AlertINT on a real stack for a couple of weeks and tell us honestly whether
-the findings hold up.
-[How to join](https://github.com/alertint/alertint-agent/discussions/categories/announcements)
+run AlertINT on a real stack and tell us honestly whether the findings hold up.
+Email [ernests@alertint.com](mailto:ernests@alertint.com) or say hello in
+[Discussions](https://github.com/alertint/alertint-agent/discussions).
 
-## Community
+## <img src=".github/assets/icons/community.svg" width="22" height="22" alt=""> Community
 
 - **Questions and ideas:** [GitHub Discussions](https://github.com/alertint/alertint-agent/discussions)
 - **Bugs:** [Issues](https://github.com/alertint/alertint-agent/issues/new/choose)
 - **Security:** never in public, see [SECURITY.md](SECURITY.md)
 
-## License
+## <img src=".github/assets/icons/license.svg" width="22" height="22" alt=""> License
 
 [Fair Source](https://fair.io) under [FSL-1.1-ALv2](LICENSE). Free to use,
 modify and self-host at any scale. The only restriction is offering it as a
