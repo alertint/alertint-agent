@@ -76,6 +76,14 @@ the draft, revise; don't defend it. The result is the finding that persists —
 confidence caps and the memory verdict apply to this final judgment, not the
 draft.
 
+PromQL check results show numerical values before labels so long labels do
+not hide the first value. Results remain bounded; large vectors can still
+be truncated. Backend warnings and infos are included separately, even when
+the query matches nothing: at most two of each, with each note limited to
+200 characters. The model is told to account for these limits before treating
+a result as proof. A missing change record also does not prove that nothing
+changed.
+
 When a metric source is configured, call 2 names the numbered check that
 directly tested its proposed cause. The stored headline and Finding begin with
 "Unconfirmed" unless that cited model or operator check fetched data. Floor

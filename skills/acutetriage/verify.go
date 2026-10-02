@@ -708,7 +708,7 @@ func markInvalid(q *VerificationQuery) {
 // annotatedMetricQuerier is optional so existing query providers keep their
 // data-only contract. It does not add a second request.
 type annotatedMetricQuerier interface {
-	QueryInstantWithAnnotations(context.Context, string, time.Time, int) (*promclient.QueryResult, error)
+	QueryInstantWithAnnotations(ctx context.Context, expr string, t time.Time, limit int) (*promclient.QueryResult, error)
 }
 
 // runPromQL executes one model-proposed promql query, server-side bounded by
