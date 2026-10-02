@@ -479,8 +479,9 @@ type MetricEnrichment struct {
 	RuleExprs            []string          `json:"rule_exprs,omitempty"`
 	RecordingRules       map[string]string `json:"recording_rules,omitempty"`
 	LabelMap             map[string]string `json:"label_map,omitempty"`
-	Snapshots            []MetricSnapshot  `json:"snapshots,omitempty"` // ranked, capped
-	Note                 string            `json:"note,omitempty"`      // why Snapshots is empty
+	MetricNames          []string          `json:"metric_names,omitempty"` // observed current scoped series, bounded sample
+	Snapshots            []MetricSnapshot  `json:"snapshots,omitempty"`    // ranked, capped
+	Note                 string            `json:"note,omitempty"`         // why Snapshots is empty
 	Outcome              Outcome           `json:"outcome,omitempty"`
 	RequestAttempts      int               `json:"request_attempts,omitempty"`
 	RequestAttemptsKnown bool              `json:"request_attempts_known,omitempty"`
@@ -539,6 +540,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	logDroppedSelectorKeys(ctx, logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
 	memberPairs := memberLabelPairs(alerts)
 	var snapshots []MetricSnapshot
+	metricNames := make(map[string]bool)
 	learned := make(map[string]map[string]bool)
 	ambiguous := make(map[string]bool)
 	var perRule time.Duration
@@ -701,6 +703,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			classify(scope, err)
 			continue
 		}
+		collectMetricNames(data, metricNames)
 		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope, baseline, prior)
 		// R9 physical-core rescue — primary scope only, when no usable series
 		// remain (including when only alert bookkeeping series matched) and
@@ -710,6 +713,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			if err2 != nil {
 				classify(physicalFallback, err2)
 			} else {
+				collectMetricNames(data2, metricNames)
 				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope, baseline2, prior2)
 			}
 		}
@@ -717,7 +721,12 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	}
 	snapshots = dedupeSnapshots(snapshots)
 
-	enr := &MetricEnrichment{At: t, Selector: strings.Join(scopes, ", "), RuleExprs: ruleExprs, LabelMap: labelMap}
+	names := make([]string, 0, len(metricNames))
+	for name := range metricNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	enr := &MetricEnrichment{At: t, Selector: strings.Join(scopes, ", "), RuleExprs: ruleExprs, LabelMap: labelMap, MetricNames: names}
 	switch {
 	case len(snapshots) > 0:
 		enr.Snapshots = snapshots
@@ -776,4 +785,38 @@ func isSystemMetric(name string) bool {
 		}
 	}
 	return false
+}
+
+// collectMetricNames reuses current scoped results before snapshot ranking. This
+// is a sample, never a claim that an unlisted metric is absent from the backend.
+func collectMetricNames(raw json.RawMessage, names map[string]bool) {
+	var data struct {
+		Result []struct {
+			Metric map[string]string `json:"metric"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(raw, &data) != nil {
+		return
+	}
+	for _, series := range data.Result {
+		name := series.Metric["__name__"]
+		if name == "" || len(name) > 200 || alertBookkeepingMetrics[name] || isSystemMetric(name) || names[name] {
+			continue
+		}
+		// Keep the lexicographically first 64 names without accumulating an
+		// unbounded set if a backend ignores the requested series limit.
+		if len(names) == 64 {
+			var largest string
+			for existing := range names {
+				if existing > largest {
+					largest = existing
+				}
+			}
+			if name >= largest {
+				continue
+			}
+			delete(names, largest)
+		}
+		names[name] = true
+	}
 }

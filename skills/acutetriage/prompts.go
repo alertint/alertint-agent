@@ -213,7 +213,9 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 	if verify.HasPromQL {
 		b.WriteString(" Write queries that can actually return data: prefer single-metric " +
 			"expressions; reuse exact metric names and label keys visible in the Live metrics " +
-			"section or the alert labels; avoid combining two metrics (ratios, and/unless, " +
+			"section; observed metric names alone do not establish their label schema. Use " +
+			"matcher keys and values shown together on that metric's own series, not borrowed " +
+			"from another metric or alert. Unlisted names are unknown, not proven absent; avoid combining two metrics (ratios, and/unless, " +
 			"group_left joins) unless both carry the same label keys — an expression joining " +
 			"metrics with mismatched label schemas returns empty regardless of what is true, " +
 			"and proves nothing.")
@@ -225,7 +227,7 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 func floorDescription(verify VerificationParams) string {
 	var parts []string
 	if verify.HasPromQL {
-		parts = append(parts, "a parent-scope up ratio")
+		parts = append(parts, "a parent-scope up ratio (scrape targets only, not application health)")
 	}
 	if verify.HasZabbix {
 		parts = append(parts, "Zabbix host-reachability and neighbor open-problem checks")
@@ -251,11 +253,12 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 	renderVerificationResults(&b, round)
 	b.WriteString("\nPrometheus warnings and infos can limit a check’s meaning or completeness; account for them before using its value as proof.")
 	b.WriteString("\nValues marked [per second] are rates, not fractions; never present them as percentages.")
+	b.WriteString("\nRespect explicit base units: bytes are not kilobytes; nanoseconds are time, not CPU cycles. CPU time per second can be expressed as CPU cores. Scrape health describes only the queried targets and does not establish application health; no matching scrape targets leaves application health unknown.")
 	b.WriteString("\n\nThese results are computed facts: they outrank the draft, the evidence " +
 		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +
 		"If they contradict it, revise — do not defend the draft. A query that returned no " +
-		"data weighs against the draft ONLY if it reused metric names and label keys " +
-		"confirmed present in the evidence above (a confirmed absence). A deterministic " +
+		"data weighs against the draft ONLY if the queried metric and matcher keys and values were confirmed together on that metric's own series " +
+		"in the evidence above (a confirmed absence); a catalog name or labels from another metric or alert do not establish this. A deterministic " +
 		"floor check reporting zero problems for a named, resolved scope (its result line " +
 		"names the groups and peer count it searched) is likewise a confirmed absence — " +
 		"except when it reports no peer hosts, which means the check had nothing to " +
@@ -402,10 +405,16 @@ func renderMetrics(b *strings.Builder, m *MetricEnrichment) {
 	for _, expr := range m.RuleExprs {
 		fmt.Fprintf(b, "\nAlert rule expression: %s", expr)
 	}
+	if len(m.MetricNames) > 0 {
+		fmt.Fprintf(b, "\nObserved metric names (bounded sample from incident-scoped series; unlisted names are unknown): %s", strings.Join(m.MetricNames, ", "))
+	}
 	if len(m.Snapshots) > 0 {
 		b.WriteString("\n\nLive metrics (Prometheus, at incident time):")
 		for _, s := range m.Snapshots {
 			fmt.Fprintf(b, "\n  %s%s = %s", s.Metric, s.Series, s.Value)
+			if unit := metricBaseUnit(s.Metric); unit != "" {
+				fmt.Fprintf(b, " [%s]", unit)
+			}
 			if s.Increase != "" && s.PriorIncrease != "" {
 				fmt.Fprintf(b, " (+%s in last 15m, +%s in prior 15m)", s.Increase, s.PriorIncrease)
 			} else if s.Baseline != "" {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +18,6 @@ import (
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
-	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -310,7 +310,7 @@ func composeFloor(p VerificationParams, hostLabel string, alerts []store.Alert) 
 	var qs []VerificationQuery
 	if p.HasPromQL {
 		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts, p.ExtraSelectorLabels, p.LabelMap),
-			Why: "peer-scope health: is the wider world up?"})
+			Why: "scrape-target health in the requested parent scope; not application health"})
 	}
 	if p.HasZabbix {
 		qs = append(qs, zabbixFloorQueries(alerts, hostLabel)...)
@@ -656,16 +656,16 @@ func runUpRatio(ctx context.Context, prom metricQuerier, q *VerificationQuery, n
 
 	sumVal, sumOK := firstInstantValue(sumData)
 	countVal, countOK := firstInstantValue(countData)
-	if !sumOK || !countOK {
+	if !sumOK || !countOK || countVal == "0" {
 		q.Outcome = OutcomeEmpty
-		q.Result = "(no data)"
+		q.Result = capText("[scrape health only; application health unknown] no matching scrape targets in "+upScopeLabel(scope), 400)
 		return
 	}
 	q.Outcome = OutcomeFetched
 	if scope == "" {
-		q.Result = capText(flattenRecalled(fmt.Sprintf("up %s/%s (all targets)", sumVal, countVal)), 400)
+		q.Result = capText(flattenRecalled(fmt.Sprintf("[scrape health only; application health unknown] up %s/%s (all targets)", sumVal, countVal)), 400)
 	} else {
-		q.Result = capText(flattenRecalled(fmt.Sprintf("up %s/%s in %s", sumVal, countVal, scope)), 400)
+		q.Result = capText(flattenRecalled(fmt.Sprintf("[scrape health only; application health unknown] up %s/%s in %s", sumVal, countVal, scope)), 400)
 	}
 }
 
@@ -759,7 +759,12 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 		classifyErr(q, err)
 		return
 	}
-	results := decodeInstantResults(data)
+	results, decodeErr := decodeVerificationResults(data)
+	if decodeErr != nil {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("unsupported Prometheus result shape")
+		return
+	}
 	if len(results) == 0 {
 		q.Outcome = OutcomeEmpty
 		q.Result = "(no data)"
@@ -768,58 +773,27 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 	if len(results) > maxSnapshotsPerScope {
 		results = results[:maxSnapshotsPerScope]
 	}
+	unit, cpuScale := promQLUnit(q.Expr)
 	lines := make([]string, 0, len(results))
 	for _, r := range results {
-		lines = append(lines, fmt.Sprintf("%s %s", r.Value, r.Series))
-	}
-	q.Outcome = OutcomeFetched
-	q.Result = capText(promQLResultUnit(q.Expr)+flattenRecalled(strings.Join(lines, "; ")), 400)
-}
-
-// promQLResultUnit labels only explicit rate/count values whose outer
-// operations preserve units. Arithmetic and recording-rule names are unknown.
-func promQLResultUnit(query string) string {
-	expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
-	if err != nil {
-		return ""
-	}
-	var unit func(parser.Expr) string
-	unit = func(expr parser.Expr) string {
-		switch e := expr.(type) {
-		case *parser.ParenExpr:
-			return unit(e.Expr)
-		case *parser.AggregateExpr:
-			// Counts, grouping and variance do not preserve the input's unit.
-			if e.Op != parser.COUNT && e.Op != parser.COUNT_VALUES && e.Op != parser.GROUP && e.Op != parser.STDVAR {
-				return unit(e.Expr)
-			}
-		case *parser.BinaryExpr:
-			if e.Op.IsComparisonOperator() && !e.ReturnBool {
-				if e.LHS.Type() == parser.ValueTypeScalar {
-					return unit(e.RHS)
-				}
-				return unit(e.LHS)
-			}
-		case *parser.Call:
-			switch e.Func.Name {
-			case "rate", "irate":
-				return "[per second] "
-			case "increase":
-				var window time.Duration
-				switch arg := e.Args[0].(type) {
-				case *parser.MatrixSelector:
-					window = arg.Range
-				case *parser.SubqueryExpr:
-					window = arg.Range
-				}
-				if window > 0 {
-					return "[count over " + model.Duration(window).String() + "] "
-				}
+		value := r.Value
+		if cpuScale > 0 {
+			if f, err := strconv.ParseFloat(value, 64); err == nil && !math.IsInf(f, 0) && !math.IsNaN(f) {
+				value += " (" + strconv.FormatFloat(f/cpuScale, 'g', 6, 64) + " CPU cores)"
 			}
 		}
-		return ""
+		lines = append(lines, fmt.Sprintf("%s %s", value, r.Series))
 	}
-	return unit(expr)
+	q.Outcome = OutcomeFetched
+	q.Result = capText(unit+flattenRecalled(strings.Join(lines, "; ")), 400)
+}
+
+// upScopeLabel names the exact scrape scope, including the explicitly global case.
+func upScopeLabel(scope string) string {
+	if scope == "" {
+		return "all targets"
+	}
+	return scope
 }
 
 // isHardErr reports whether err is more than a mere timeout — the shared

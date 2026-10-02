@@ -45,11 +45,13 @@ Before call 2, a runner executes:
 - **The deterministic floor** — two checks that run on *every* judged
   triage, regardless of what the model asked for or whether it asked for
   anything at all:
-  - **Peer-scope up ratio** — what fraction of the incident's broader scope
-    (`namespace`/`service`/`job`, derived from the alerts' own labels) is
-    up right now, rendered as a plain pair like "up 34/37 in
-    namespace=checkout" — never a raw series dump. No shared broad label
-    means an unscoped global ratio instead.
+  - **Scrape-target up ratio** — what fraction of the scrape targets matching
+    the requested parent scope (`namespace`/`service`/`job`, derived from the
+    alerts' own labels) is up, rendered as a plain pair like "up 34/37 in
+    namespace=checkout" — never a raw series dump. This checks scrape health,
+    not application health. No matching targets leaves application health
+    unknown; the runner does not retry against a broader or collector scope.
+    No shared broad label means an explicitly global scrape ratio instead.
   - **Incidents in window** — is anything else firing on a different group
     key right now? A count plus up to five other incidents' group keys,
     severities, and statuses — never another incident's finding text.
@@ -70,7 +72,14 @@ Before call 2, a runner executes:
 
 **Call 2** is a full continuation of call 1 — the same prompt prefix, the
 draft as the model's own prior turn, then every query's result appended
-verbatim. The instruction is explicit: verification results outrank the
+verbatim. Numeric range-vector results are bounded summaries: sample count,
+first and last values with UTC timestamps, finite minimum and maximum,
+decreasing steps between adjacent finite samples, and a nonfinite sample count.
+These summaries are not a full trajectory or proof of a cause. Scalar results
+are retained too; unsupported sample shapes are unavailable rather than empty.
+The existing result length and series limits still apply.
+
+The instruction is explicit: verification results outrank the
 draft, the evidence pack, and any recalled memory. If the checks contradict
 the draft, revise; don't defend it. The result is the finding that persists —
 confidence caps and the memory verdict apply to this final judgment, not the
@@ -83,6 +92,11 @@ the query matches nothing: at most two of each, with each note limited to
 200 characters. The model is told to account for these limits before treating
 a result as proof. A missing change record also does not prove that nothing
 changed.
+
+An empty metric query is inconclusive unless the queried metric and its matcher
+keys and values were observed together on that metric's own series. A discovered
+metric name alone does not establish its labels. Malformed numerical results are
+unavailable, not empty; valid `NaN` and infinite values remain visible.
 
 When a metric source is configured, call 2 names the numbered check that
 directly tested its proposed cause. The stored headline and Finding begin with

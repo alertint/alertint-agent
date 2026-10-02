@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Metric evidence includes a bounded sample of observed metric names, including
+  names outside the ranked snapshots, without additional backend requests.
 - Loki evidence includes selected entry attributes in error and comparison
   lines, with bounded values, cardinality preference, and byte accounting.
 - Loki triage compares filtered failure lines with a small sample of lines the
@@ -31,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Verification treats empty queries with unconfirmed metric-label combinations
+  as inconclusive and rejects malformed numerical results as unavailable.
+- PromQL verification preserves scalar results and summarizes range-vector
+  samples instead of reporting them as empty. Unsupported sample shapes remain
+  explicitly unavailable.
+- Verification distinguishes scrape-target health from application health and
+  keeps unmatched target scopes unknown without broadening the query.
+- Metric evidence and checks retain conventional base units; CPU-time rates
+  show their equivalent in cores while arithmetic and ambiguous names stay
+  unlabelled.
 - Loki triage keeps bounded exception messages and types instead of dropping
   repeated or longer diagnostic details.
 - PromQL verification checks preserve bounded backend warnings and infos,

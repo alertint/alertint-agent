@@ -800,7 +800,7 @@ func TestFetchMetrics_CounterIncreaseOutranksChangingGauge(t *testing.T) {
 	}
 	var b strings.Builder
 	renderMetrics(&b, e)
-	for _, want := range []string{"request_errors_total{service=\"api\"} = 987 (+10 in last 15m, +0 in prior 15m)", "heap_bytes{service=\"api\"} = 7063384 (15m earlier: 1954512)"} {
+	for _, want := range []string{"request_errors_total{service=\"api\"} = 987 (+10 in last 15m, +0 in prior 15m)", "heap_bytes{service=\"api\"} = 7063384 [bytes] (15m earlier: 1954512)"} {
 		if !strings.Contains(b.String(), want) {
 			t.Errorf("missing %q: %s", want, b.String())
 		}
