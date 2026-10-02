@@ -97,6 +97,11 @@ per line are kept, preferring keys with fewer distinct values, then key order.
 Absent attributes count as a distinct value. Attributes count toward the log
 byte cap and are persisted with the selected lines.
 
+Standard exception messages and types (`exception.message`, `exception.type`,
+and their underscore forms) are prioritized and kept even when repeated. Their
+values are flattened to one line and limited to 256 characters. They share the
+eight-attribute limit and log byte cap; long stack traces remain omitted.
+
 The deterministic comparison still reads `key=value` tokens in message text
 only. When a comparison sample exists but its messages lack an attribute, the
 affected group is unknown. A claim naming that value is marked Unconfirmed only

@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Loki triage keeps bounded exception messages and types instead of dropping
+  repeated or longer diagnostic details.
 - PromQL verification checks preserve bounded backend warnings and infos,
   including on empty results and during replay.
 - Pack-selected triage prompts retain the change-evidence warning: an empty
