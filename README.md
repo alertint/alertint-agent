@@ -42,7 +42,7 @@ Read-only by design. Local state. You bring the LLM key.
 
 ## At a glance
 
-| | |
+| Area | Supported today |
 |---|---|
 | **Alert sources** | Alertmanager, Zabbix |
 | **Read-only evidence** | Prometheus, Loki, Zabbix, Sentry, change-event webhooks (deploys, config, flags) |
@@ -66,7 +66,8 @@ Then fire the built-in drill. It plants a fake deploy, sends synthetic alerts
 through the real ingress, and prints the finding:
 
 ```bash
-docker compose -f docker/docker-compose.yaml exec agent /alertint drill --config /etc/alertint/config.yaml
+docker compose -f docker/docker-compose.yaml exec agent \
+  /alertint drill --config /etc/alertint/config.yaml
 ```
 
 Other installs:
