@@ -130,6 +130,18 @@ namespace) and appended to the LLM prompt as a *Live metrics* section.
 The model uses those values to calibrate severity and confidence — actual
 numbers take precedence over text annotations.
 
+The same scoped responses also provide up to 64 observed metric names before
+snapshot ranking, including constant metrics omitted from the ten snapshots.
+This adds no backend requests and stays within the existing fetch deadline.
+The persisted list is a bounded sample: an unlisted name is unknown, not proof
+that the metric does not exist. System and alert-bookkeeping names are omitted.
+
+Explicit conventional metric suffixes supply base-unit labels such as bytes,
+seconds and nanoseconds. Rate and increase checks preserve these units through
+aggregations and comparison filters. Explicit CPU-time rates also show their
+CPU-core equivalent, retaining the original value. Arbitrary arithmetic,
+recording-rule names and ambiguous suffixes do not receive guessed unit labels.
+
 ### Scoping evidence queries: the selector allowlist
 
 When AlertINT builds metric queries for an incident, it uses the alert-label

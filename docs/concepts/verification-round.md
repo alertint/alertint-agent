@@ -45,11 +45,13 @@ Before call 2, a runner executes:
 - **The deterministic floor** — two checks that run on *every* judged
   triage, regardless of what the model asked for or whether it asked for
   anything at all:
-  - **Peer-scope up ratio** — what fraction of the incident's broader scope
-    (`namespace`/`service`/`job`, derived from the alerts' own labels) is
-    up right now, rendered as a plain pair like "up 34/37 in
-    namespace=checkout" — never a raw series dump. No shared broad label
-    means an unscoped global ratio instead.
+  - **Scrape-target up ratio** — what fraction of the scrape targets matching
+    the requested parent scope (`namespace`/`service`/`job`, derived from the
+    alerts' own labels) is up, rendered as a plain pair like "up 34/37 in
+    namespace=checkout" — never a raw series dump. This checks scrape health,
+    not application health. No matching targets leaves application health
+    unknown; the runner does not retry against a broader or collector scope.
+    No shared broad label means an explicitly global scrape ratio instead.
   - **Incidents in window** — is anything else firing on a different group
     key right now? A count plus up to five other incidents' group keys,
     severities, and statuses — never another incident's finding text.
