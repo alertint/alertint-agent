@@ -1001,3 +1001,36 @@ func TestCauseUnconfirmed_RecordingRuleSignal(t *testing.T) {
 		})
 	}
 }
+
+func TestRunIncidentsInWindow_LabelsLocalHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		total int
+		top   []store.WindowIncident
+	}{
+		{name: "empty"},
+		{name: "resolved history", total: 1, top: []store.WindowIncident{{GroupKey: "service=alpha", Severity: "warning", Status: "resolved"}}},
+		{name: "bounded output", total: 2, top: []store.WindowIncident{{GroupKey: strings.Repeat("x", 500), Severity: "warning", Status: "resolved"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := VerificationQuery{Kind: kindIncidentsInWindow, Params: map[string]any{"window_minutes": 60}}
+			runIncidentsInWindow(context.Background(), fakeState{total: tc.total, top: tc.top}, &q, store.Incident{}, time.Now(), slog.Default())
+			if !strings.HasPrefix(q.Result, "[local stored incident history; not live alert health or topology] ") {
+				t.Fatalf("incident lookup lost its actual scope: %s", q.Result)
+			}
+			if !strings.Contains(q.Result, fmt.Sprintf("%d incidents on other group keys (60m)", tc.total)) {
+				t.Fatalf("scope label must preserve the count/window: %s", q.Result)
+			}
+			if tc.total > 0 && !strings.Contains(q.Result, "resolved") {
+				t.Fatalf("stored resolved status must remain visible: %s", q.Result)
+			}
+			if utf8.RuneCountInString(q.Result) > 401 {
+				t.Fatal("history scope must fit the existing result cap")
+			}
+		})
+	}
+	floor := composeFloor(VerificationParams{}, "", nil)
+	if !strings.Contains(floor[len(floor)-1].Why, "locally stored") {
+		t.Fatal("floor must describe local history rather than asking about live firing")
+	}
+}

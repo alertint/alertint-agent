@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Incident-window checks identify their local history scope instead of implying
+  a live health or topology scan; resolved records remain explicitly historical.
+
 - Loki evidence retains bounded attributes referenced by message templates,
   preserving diagnostic parameters even when constant, numeric or long.
 - Verification treats empty queries with unconfirmed metric-label combinations

@@ -317,7 +317,7 @@ func composeFloor(p VerificationParams, hostLabel string, alerts []store.Alert) 
 	}
 	return append(qs, VerificationQuery{Kind: kindIncidentsInWindow, Source: "floor",
 		Params: map[string]any{"window_minutes": float64(60)},
-		Why:    "is anything else firing?"})
+		Why:    "contrast with other locally stored incidents; not live alert health"})
 }
 
 // verificationPlanEnvelope is the shape parseVerificationPlan extracts out of
@@ -670,8 +670,8 @@ func runUpRatio(ctx context.Context, prom metricQuerier, q *VerificationQuery, n
 }
 
 // runIncidentsInWindow executes the floor's own-state contrast check (also
-// the model's only permitted named state query): is anything else firing on a
-// different group key right now? Render per spec R4 — the count, then up to 5
+// the model's only permitted named state query): locally stored activity on
+// other group keys, not a live alert-health or topology scan. Render per spec R4 — the count, then up to 5
 // group keys with severity and status, folded into a "+N more" line; never
 // another incident's finding text.
 func runIncidentsInWindow(ctx context.Context, state verifyStateReader, q *VerificationQuery, inc store.Incident, now time.Time, logger *slog.Logger) {
@@ -882,14 +882,14 @@ func windowMinutesFromParams(params map[string]any) int {
 }
 
 // renderIncidentsInWindowResult renders the R4 contrast-check text: the total
-// count, then up to len(top) "group_key (severity, status)" entries — top is
+// count, then up to len(top) "(severity, status) group_key" entries — top is
 // already store-side limited to 5 — folded into a trailing "+N more" when
 // total exceeds what top carries. A member alert with no severity label
 // renders "unknown" rather than a blank field.
 func renderIncidentsInWindowResult(total int, top []store.WindowIncident, windowMinutes int) string {
 	windowLabel := fmt.Sprintf("%dm", windowMinutes)
 	if total == 0 {
-		return fmt.Sprintf("0 incidents on other group keys (%s)", windowLabel)
+		return fmt.Sprintf("[local stored incident history; not live alert health or topology] 0 incidents on other group keys (%s)", windowLabel)
 	}
 	parts := make([]string, 0, len(top))
 	for _, wi := range top {
@@ -897,13 +897,13 @@ func renderIncidentsInWindowResult(total int, top []store.WindowIncident, window
 		if sev == "" {
 			sev = "unknown"
 		}
-		parts = append(parts, fmt.Sprintf("%s (%s, %s)", wi.GroupKey, sev, wi.Status))
+		parts = append(parts, fmt.Sprintf("(%s, %s) %s", sev, wi.Status, wi.GroupKey))
 	}
 	line := strings.Join(parts, "; ")
 	if more := total - len(top); more > 0 {
 		line += fmt.Sprintf("; +%d more", more)
 	}
-	return fmt.Sprintf("%d incidents on other group keys (%s): %s", total, windowLabel, line)
+	return fmt.Sprintf("[local stored incident history; not live alert health or topology] %d incidents on other group keys (%s): %s", total, windowLabel, line)
 }
 
 // decodeInstantResults parses the same instant-vector envelope rankSeries

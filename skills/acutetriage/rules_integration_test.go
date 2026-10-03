@@ -102,3 +102,18 @@ func TestSystemPrompt_ChangeAbsenceGuidanceInPackTemplates(t *testing.T) {
 		})
 	}
 }
+
+func TestSystemPrompt_IncidentHistoryScope(t *testing.T) {
+	bare := &Skill{cfg: Config{}}
+	withPacks := &Skill{cfg: Config{Rules: testEngine(t)}}
+	prompts := make([]string, 0, 5)
+	prompts = append(prompts, bare.systemPrompt(rules.Decision{}, 1))
+	for _, template := range []string{"single_alert", "correlated", "storm", "recovery"} {
+		prompts = append(prompts, withPacks.systemPrompt(rules.Decision{TemplateName: template}, 1))
+	}
+	for _, prompt := range prompts {
+		if !strings.Contains(prompt, "local stored incident history") || !strings.Contains(prompt, "zero results do not prove other services are healthy") {
+			t.Fatalf("prompt must describe lookup scope and the meaning of zero: %s", prompt)
+		}
+	}
+}
