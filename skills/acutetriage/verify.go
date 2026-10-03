@@ -317,7 +317,7 @@ func composeFloor(p VerificationParams, hostLabel string, alerts []store.Alert) 
 	}
 	return append(qs, VerificationQuery{Kind: kindIncidentsInWindow, Source: "floor",
 		Params: map[string]any{"window_minutes": float64(60)},
-		Why:    "is anything else firing?"})
+		Why:    "contrast with other locally stored incidents; not live alert health"})
 }
 
 // verificationPlanEnvelope is the shape parseVerificationPlan extracts out of
@@ -670,8 +670,8 @@ func runUpRatio(ctx context.Context, prom metricQuerier, q *VerificationQuery, n
 }
 
 // runIncidentsInWindow executes the floor's own-state contrast check (also
-// the model's only permitted named state query): is anything else firing on a
-// different group key right now? Render per spec R4 — the count, then up to 5
+// the model's only permitted named state query): locally stored activity on
+// other group keys, not a live alert-health or topology scan. Render per spec R4 — the count, then up to 5
 // group keys with severity and status, folded into a "+N more" line; never
 // another incident's finding text.
 func runIncidentsInWindow(ctx context.Context, state verifyStateReader, q *VerificationQuery, inc store.Incident, now time.Time, logger *slog.Logger) {
@@ -774,18 +774,27 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 		results = results[:maxSnapshotsPerScope]
 	}
 	unit, cpuScale := promQLUnit(q.Expr)
+	identities, omittedCommon := distinctVerificationLabels(results)
 	lines := make([]string, 0, len(results))
-	for _, r := range results {
+	for i, r := range results {
 		value := r.Value
 		if cpuScale > 0 {
 			if f, err := strconv.ParseFloat(value, 64); err == nil && !math.IsInf(f, 0) && !math.IsNaN(f) {
 				value += " (" + strconv.FormatFloat(f/cpuScale, 'g', 6, 64) + " CPU cores)"
 			}
 		}
-		lines = append(lines, fmt.Sprintf("%s %s", value, r.Series))
+		lines = append(lines, fmt.Sprintf("%s %s", value, identities[i]))
 	}
 	q.Outcome = OutcomeFetched
-	q.Result = capText(unit+flattenRecalled(strings.Join(lines, "; ")), 400)
+	header := ""
+	if len(results) > 1 {
+		header = fmt.Sprintf("[%d series selected", len(results))
+		if omittedCommon {
+			header += "; common labels omitted"
+		}
+		header += "] "
+	}
+	q.Result = capText(unit+header+flattenRecalled(strings.Join(lines, "; ")), 400)
 }
 
 // upScopeLabel names the exact scrape scope, including the explicitly global case.
@@ -882,14 +891,14 @@ func windowMinutesFromParams(params map[string]any) int {
 }
 
 // renderIncidentsInWindowResult renders the R4 contrast-check text: the total
-// count, then up to len(top) "group_key (severity, status)" entries — top is
+// count, then up to len(top) "(severity, status) group_key" entries — top is
 // already store-side limited to 5 — folded into a trailing "+N more" when
 // total exceeds what top carries. A member alert with no severity label
 // renders "unknown" rather than a blank field.
 func renderIncidentsInWindowResult(total int, top []store.WindowIncident, windowMinutes int) string {
 	windowLabel := fmt.Sprintf("%dm", windowMinutes)
 	if total == 0 {
-		return fmt.Sprintf("0 incidents on other group keys (%s)", windowLabel)
+		return fmt.Sprintf("[local stored incident history; not live alert health or topology] 0 incidents on other group keys (%s)", windowLabel)
 	}
 	parts := make([]string, 0, len(top))
 	for _, wi := range top {
@@ -897,13 +906,13 @@ func renderIncidentsInWindowResult(total int, top []store.WindowIncident, window
 		if sev == "" {
 			sev = "unknown"
 		}
-		parts = append(parts, fmt.Sprintf("%s (%s, %s)", wi.GroupKey, sev, wi.Status))
+		parts = append(parts, fmt.Sprintf("(%s, %s) %s", sev, wi.Status, wi.GroupKey))
 	}
 	line := strings.Join(parts, "; ")
 	if more := total - len(top); more > 0 {
 		line += fmt.Sprintf("; +%d more", more)
 	}
-	return fmt.Sprintf("%d incidents on other group keys (%s): %s", total, windowLabel, line)
+	return fmt.Sprintf("[local stored incident history; not live alert health or topology] %d incidents on other group keys (%s): %s", total, windowLabel, line)
 }
 
 // decodeInstantResults parses the same instant-vector envelope rankSeries
@@ -1159,4 +1168,40 @@ func (e *snapshotExecutor) fidelity() string {
 		return "full"
 	}
 	return fmt.Sprintf("partial (%d/%d verification queries unmatched)", e.missed, e.missed+e.matched)
+}
+
+// distinctVerificationLabels omits labels shared by every displayed series so
+// repeated resource metadata cannot consume the cap before later values.
+// Missing labels remain distinct from labels present with an empty value.
+func distinctVerificationLabels(results []verificationResult) ([]string, bool) {
+	identities := make([]string, len(results))
+	common := make(map[string]string)
+	if len(results) > 1 {
+		for key, value := range results[0].labels {
+			if key != "__name__" {
+				common[key] = value
+			}
+		}
+		for _, result := range results[1:] {
+			for key, value := range common {
+				if other, ok := result.labels[key]; !ok || other != value {
+					delete(common, key)
+				}
+			}
+		}
+	}
+	for i, result := range results {
+		identities[i] = result.Series
+		if len(common) == 0 {
+			continue
+		}
+		labels := make(map[string]string)
+		for key, value := range result.labels {
+			if _, shared := common[key]; !shared {
+				labels[key] = value
+			}
+		}
+		identities[i] = formatSeriesIdentity(labels)
+	}
+	return identities, len(common) > 0
 }

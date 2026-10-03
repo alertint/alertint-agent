@@ -617,3 +617,63 @@ func TestFetchLogs_AttributeLengthCountsCharacters(t *testing.T) {
 		t.Fatal(b.String())
 	}
 }
+
+func TestFetchLogs_MessageParameterAttributesSurvive(t *testing.T) {
+	const message = "Request failed with {Status} after {Attempts} attempts: {ErrorDetail}"
+	detail := "Backend connection failed: " + strings.Repeat("\u754c", 300) + "\nstack frame"
+	entries := []logs.Line{
+		{Line: message, Attrs: map[string]string{"Status": "Unavailable", "Attempts": "3", "ErrorDetail": detail, "resource": "same", "unrelated": detail}},
+		{Line: message, Attrs: map[string]string{"Status": "Unavailable", "Attempts": "3", "ErrorDetail": detail, "resource": "same", "unrelated": detail}},
+	}
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: entries}}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	if len(e.Lines) != 2 {
+		t.Fatalf("lines = %d, want 2", len(e.Lines))
+	}
+	for _, line := range e.Lines {
+		if line.Line != message {
+			t.Fatalf("raw message changed: %q", line.Line)
+		}
+		if line.Attrs["Status"] != "Unavailable" || line.Attrs["Attempts"] != "3" {
+			t.Errorf("constant/numeric message parameters lost: %+v", line.Attrs)
+		}
+		got := line.Attrs["ErrorDetail"]
+		if !strings.HasPrefix(got, "Backend connection failed: ") || len([]rune(got)) != 256 || !strings.HasSuffix(got, "…") || strings.ContainsAny(got, "\r\n") {
+			t.Errorf("bounded message detail lost or malformed: %q", got)
+		}
+		if len(line.Attrs) != 3 {
+			t.Errorf("unreferenced attributes retained: %+v", line.Attrs)
+		}
+	}
+	var b strings.Builder
+	renderLogs(&b, e)
+	if !strings.Contains(b.String(), "ErrorDetail=Backend connection failed: ") || !strings.Contains(b.String(), "Attempts=3") {
+		t.Fatalf("message parameters missing from model evidence: %s", b.String())
+	}
+	if len(contrastSummary(e.Lines, e.Lines)) != 0 || len(inconclusiveTokens(e.Lines, e.Lines)) != 0 {
+		t.Fatal("message parameters entered token comparison")
+	}
+}
+
+func TestFetchLogs_MessageParametersPrioritizedAcrossBothSamples(t *testing.T) {
+	attrs := map[string]string{"Reason": strings.Repeat("timeout ", 100)}
+	for _, key := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
+		attrs[key] = "failure"
+	}
+	src := &fakeContrastSource{
+		fakeSource: &fakeSource{name: "loki", fetched: logs.Fetched{Filtered: true, Lines: []logs.Line{{Line: "Failed: {Reason}", Attrs: attrs}}}},
+		contrast:   logs.Fetched{Lines: []logs.Line{{Line: "Completed {Count}", Attrs: map[string]string{"Count": "42"}}}},
+	}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	if len(e.Lines[0].Attrs) != 8 || !strings.HasPrefix(e.Lines[0].Attrs["Reason"], "timeout ") {
+		t.Fatalf("message detail displaced by ordinary attributes: %+v", e.Lines[0].Attrs)
+	}
+	if len(e.Contrast) != 1 || e.Contrast[0].Attrs["Count"] != "42" {
+		t.Fatalf("comparison message parameter lost: %+v", e.Contrast)
+	}
+	var b strings.Builder
+	renderLogs(&b, e)
+	if !strings.Contains(b.String(), "Reason=timeout ") || !strings.Contains(b.String(), "Completed {Count} {Count=42}") {
+		t.Fatalf("parameter evidence missing from prompt: %s", b.String())
+	}
+}

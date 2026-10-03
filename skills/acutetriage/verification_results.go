@@ -11,9 +11,16 @@ import (
 	"time"
 )
 
+// verificationResult retains transient labels for bounded rendering only.
+type verificationResult struct {
+	MetricSnapshot
+
+	labels map[string]string
+}
+
 // decodeVerificationResults preserves the numeric shapes an instant API call
 // can return. Range vectors are summaries, not invented instant measurements.
-func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
+func decodeVerificationResults(raw json.RawMessage) ([]verificationResult, error) {
 	var envelope struct {
 		ResultType string          `json:"resultType"`
 		Result     json.RawMessage `json:"result"`
@@ -23,7 +30,9 @@ func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
 	}
 	switch envelope.ResultType {
 	case "", "vector":
-		var entries []json.RawMessage
+		var entries []struct {
+			Metric map[string]string `json:"metric"`
+		}
 		if err := json.Unmarshal(envelope.Result, &entries); err != nil {
 			return nil, err
 		}
@@ -31,12 +40,14 @@ func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
 		if len(results) != len(entries) {
 			return nil, errors.New("unsupported vector sample")
 		}
-		for _, result := range results {
+		out := make([]verificationResult, 0, len(results))
+		for i, result := range results {
 			if _, err := strconv.ParseFloat(result.Value, 64); err != nil {
 				return nil, err
 			}
+			out = append(out, verificationResult{MetricSnapshot: result, labels: entries[i].Metric})
 		}
-		return results, nil
+		return out, nil
 	case "scalar":
 		var sample [2]any
 		if err := json.Unmarshal(envelope.Result, &sample); err != nil {
@@ -50,7 +61,7 @@ func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
 		if _, err := strconv.ParseFloat(value, 64); err != nil {
 			return nil, err
 		}
-		return []MetricSnapshot{{Series: "{}", Value: value}}, nil
+		return []verificationResult{{MetricSnapshot: MetricSnapshot{Series: "{}", Value: value}}}, nil
 	case "matrix":
 		var series []struct {
 			Metric     map[string]string `json:"metric"`
@@ -63,7 +74,7 @@ func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
 		if len(series) > maxSnapshotsPerScope {
 			series = series[:maxSnapshotsPerScope]
 		}
-		out := make([]MetricSnapshot, 0, len(series))
+		out := make([]verificationResult, 0, len(series))
 		for _, s := range series {
 			if len(s.Histograms) > 0 {
 				return nil, errors.New("unsupported range histogram sample")
@@ -75,7 +86,7 @@ func decodeVerificationResults(raw json.RawMessage) ([]MetricSnapshot, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, MetricSnapshot{Series: formatSeriesIdentity(s.Metric), Value: summary})
+			out = append(out, verificationResult{MetricSnapshot: MetricSnapshot{Series: formatSeriesIdentity(s.Metric), Value: summary}, labels: s.Metric})
 		}
 		return out, nil
 	default:

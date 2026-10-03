@@ -1001,3 +1001,80 @@ func TestCauseUnconfirmed_RecordingRuleSignal(t *testing.T) {
 		})
 	}
 }
+
+func TestRunIncidentsInWindow_LabelsLocalHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		total int
+		top   []store.WindowIncident
+	}{
+		{name: "empty"},
+		{name: "resolved history", total: 1, top: []store.WindowIncident{{GroupKey: "service=alpha", Severity: "warning", Status: "resolved"}}},
+		{name: "bounded output", total: 2, top: []store.WindowIncident{{GroupKey: strings.Repeat("x", 500), Severity: "warning", Status: "resolved"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := VerificationQuery{Kind: kindIncidentsInWindow, Params: map[string]any{"window_minutes": 60}}
+			runIncidentsInWindow(context.Background(), fakeState{total: tc.total, top: tc.top}, &q, store.Incident{}, time.Now(), slog.Default())
+			if !strings.HasPrefix(q.Result, "[local stored incident history; not live alert health or topology] ") {
+				t.Fatalf("incident lookup lost its actual scope: %s", q.Result)
+			}
+			if !strings.Contains(q.Result, fmt.Sprintf("%d incidents on other group keys (60m)", tc.total)) {
+				t.Fatalf("scope label must preserve the count/window: %s", q.Result)
+			}
+			if tc.total > 0 && !strings.Contains(q.Result, "resolved") {
+				t.Fatalf("stored resolved status must remain visible: %s", q.Result)
+			}
+			if utf8.RuneCountInString(q.Result) > 401 {
+				t.Fatal("history scope must fit the existing result cap")
+			}
+		})
+	}
+	floor := composeFloor(VerificationParams{}, "", nil)
+	if !strings.Contains(floor[len(floor)-1].Why, "locally stored") {
+		t.Fatal("floor must describe local history rather than asking about live firing")
+	}
+}
+
+func TestRunPromQL_MultipleSeriesKeepDistinctValues(t *testing.T) {
+	for _, resultType := range []string{"vector", "matrix"} {
+		t.Run(resultType, func(t *testing.T) {
+			entries := make([]map[string]any, 0, 2)
+			for i, state := range []string{"ready", "blocked"} {
+				entry := map[string]any{"metric": map[string]string{"resource": strings.Repeat("a", 600), "state": state}}
+				value := []any{1700000000, []string{"2", "19"}[i]}
+				if resultType == "matrix" {
+					entry["values"] = []any{value}
+				} else {
+					entry["value"] = value
+				}
+				entries = append(entries, entry)
+			}
+			raw, err := json.Marshal(map[string]any{"resultType": resultType, "result": entries})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prom := fakeQuerier(func(string) (json.RawMessage, error) { return raw, nil })
+			q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: `worker_duration`}
+			runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "series-cap")
+			for _, want := range []string{"2", "19", `state="ready"`, `state="blocked"`, "2 series", "common labels omitted"} {
+				if !strings.Contains(q.Result, want) {
+					t.Fatalf("lost %q in multi-series evidence: %s", want, q.Result)
+				}
+			}
+			if utf8.RuneCountInString(q.Result) > 401 || strings.Contains(q.Result, `resource=`) {
+				t.Fatalf("repeated metadata must not consume the result cap: %s", q.Result)
+			}
+		})
+	}
+}
+
+func TestRunPromQL_AbsentLabelIsNotCommonEmptyValue(t *testing.T) {
+	prom := fakeQuerier(func(string) (json.RawMessage, error) {
+		return vector(s(map[string]string{"resource": "same", "state": ""}, "2"), s(map[string]string{"resource": "same"}, "19")), nil
+	})
+	q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: `worker_duration`}
+	runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "empty-label")
+	if !strings.Contains(q.Result, `2 {state=""}`) || !strings.Contains(q.Result, "19 {}") {
+		t.Fatalf("missing and empty labels must remain distinct: %s", q.Result)
+	}
+}

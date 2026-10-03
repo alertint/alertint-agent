@@ -40,7 +40,7 @@ The response must conform exactly to this schema:
 Rules:
 - analysis_name is the channel headline: summarize the final overall_issue in one short sentence (at most 80 characters). Preserve causal qualifiers such as "likely" or "may"; never make the title more certain than the finding. Revise it when verification changes the finding. Omit "Earlier report", time windows, and percentages unless essential to identify the issue.
 - Separate direct observations from hypotheses: correlation_findings must state only facts visible in the supplied evidence, with their source and scope. Put possible causes and interpretations in overall_issue.
-- Sampled errors do not establish uniform failure across users. Alerts on other group keys in the incident-window lookup rule out claims that no other services have alerts; a shared cause remains unconfirmed.
+- Sampled errors do not establish uniform failure across users. The incident-window lookup reads local stored incident history, not live alert health or topology. Report its recorded scope and statuses; zero results do not prove other services are healthy or exclude a shared cause.
 - If the comparison lines don't carry an attribute, don't say which group is affected — no "only", "exclusively", or "all".
 - Reconcile every draft claim with the verification results before retaining it. Remove or qualify contradicted scope claims.
 - severity must be one of: "low", "medium", or "high" based on business impact and urgency.
@@ -749,7 +749,7 @@ func formatLabels(m map[string]string) string {
 const operatorEvidenceInstructions = `- Separate direct observations from hypotheses: correlation_findings must state only facts visible in the supplied evidence, with their source and scope. Put possible causes and interpretations in overall_issue.
 - Absence of changes is NOT proof nothing changed (the emitter may not be wired).
 - analysis_name is the channel headline: summarize the final overall_issue in one short sentence (at most 80 characters). Preserve causal qualifiers such as "likely" or "may"; never make the title more certain than the finding. Revise it when verification changes the finding. Omit "Earlier report", time windows, and percentages unless essential to identify the issue.
-- Sampled errors do not establish uniform failure across users. Alerts on other group keys in the incident-window lookup rule out claims that no other services have alerts; a shared cause remains unconfirmed.
+- Sampled errors do not establish uniform failure across users. The incident-window lookup reads local stored incident history, not live alert health or topology. Report its recorded scope and statuses; zero results do not prove other services are healthy or exclude a shared cause.
 - If the comparison lines don't carry an attribute, don't say which group is affected — no "only", "exclusively", or "all".
 - Reconcile every draft claim with the verification results before retaining it. Remove or qualify contradicted scope claims.
 `

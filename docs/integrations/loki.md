@@ -102,6 +102,11 @@ and their underscore forms) are prioritized and kept even when repeated. Their
 values are flattened to one line and limited to 256 characters. They share the
 eight-attribute limit and log byte cap; long stack traces remain omitted.
 
+Attributes explicitly referenced as `{FieldName}` in a message are also kept as
+message content, with the same priority and bounds, including repeated or numeric
+values. The original message is not rewritten; parameter values appear in the
+attribute list so a template cannot lose its diagnostic details.
+
 The deterministic comparison still reads `key=value` tokens in message text
 only. When a comparison sample exists but its messages lack an attribute, the
 affected group is unknown. A claim naming that value is marked Unconfirmed only
