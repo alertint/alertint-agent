@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Multi-series PromQL checks omit repeated labels so distinguishing values fit the bounded evidence display.
+
 - Incident-window checks identify their local history scope instead of implying
   a live health or topology scan; resolved records remain explicitly historical.
 

@@ -1034,3 +1034,47 @@ func TestRunIncidentsInWindow_LabelsLocalHistory(t *testing.T) {
 		t.Fatal("floor must describe local history rather than asking about live firing")
 	}
 }
+
+func TestRunPromQL_MultipleSeriesKeepDistinctValues(t *testing.T) {
+	for _, resultType := range []string{"vector", "matrix"} {
+		t.Run(resultType, func(t *testing.T) {
+			entries := make([]map[string]any, 0, 2)
+			for i, state := range []string{"ready", "blocked"} {
+				entry := map[string]any{"metric": map[string]string{"resource": strings.Repeat("a", 600), "state": state}}
+				value := []any{1700000000, []string{"2", "19"}[i]}
+				if resultType == "matrix" {
+					entry["values"] = []any{value}
+				} else {
+					entry["value"] = value
+				}
+				entries = append(entries, entry)
+			}
+			raw, err := json.Marshal(map[string]any{"resultType": resultType, "result": entries})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prom := fakeQuerier(func(string) (json.RawMessage, error) { return raw, nil })
+			q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: `worker_duration`}
+			runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "series-cap")
+			for _, want := range []string{"2", "19", `state="ready"`, `state="blocked"`, "2 series", "common labels omitted"} {
+				if !strings.Contains(q.Result, want) {
+					t.Fatalf("lost %q in multi-series evidence: %s", want, q.Result)
+				}
+			}
+			if utf8.RuneCountInString(q.Result) > 401 || strings.Contains(q.Result, `resource=`) {
+				t.Fatalf("repeated metadata must not consume the result cap: %s", q.Result)
+			}
+		})
+	}
+}
+
+func TestRunPromQL_AbsentLabelIsNotCommonEmptyValue(t *testing.T) {
+	prom := fakeQuerier(func(string) (json.RawMessage, error) {
+		return vector(s(map[string]string{"resource": "same", "state": ""}, "2"), s(map[string]string{"resource": "same"}, "19")), nil
+	})
+	q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: `worker_duration`}
+	runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "empty-label")
+	if !strings.Contains(q.Result, `2 {state=""}`) || !strings.Contains(q.Result, "19 {}") {
+		t.Fatalf("missing and empty labels must remain distinct: %s", q.Result)
+	}
+}

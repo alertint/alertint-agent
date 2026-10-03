@@ -774,18 +774,27 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 		results = results[:maxSnapshotsPerScope]
 	}
 	unit, cpuScale := promQLUnit(q.Expr)
+	identities, omittedCommon := distinctVerificationLabels(results)
 	lines := make([]string, 0, len(results))
-	for _, r := range results {
+	for i, r := range results {
 		value := r.Value
 		if cpuScale > 0 {
 			if f, err := strconv.ParseFloat(value, 64); err == nil && !math.IsInf(f, 0) && !math.IsNaN(f) {
 				value += " (" + strconv.FormatFloat(f/cpuScale, 'g', 6, 64) + " CPU cores)"
 			}
 		}
-		lines = append(lines, fmt.Sprintf("%s %s", value, r.Series))
+		lines = append(lines, fmt.Sprintf("%s %s", value, identities[i]))
 	}
 	q.Outcome = OutcomeFetched
-	q.Result = capText(unit+flattenRecalled(strings.Join(lines, "; ")), 400)
+	header := ""
+	if len(results) > 1 {
+		header = fmt.Sprintf("[%d series selected", len(results))
+		if omittedCommon {
+			header += "; common labels omitted"
+		}
+		header += "] "
+	}
+	q.Result = capText(unit+header+flattenRecalled(strings.Join(lines, "; ")), 400)
 }
 
 // upScopeLabel names the exact scrape scope, including the explicitly global case.
@@ -1159,4 +1168,40 @@ func (e *snapshotExecutor) fidelity() string {
 		return "full"
 	}
 	return fmt.Sprintf("partial (%d/%d verification queries unmatched)", e.missed, e.missed+e.matched)
+}
+
+// distinctVerificationLabels omits labels shared by every displayed series so
+// repeated resource metadata cannot consume the cap before later values.
+// Missing labels remain distinct from labels present with an empty value.
+func distinctVerificationLabels(results []verificationResult) ([]string, bool) {
+	identities := make([]string, len(results))
+	common := make(map[string]string)
+	if len(results) > 1 {
+		for key, value := range results[0].labels {
+			if key != "__name__" {
+				common[key] = value
+			}
+		}
+		for _, result := range results[1:] {
+			for key, value := range common {
+				if other, ok := result.labels[key]; !ok || other != value {
+					delete(common, key)
+				}
+			}
+		}
+	}
+	for i, result := range results {
+		identities[i] = result.Series
+		if len(common) == 0 {
+			continue
+		}
+		labels := make(map[string]string)
+		for key, value := range result.labels {
+			if _, shared := common[key]; !shared {
+				labels[key] = value
+			}
+		}
+		identities[i] = formatSeriesIdentity(labels)
+	}
+	return identities, len(common) > 0
 }
