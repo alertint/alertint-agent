@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-10-05
+
 ### Added
 
 - Metric evidence includes a bounded sample of observed metric names, including
@@ -1023,7 +1025,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.3...HEAD
+[0.14.3]: https://github.com/alertint/alertint-agent/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/alertint/alertint-agent/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/alertint/alertint-agent/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0
