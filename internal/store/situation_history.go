@@ -45,6 +45,7 @@ var historyCommitSteps = []string{
 	"transitions",
 	"episode_summary",
 	"transition_stream",
+	"ntfy",
 	"artifacts",
 	"intents",
 	"current_pointer",
@@ -118,6 +119,13 @@ func applyHistoryCommitTx(ctx context.Context, tx *sql.Tx, situationID string, h
 		}
 	}
 	if err := historyStepDone("transition_stream"); err != nil {
+		return err
+	}
+
+	if err := enqueueNTFYTx(ctx, tx, history.Transitions); err != nil {
+		return err
+	}
+	if err := historyStepDone("ntfy"); err != nil {
 		return err
 	}
 

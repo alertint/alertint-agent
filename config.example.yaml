@@ -126,6 +126,12 @@ telemetry:
 
 notify:
   stdout: true             # always emit one JSON line per finding to stdout
+  ntfy:
+    enabled: false
+    base_url: https://ntfy.sh
+    topic: ""
+    token_env: ""  # optional env var containing the access token
+    # events omitted = defaults; [] = none; explicit list replaces defaults
   slack:
     enabled: false
     bot_token_env: SLACK_BOT_TOKEN   # xoxb- bot token (requires chat:write scope)

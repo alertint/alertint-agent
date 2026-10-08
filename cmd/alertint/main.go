@@ -106,6 +106,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return runServe(args, stdout, stderr)
 }
 
+//nolint:gocyclo // Startup assembles the independent subsystem runtimes in one place.
 func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	fs := flag.NewFlagSet("alertint serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -484,6 +485,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// Plan 2's controller recovery and before the Correlator, and both its
 	// workers stop LAST, outside the shutdown drain rounds (R6).
 	nrt := buildSituationNotificationRuntime(cfg, st, auditor, owner, logger)
+	nrt.ntfy, err = buildNTFYRuntime(ctx, cfg, st, auditor, owner, logger)
+	if err != nil {
+		return err
+	}
 
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still

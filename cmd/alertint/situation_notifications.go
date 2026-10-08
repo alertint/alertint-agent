@@ -14,6 +14,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/config"
 
+	"github.com/alertint/alertint-agent/internal/notify/ntfy"
 	"github.com/alertint/alertint-agent/internal/notify/slack"
 	"github.com/alertint/alertint-agent/internal/notify/stdout"
 	"github.com/alertint/alertint-agent/internal/situation"
@@ -743,6 +744,7 @@ var (
 // Situation Slack is not configured) and the stdout Transition-stream
 // worker (always present — the state stream is not Slack-gated).
 type notificationRuntime struct {
+	ntfy   *ntfy.Worker
 	store  notificationStartupStore
 	probe  slackConfigurationProbe
 	worker situationNotificationWorker
@@ -921,6 +923,9 @@ func (r *notificationRuntime) resumeGapReplay(ctx context.Context, now time.Time
 // each on its own background schedule. Call only after RecoverAndReactivate
 // has succeeded, and after the controller/Triage workers have started.
 func (r *notificationRuntime) Start(ctx context.Context) {
+	if r.ntfy != nil {
+		r.ntfy.Start(ctx)
+	}
 	if r.worker != nil {
 		r.worker.Start(ctx)
 	}
@@ -938,6 +943,11 @@ func (r *notificationRuntime) Start(ctx context.Context) {
 // at the next startup.
 func (r *notificationRuntime) Stop(ctx context.Context) error {
 	var errs []error
+	if r.ntfy != nil {
+		if err := r.ntfy.Stop(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if r.stream != nil {
 		if err := r.stream.Stop(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("transition stream worker stop: %w", err))

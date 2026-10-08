@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/notify/ntfy"
 	"github.com/alertint/alertint-agent/internal/situation"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -444,6 +445,9 @@ func TestControllerCommitHistoryFailedWriteLeavesNoPartialState(t *testing.T) {
 			st := newTestStore(t)
 			ctx := context.Background()
 			now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+			if err := st.ConfigureNTFY(ctx, ntfy.Config{Enabled: true, BaseURL: "http://localhost", Topic: "atomic"}, now); err != nil {
+				t.Fatal(err)
+			}
 			group := "group-history-fail-" + step
 			sitID := newSituationForGroup(t, st, group, now)
 			claim := claimSituation(t, st, sitID, "controller-a", now)
@@ -468,6 +472,9 @@ func TestControllerCommitHistoryFailedWriteLeavesNoPartialState(t *testing.T) {
 				t.Fatalf("CommitController with a failure at %q = %v, want the injected error", step, err)
 			}
 			historyCommitFailpoint = nil
+			if n := shCountRows(t, st, `SELECT COUNT(*) FROM ntfy_notifications`); n != 0 {
+				t.Fatalf("ntfy work after rollback = %d", n)
+			}
 
 			if n := shCountRows(t, st, `SELECT COUNT(*) FROM situation_transitions WHERE situation_id = ?`, sitID); n != 0 {
 				t.Fatalf("transitions after rollback = %d, want 0", n)

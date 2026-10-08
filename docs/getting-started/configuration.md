@@ -391,6 +391,11 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
+| `ntfy.enabled` | bool | `false` | Deliver selected Situation changes to one ntfy topic, independently of Slack. |
+| `ntfy.base_url` | string | `https://ntfy.sh` | ntfy server URL; HTTP is accepted for private servers. No embedded credentials, query or fragment. |
+| `ntfy.topic` | string | — | Required when enabled; 1–64 letters, digits, underscores or hyphens. |
+| `ntfy.token_env` | string | — | Optional environment variable holding an access token. A named but unset or empty variable fails startup. |
+| `ntfy.events` | list | — | Omitted uses five defaults; an explicit list replaces them; `[]` selects none. See the [event catalogue and delivery rules](../notifications/ntfy.md). |
 | `slack.enabled` | bool | `false` | Turn on Slack delivery. In v0.14 this enables the Situation delivery worker, which posts one Situation root plus an immutable ordered journal thread. |
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope; no history-read scope is ever requested) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |

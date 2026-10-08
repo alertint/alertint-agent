@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ntfy Situation notifications with configurable material events, authenticated
+  topics, independent durable retries and current-state catch-up after outages.
+  Omitted events use five defaults; explicit lists replace them and `[]` selects
+  none. Same-commit updates coalesce into one push; drills are clearly marked.
+
 ## [0.14.3] - 2026-10-05
 
 ### Added
