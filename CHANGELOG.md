@@ -16,11 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The shadow classifier uses Claude Haiku 5.5 instead of Haiku 4.5;
+  each verdict records the answering model in the audit log.
+
 - ntfy notifications use compact Markdown cards with service/outcome titles,
   explicit actions and uncertainty, evidence bullets and copyable references.
   Dynamic content is escaped and bounded without cutting Markdown formatting.
 
 ### Fixed
+
+- Model refusals report their category instead of an empty-response error.
 
 - Build with Go 1.26.9 and golang.org/x/net 0.60.0 to address the
   October 2026 Go and HTTP/2 security advisories.

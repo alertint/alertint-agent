@@ -115,7 +115,7 @@ func TestRun_ClassifierShadowStaysDark(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("classifier_verdict audit rows = %d, want 1", n)
 	}
-	for _, want := range []string{`"verdict":"matched"`, `"candidates":["inc_weak"]`} {
+	for _, want := range []string{`"verdict":"matched"`, `"candidates":["inc_weak"]`, `"model":"fake-model"`} {
 		if !strings.Contains(payload, want) {
 			t.Errorf("audit payload missing %s: %s", want, payload)
 		}

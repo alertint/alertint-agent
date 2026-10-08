@@ -160,6 +160,7 @@ func TestThinkingModeForSonnet55(t *testing.T) {
 		{"claude-sonnet-5-5", "between_tools"},
 		{"claude-sonnet-5", "disabled"},
 		{"claude-haiku-4-5", "disabled"},
+		{"claude-haiku-5-5", "disabled"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +314,30 @@ func TestMaxTokensTruncationError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "not valid JSON") {
 		t.Errorf("truncation must not surface as a JSON parse error: %v", err)
+	}
+}
+
+// TestRefusalStopNamesCategory verifies that a safety-classifier decline
+// (stop_reason=refusal, no text block) is reported as a refusal with its
+// category — not as the misleading "no text content block" — while staying
+// in the ErrResponseInvalid content class every caller already handles.
+func TestRefusalStopNamesCategory(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"},"usage":{"input_tokens":900,"output_tokens":3}}`)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL, nil)
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name"})
+	if !errors.Is(err, llm.ErrResponseInvalid) {
+		t.Fatalf("expected ErrResponseInvalid, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refusal") || !strings.Contains(err.Error(), "cyber") {
+		t.Errorf("error must name the refusal and its category: %v", err)
+	}
+	if strings.Contains(err.Error(), "no text content block") {
+		t.Errorf("refusal must not surface as a missing text block: %v", err)
 	}
 }
 
