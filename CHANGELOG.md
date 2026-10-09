@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Keep observation preparation and cleanup responsive as retained history grows
   by indexing exact query results, live temporary references and pending detail
-  expiration. Preserve evidence ordering,
+  expiration, with smaller background metadata deletion batches. Preserve
+  evidence ordering,
   version fences and retention protections; backfill the index during upgrades.
 
 ## [0.15.0] - 2026-10-09
