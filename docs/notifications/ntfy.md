@@ -44,16 +44,34 @@ Messages use Markdown inside the app; system notification previews may look simp
 
 ## 3. Choose updates (optional)
 
-Omit `events` to use the five defaults marked **On**. To choose your own list, add it under `notify.ntfy`:
+The full configuration below enables the five defaults marked **On**. Uncomment optional events to include them, or remove entries to exclude them:
 
 ```yaml
-events:
-  - first_notification
-  - operator_action_required
-  - recovered
+notify:
+  ntfy:
+    enabled: true
+    base_url: https://ntfy.sh
+    topic: infrastructure-alerts
+    token_env: NTFY_TOKEN
+    events:
+      # Default events
+      - first_notification
+      - priority_escalated
+      - operator_action_required
+      - recovered
+      - closed_uncertain
+      # Optional events
+      # - investigation_started
+      # - investigation_completed
+      # - coverage_degraded
+      # - coverage_restored
+      # - recovery_pending
+      # - recovery_refired
+      # - members_changed
+      # - operator_updated
 ```
 
-An explicit list replaces the defaults. `events: []` sends nothing; unknown names fail validation. Slack settings do not affect this selection.
+Omit `events` to use the defaults. An explicit list replaces them. `events: []` sends nothing; unknown names fail validation. Slack settings do not affect this selection.
 
 | Event | Default · sends an update when… |
 |---|---|
