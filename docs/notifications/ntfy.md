@@ -78,6 +78,8 @@ Messages use Markdown with compact service/outcome titles, readable alert names,
 bold section labels, evidence bullets and a copyable Situation reference. Required
 actions and uncertainty appear before bounded analysis details. Historical analysis
 is labeled separately; recovery confirmation does not imply a confirmed cause.
+Activity and checkpoint times are explicitly scoped to the update, so an ordered
+older notification does not claim the investigation is still running now.
 The app's notification list and expanded message show the rich layout. Android
 app version 1.17.8 or newer renders Markdown; system notification previews may
 show a simpler layout. See [ntfy's formatting guide](https://docs.ntfy.sh/publish/#markdown-formatting).

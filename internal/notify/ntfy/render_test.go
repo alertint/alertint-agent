@@ -3,6 +3,9 @@
 package ntfy
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -103,5 +106,35 @@ func TestRenderActivityDistinguishesPlannedFromExecuting(t *testing.T) {
 		if tc.status != model.AlertINTStatusRunning && strings.Contains(m.Body, "Investigating") {
 			t.Fatalf("not-yet-running work claims execution: %q", m.Body)
 		}
+	}
+}
+
+func TestRenderExternalScopeCannotBreakHTTPDelivery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.ContainsAny(r.Header.Get("Title"), "\x00\x1b\x7f\r\n") {
+			t.Error("invalid control reached HTTP title")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	tr := model.Transition{ID: "transition", SituationID: "S-104", Lifecycle: model.LifecycleActive,
+		Projection: model.ProjectionFacts{Briefing: &model.OperatorBriefing{DisplayScope: "payment\x00\x1b\x7f\r\nservice"}}}
+	m := Render(tr, []string{"first_notification"}, false)
+	if err := NewClient("").Send(context.Background(), srv.URL, m); err != nil {
+		t.Fatalf("untrusted scope prevented delivery: %v (title %q)", err, m.Title)
+	}
+}
+
+func TestRenderOrderedActivityIsExplicitlyScopedToUpdateTime(t *testing.T) {
+	action, status := model.AlertINTActionRunAcuteTriage, model.AlertINTStatusRunning
+	at := time.Date(2026, 10, 9, 9, 0, 0, 0, time.UTC)
+	checkpoint := at.Add(time.Minute)
+	tr := model.Transition{SituationID: "S-104", Lifecycle: model.LifecycleActive, CreatedAt: at,
+		ActionContract: model.ActionContract{AlertINTAction: &action, AlertINTStatus: &status, NextUpdateAt: &checkpoint}}
+	m := Render(tr, []string{"investigation_started"}, false)
+	activity := strings.Index(m.Body, "Investigating this Situation")
+	context := strings.Index(m.Body, "At this update")
+	if context < 0 || activity < context || !strings.Contains(m.Body, "As of") || !strings.Contains(m.Body, "Checkpoint:** 09 Oct 2026") {
+		t.Fatalf("queued activity is not explicitly historical: %q", m.Body)
 	}
 }

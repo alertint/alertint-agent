@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/alertint/alertint-agent/internal/situation"
@@ -58,7 +59,7 @@ func render(t model.Transition, events []string, catchup, delayed bool) Message 
 	}
 	footer := "---\nSituation: " + codeReference(handle)
 	if !t.CreatedAt.IsZero() {
-		footer += "  \n" + t.CreatedAt.UTC().Format("02 Jan 2006 · 15:04:05 UTC")
+		footer += "  \nAs of " + t.CreatedAt.UTC().Format("02 Jan 2006 · 15:04:05 UTC")
 	}
 	if t.Drill {
 		footer += "  \nDRILL — test Situation."
@@ -147,10 +148,10 @@ func renderContract(body *messageBody, t model.Transition) {
 		activityLines = append(activityLines, "**AlertINT:** "+activity)
 	}
 	if at := t.ActionContract.NextUpdateAt; at != nil {
-		activityLines = append(activityLines, "**Next checkpoint:** "+at.UTC().Format("15:04 UTC · 02 Jan"))
+		activityLines = append(activityLines, "**Checkpoint:** "+at.UTC().Format("02 Jan 2006 · 15:04 UTC"))
 	}
 	if len(activityLines) > 0 {
-		body.add(strings.Join(activityLines, "  \n"))
+		body.add("**At this update**  \n" + strings.Join(activityLines, "  \n"))
 	}
 }
 
@@ -334,6 +335,12 @@ func (b *messageBody) text(s string, limit int) string {
 }
 
 func plainText(s string, limit int) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
 	return shorten(strings.Join(strings.Fields(s), " "), limit, "…")
 }
 
