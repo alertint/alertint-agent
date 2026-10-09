@@ -17,42 +17,30 @@ import (
 
 // loadCurrentEvidenceTx selects the latest observation per exact query slot,
 // not just the reads that happened to fit this cycle. Input and configuration
-// fences prevent evidence crossing membership/configuration changes. Rank before
-// checking expiry or success: an old success must never replace a newer failure.
+// fences prevent evidence crossing membership/configuration changes. Select the
+// latest generation before checking expiry or success: an old success must
+// never replace a newer failure.
 // Canonical slot order, rather than recency, makes truncation stable under refresh.
 func loadCurrentEvidenceTx(ctx context.Context, tx *sql.Tx, situationID, cycleID string, now time.Time) ([]observationmodel.Run, []situation.SourceObservation, error) {
 	rows, err := tx.QueryContext(ctx, `
-		WITH scoped_plans AS (
-		 SELECT p.id, p.capability, p.scope_json, p.parameters_json,
-		        p.start_at, p.end_at, p.limit_count, p.purpose,
-		   (unixepoch(substr(end_at,1,19)||'Z')-unixepoch(substr(start_at,1,19)||'Z'))*1000000000
-		   + CASE WHEN substr(end_at,20,1)='.' THEN CAST(substr(substr(end_at,21,length(end_at)-21)||'000000000',1,9) AS INTEGER) ELSE 0 END
-		   - CASE WHEN substr(start_at,20,1)='.' THEN CAST(substr(substr(start_at,21,length(start_at)-21)||'000000000',1,9) AS INTEGER) ELSE 0 END AS window_ns
-		 FROM situation_observation_plans p
-		), ranked AS (
-		 SELECT r.id, r.cycle_id, r.plan_id, r.status, r.coverage_start, r.coverage_end,
-		        r.coverage_complete, r.coverage_returned, r.coverage_omitted,
-		        r.limitation_codes_json, r.observed_at, r.expires_at, r.completed_at,
-		        r.reused_from_run_id, e.expired_at, p.capability, p.scope_json,
-		        p.parameters_json, p.start_at, p.end_at, p.limit_count, p.purpose, p.window_ns,
-		        ROW_NUMBER() OVER (
-		          PARTITION BY p.capability, p.scope_json, p.parameters_json, p.window_ns, p.limit_count, p.purpose
-		          ORDER BY c.generation DESC, r.completed_at DESC, r.id DESC) AS rank
-		 FROM situation_observation_runs r
-		 JOIN situation_preparation_cycles c ON c.id = r.cycle_id
-		 JOIN scoped_plans p ON p.id = r.plan_id
-		 JOIN situations s ON s.id = c.situation_id
-		 JOIN situation_preparation_cycles current ON current.id = ?
-		 LEFT JOIN situation_observation_detail_expirations e ON e.run_id = r.id
-		 WHERE c.situation_id = ? AND c.input_version = s.input_version
-		   AND c.config_digest = current.config_digest AND c.generation <= current.generation
+		SELECT r.id, r.cycle_id, r.plan_id, r.status, r.coverage_start, r.coverage_end,
+		       r.coverage_complete, r.coverage_returned, r.coverage_omitted,
+		       r.limitation_codes_json, r.observed_at, r.expires_at, r.completed_at,
+		       r.reused_from_run_id, e.expired_at, q.capability, q.scope_json, q.parameters_json,
+		       p.start_at, p.end_at, q.limit_count, q.purpose
+		FROM situation_observation_query_slots q
+		JOIN situations s ON s.id = q.situation_id
+		JOIN situation_preparation_cycles current ON current.id = ?
+		JOIN situation_observation_runs r ON r.id = (
+		 SELECT h.run_id FROM situation_observation_query_runs h
+		 WHERE h.slot_id = q.id AND h.generation <= current.generation
+		 ORDER BY h.generation DESC, h.completed_at DESC, h.run_id DESC LIMIT 1
 		)
-		SELECT id, cycle_id, plan_id, status, coverage_start, coverage_end,
-		       coverage_complete, coverage_returned, coverage_omitted,
-		       limitation_codes_json, observed_at, expires_at, completed_at,
-		       reused_from_run_id, expired_at, capability, scope_json, parameters_json, start_at, end_at, limit_count, purpose
-		FROM ranked WHERE rank = 1
-		ORDER BY capability, scope_json, parameters_json, limit_count, purpose, window_ns LIMIT ?`, cycleID, situationID, observationmodel.MaxPlansPerCycle+1)
+		JOIN situation_observation_plans p ON p.id = r.plan_id
+		LEFT JOIN situation_observation_detail_expirations e ON e.run_id = r.id
+		WHERE q.situation_id = ? AND q.input_version = s.input_version
+		  AND q.config_digest = current.config_digest
+		ORDER BY q.capability, q.scope_json, q.parameters_json, q.limit_count, q.purpose, q.window_ns LIMIT ?`, cycleID, situationID, observationmodel.MaxPlansPerCycle+1)
 	if err != nil {
 		return nil, nil, fmt.Errorf("store: query current evidence: %w", err)
 	}

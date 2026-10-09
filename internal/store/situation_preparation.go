@@ -256,10 +256,10 @@ func (s *Store) BeginPreparation(ctx context.Context, f observationmodel.Fence, 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE situation_observation_references SET superseded = 1
 		WHERE superseded = 0 AND reference_kind IN ('current_cycle','open_cycle') AND owner_id != ?
-		  AND run_id IN (
-		      SELECT r.id FROM situation_observation_runs r
+		  AND EXISTS (
+		      SELECT 1 FROM situation_observation_runs r
 		      JOIN situation_preparation_cycles c ON c.id = r.cycle_id
-		      WHERE c.situation_id = ?
+		      WHERE r.id = situation_observation_references.run_id AND c.situation_id = ?
 		  )`, cycleID, f.SituationID); err != nil {
 		return observationmodel.Cycle{}, fmt.Errorf("store: supersede prior cycle references: %w", err)
 	}
