@@ -13,6 +13,21 @@ slug: "faq"
 Yes — **AlertINT** is self-hosted. It runs as a single binary with local
 state, so your alert data stays with you.
 
+Configured LLM and notification services receive the evidence or message
+content you send them. Use self-hosted endpoints when that content must stay
+inside your network.
+
+---
+
+## Can I receive notifications without Slack?
+
+Yes. The [ntfy integration](../notifications/ntfy.md), planned for AlertINT
+0.15, sends selected Situation changes to ntfy.sh or your own ntfy server.
+Subscribe with the ntfy app on your phone. It works independently of Slack
+and adds no LLM calls. Five events are enabled by default; a configurable
+list lets you choose additional progress updates or fewer notifications.
+v0.14.3 does not include ntfy support.
+
 ---
 
 ## Does it replace Alertmanager?

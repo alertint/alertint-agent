@@ -160,10 +160,14 @@ mount through `extraVolumeMounts`, the chart keeps yours instead.
 | configOverride | string | `""` | Raw YAML config, used verbatim as config.yaml instead of `config` below when non-empty. Unlike `config` (a YAML map, which Helm deep-merges with the chart's defaults on a partial override — see the warning below), a plain string value is never merged: whatever you put here is exactly what ships, with nothing inherited from the chart's defaults. Prefer this (or existingConfigMap above) over partially overriding `config` whenever you want to be certain no default leaks through — e.g. switching llm.provider to openai-compatible without also inheriting the default llm.api_key_env: ANTHROPIC_API_KEY. configOverride: |   receivers:     address: "0.0.0.0:9911"   alertmanager:     enabled: true     webhook_token_env: ALERTINT_WEBHOOK_TOKEN   ... |
 | config | object | see config.example.yaml in the repo root for the full schema | The complete alertint-agent config, rendered verbatim to /etc/alertint/config.yaml — but ONLY when both existingConfigMap and configOverride above are empty. This mirrors config.example.yaml in the alertint-agent repo (see also docs/getting-started/configuration.md) — that file documents every available field; this chart intentionally does not duplicate the schema into typed Helm values, since it evolves with the app itself.  WARNING: this is a YAML map, so Helm deep-merges a partial override with the defaults below rather than replacing them — e.g. setting only config.llm.provider and config.llm.base_url still inherits this chart's default config.llm.api_key_env: ANTHROPIC_API_KEY alongside them, which is very likely not what you want for a non-Anthropic setup. If you need a config taken exactly as given with nothing inherited, use configOverride or existingConfigMap above instead. |
 
-### ntfy notifications
+## ntfy notifications
+
+Planned for AlertINT 0.15. The current chart's default v0.14.3 image does not
+support ntfy; install the application/chart release that includes the feature.
 
 Set `config.notify.ntfy.enabled`, `base_url`, `topic` and optional `token_env`.
-Use `extraEnv` with a Kubernetes Secret for the token value. Omit `events` to
-use the default Situation events, or supply an explicit replacement list;
-`events: []` selects none. See the [ntfy guide](../../docs/notifications/ntfy.md)
-for the catalogue and delivery/reconfiguration behavior.
+Supply the named environment variable through `secret.existingSecret`, or
+`extraEnv` with `valueFrom.secretKeyRef`. Omit `events` for the five defaults;
+an explicit list replaces them and `events: []` selects none.
+See the [ntfy guide](https://alertint.com/docs/notifications/ntfy) for a complete
+values example, subscriber setup and delivery behavior.

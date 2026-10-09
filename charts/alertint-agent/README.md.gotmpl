@@ -98,3 +98,15 @@ mount through `extraVolumeMounts`, the chart keeps yours instead.
 {{ template "chart.sourcesSection" . }}
 
 {{ template "chart.valuesSection" . }}
+
+## ntfy notifications
+
+Planned for AlertINT 0.15. The current chart's default v0.14.3 image does not
+support ntfy; install the application/chart release that includes the feature.
+
+Set `config.notify.ntfy.enabled`, `base_url`, `topic` and optional `token_env`.
+Supply the named environment variable through `secret.existingSecret`, or
+`extraEnv` with `valueFrom.secretKeyRef`. Omit `events` for the five defaults;
+an explicit list replaces them and `events: []` selects none.
+See the [ntfy guide](https://alertint.com/docs/notifications/ntfy) for a complete
+values example, subscriber setup and delivery behavior.

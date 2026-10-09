@@ -70,7 +70,7 @@ Helm:
 secret:
   # A Secret you manage yourself (External Secrets, Sealed Secrets, SOPS, ...)
   # holding every *_env name the config references:
-  # ALERTINT_WEBHOOK_TOKEN, ANTHROPIC_API_KEY, and any tokens for Slack,
+  # ALERTINT_WEBHOOK_TOKEN, ANTHROPIC_API_KEY, and any tokens for Slack, ntfy,
   # MCP, changes or Zabbix you enable.
   existingSecret: alertint-agent
 
@@ -89,6 +89,10 @@ config:
 helm upgrade --install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
   --version <chart version> -f values.yaml
 ```
+
+For selected mobile notifications, see [ntfy](../notifications/ntfy.md#kubernetes).
+That integration is planned for AlertINT 0.15; use a chart and image from the
+release that includes it, rather than the current v0.14.3 image.
 
 Things worth knowing before the first real install:
 

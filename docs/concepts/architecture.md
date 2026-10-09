@@ -206,6 +206,15 @@ reply any more.
 - **Method:** stdout (always available) and Slack Bot Token API
   (`chat.postMessage` / `chat.update`), written by exactly one path
 
+Planned for 0.15, [ntfy](../notifications/ntfy.md) adds an independent
+Situation notification path. Event selection and a frozen Markdown payload
+are committed with the Situation transition into a separate SQLite delivery
+ledger. A bounded HTTP worker publishes to one configured topic, with durable
+retries and current-state catch-up after an outage or pause. Slack delivery
+does not consume ntfy work. Both use the same Situation decisions and findings;
+notification delivery adds no LLM calls. Each ntfy push is a new message,
+rather than an edit to an earlier card. External delivery is at least once.
+
 ## Phase 2 — Investigate
 
 ### 9. Agent entry via MCP

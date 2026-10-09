@@ -39,6 +39,7 @@ ANTHROPIC_API_KEY=sk-ant-...                           # console.anthropic.com �
 # Optional integrations (uncomment what you connect)
 # PROMETHEUS_BEARER_TOKEN=...     # https://alertint.com/docs/integrations/prometheus
 # SLACK_BOT_TOKEN=xoxb-...        # https://alertint.com/docs/notifications/slack
+# NTFY_TOKEN=tk_...              # https://alertint.com/docs/notifications/ntfy (0.15)
 # LOKI_BEARER_TOKEN=...           # https://alertint.com/docs/integrations/loki
 # SENTRY_AUTH_TOKEN=...           # https://alertint.com/docs/integrations/sentry
 ```
@@ -388,6 +389,9 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 
 ## `notify`
 
+The ntfy fields below are planned for AlertINT 0.15; v0.14.3 does not accept
+them. See [ntfy](../notifications/ntfy.md) for source-build testing before release.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
@@ -402,7 +406,7 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 | `slack.min_severity` | string | `low` | The minimum **interruption priority** a new main-channel interruption must meet — never alert severity and never a model claim. `critical` always passes; a withheld interruption is durably recorded; the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
 | `slack.recurrence_mode` | string | `change-gated` | Controls Situation recurrence milestone replies: `change-gated` posts one quiet thread reply at ×5/×10/×25/×50/×100 and then every ×100; `off` keeps only the silent root edit. Neither mode re-pages the channel. |
 
-At startup the agent logs one `notifiers ready` line listing the active sinks
+At startup the agent logs one `notifiers ready` line listing the finding sinks
 (and the Slack channel) so you can see where findings will go. Every analysis
 then logs, at INFO regardless of format:
 
@@ -429,6 +433,11 @@ reads a replayed stream, may legitimately see the same transition line more
 than once.
 
 See [Slack](../notifications/slack.md) for the full setup walkthrough.
+The independent ntfy worker reports its delivery outcomes in `ntfy notified`
+or `ntfy delivery unavailable; notification retained` logs and the audit history. A committed stdout transition
+does not prove ntfy delivery. ntfy is not included in the startup integration
+health probes; receipt of a selected update verifies the delivery path.
+See [ntfy](../notifications/ntfy.md) for setup and troubleshooting.
 
 ## `mcp`
 

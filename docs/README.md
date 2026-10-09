@@ -1,9 +1,10 @@
 # AlertINT documentation
 
 This folder is the **canonical source** for all AlertINT documentation. The
-website repo fetches these files at build time and renders them at
-<https://alertint.com/docs>. Do not edit docs in the website repo — edit
-them here.
+website publishes a committed, concise edition at <https://alertint.com/docs>.
+Update the reference here first, then synchronize the relevant changes into
+the website's `docs-preview/` tree in a corresponding website PR. Its build
+can also read this docs tree through an explicit `LOCAL_DOCS_PATH` override.
 
 Because the files are rendered outside GitHub, they must be clean, portable
 CommonMark: no GitHub-specific extensions (no GitHub alerts syntax such as
@@ -70,6 +71,8 @@ single-H1 rule, and that fenced code blocks declare a language.
 
 When a change under `docs/` lands on `main`, the `Docs Deploy` workflow
 re-runs the validator and triggers a rebuild of <https://alertint.com/docs>.
-No manual step is needed; the site picks up the new content within a few
-minutes. The workflow can also be started by hand from the Actions tab
-(`workflow_dispatch`) to force a redeploy without a docs change.
+The hook rebuilds the website; it does not update the website's committed
+`docs-preview/` edition. Synchronize relevant changes in a website PR and
+publish it through the site's normal workflow. The workflow can also be
+started by hand from the Actions tab (`workflow_dispatch`) to force a rebuild
+without a docs change.

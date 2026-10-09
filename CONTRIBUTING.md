@@ -36,8 +36,10 @@ community pack (with attribution preserved via git history).
 ## Contributing documentation
 
 The `/docs` tree in this repo is the canonical source for
-<https://alertint.com/docs> — the website fetches and renders it at build
-time, so a docs PR here updates the published docs. The structure,
+<https://alertint.com/docs>. The website builds a committed, concise edition;
+sync relevant reference changes into its `docs-preview/` tree through a
+corresponding website PR. An agent docs PR alone does not update that edition.
+The structure,
 frontmatter requirements, and formatting rules (plain CommonMark, one H1
 per page, code blocks with a language) are described in
 [`docs/README.md`](docs/README.md). Validate before opening a PR:
