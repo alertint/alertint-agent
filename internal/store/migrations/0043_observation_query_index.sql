@@ -33,7 +33,8 @@ CREATE TABLE situation_observation_query_runs (
     run_id TEXT PRIMARY KEY REFERENCES situation_observation_runs(id) ON DELETE CASCADE,
     slot_id INTEGER NOT NULL REFERENCES situation_observation_query_slots(id),
     generation INTEGER NOT NULL,
-    completed_at TEXT NOT NULL
+    completed_at TEXT NOT NULL,
+    detail_expired INTEGER NOT NULL DEFAULT 0 CHECK (detail_expired IN (0, 1))
 ) STRICT, WITHOUT ROWID;
 
 INSERT OR IGNORE INTO situation_observation_query_slots
@@ -43,8 +44,9 @@ SELECT k.situation_id, k.input_version, k.config_digest, k.capability, k.scope_j
 FROM situation_observation_query_keys k
 JOIN situation_observation_runs r ON r.plan_id = k.plan_id;
 
-INSERT INTO situation_observation_query_runs (run_id, slot_id, generation, completed_at)
-SELECT r.id, q.id, c.generation, r.completed_at
+INSERT INTO situation_observation_query_runs (run_id, slot_id, generation, completed_at, detail_expired)
+SELECT r.id, q.id, c.generation, r.completed_at,
+    EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
 FROM situation_observation_runs r
 JOIN situation_preparation_cycles c ON c.id = r.cycle_id
 JOIN situation_observation_query_keys k ON k.plan_id = r.plan_id
@@ -55,6 +57,24 @@ JOIN situation_observation_query_slots q
 
 CREATE INDEX situation_observation_query_runs_latest_idx
     ON situation_observation_query_runs(slot_id, generation DESC, completed_at DESC, run_id DESC);
+
+-- Cleanup must not repeatedly walk the already-expired prefix of history.
+-- Keep the pending set atomic with the authoritative expiration markers;
+-- eligibility still checks live references and protected reuse sources.
+CREATE INDEX situation_observation_query_runs_pending_details_idx
+    ON situation_observation_query_runs(completed_at, run_id) WHERE detail_expired = 0;
+
+CREATE TRIGGER situation_observation_detail_expirations_index_insert
+AFTER INSERT ON situation_observation_detail_expirations
+BEGIN
+    UPDATE situation_observation_query_runs SET detail_expired = 1 WHERE run_id = NEW.run_id;
+END;
+
+CREATE TRIGGER situation_observation_detail_expirations_index_delete
+AFTER DELETE ON situation_observation_detail_expirations
+BEGIN
+    UPDATE situation_observation_query_runs SET detail_expired = 0 WHERE run_id = OLD.run_id;
+END;
 
 -- Starting a new cycle transfers only live temporary protection. Superseded
 -- history must not be enumerated to find these few remaining references.

@@ -40,6 +40,14 @@ func TestCurrentEvidenceIndexUpgradeAndRestart(t *testing.T) {
 		}
 	}
 	id, cycles := metadataRetentionCycles(t, st, 3, false, false)
+	// Seed released-schema expiration records before the new index exists.
+	if _, err := db.ExecContext(ctx, `INSERT INTO situation_observation_detail_expirations (run_id, expired_at)
+		SELECT id, ? FROM situation_observation_runs WHERE cycle_id IN (?, ?);
+		DELETE FROM situation_observation_fact_payloads WHERE fact_id IN (
+		    SELECT f.id FROM situation_observation_facts f JOIN situation_observation_detail_expirations e ON e.run_id=f.run_id
+		)`, canonicalTime(cycles[0].Draft.Anchor.Add(11*24*time.Hour)), cycles[0].ID, cycles[1].ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -65,9 +73,46 @@ func TestCurrentEvidenceIndexUpgradeAndRestart(t *testing.T) {
 		if got := metadataCount(t, st, "situation_observation_query_slots"); got != 1 {
 			t.Fatalf("query slots = %d, want 1", got)
 		}
+		var expired int
+		if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_observation_query_runs WHERE detail_expired=1`).Scan(&expired); err != nil || expired != 2 {
+			t.Fatalf("upgrade expiration index = %d, %v; want 2", expired, err)
+		}
 		if err := st.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestObservationDetailIndexRollsBackWithCleanup(t *testing.T) {
+	st := newTestStore(t)
+	_, cycles := metadataRetentionCycles(t, st, 3, false, false)
+	ctx := context.Background()
+	at := cycles[0].Draft.Anchor.Add(11 * 24 * time.Hour)
+	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_payload_delete BEFORE DELETE ON situation_observation_fact_payloads
+		BEGIN SELECT RAISE(ABORT, 'injected payload deletion failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PruneUnusedObservationDetails(ctx, at, 100); err == nil {
+		t.Fatal("expected cleanup failure")
+	}
+	var expired int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_observation_query_runs WHERE detail_expired=1`).Scan(&expired); err != nil || expired != 0 {
+		t.Fatalf("failed cleanup changed pending set: %d, %v", expired, err)
+	}
+	if got := metadataCount(t, st, "situation_observation_detail_expirations"); got != 0 {
+		t.Fatalf("failed cleanup committed %d expiration markers", got)
+	}
+	if _, err := st.db.ExecContext(ctx, `DROP TRIGGER fail_payload_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.PruneUnusedObservationDetails(ctx, at, 100); err != nil || n != 2 {
+		t.Fatalf("cleanup retry = %d, %v; want 2", n, err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_observation_query_runs WHERE detail_expired=1`).Scan(&expired); err != nil || expired != 2 {
+		t.Fatalf("successful cleanup expiration index = %d, %v; want 2", expired, err)
+	}
+	if n, err := st.PruneUnusedObservationDetails(ctx, at, 100); err != nil || n != 0 {
+		t.Fatalf("cleanup replay = %d, %v; want 0", n, err)
 	}
 }
 
@@ -204,6 +249,19 @@ func TestCurrentEvidenceLargeHistory(t *testing.T) {
 	fence := observationmodel.Fence{SituationID: claim.Situation.ID, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}
 	if _, err := st.BeginPreparation(ctx, fence, observationmodel.CycleDraft{Anchor: now.Add(time.Minute), ConfigDigest: "config-a", Plans: []observationmodel.Plan{testPlan(now.Add(time.Minute))}}, 4); err != nil {
 		t.Fatalf("new cycle exceeds readiness budget: %v", err)
+	}
+	// Expired history must not be rescanned on every cleanup batch, including
+	// the no-op detail checks which precede each metadata cleanup batch.
+	if _, err := st.db.ExecContext(context.Background(), `INSERT INTO situation_observation_detail_expirations (run_id, expired_at)
+		SELECT id, ? FROM situation_observation_runs WHERE id LIKE 'history-run:%'`, canonicalTime(now.Add(11*24*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for range 10 {
+		if _, err := st.PruneUnusedObservationDetails(ctx, now.Add(11*24*time.Hour), 100); err != nil {
+			t.Fatalf("cleanup rescans expired history beyond readiness budget: %v", err)
+		}
 	}
 }
 
