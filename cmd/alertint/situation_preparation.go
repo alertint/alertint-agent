@@ -802,7 +802,11 @@ func newPreparationRuntime(
 			return st.BackfillActiveSemanticMappings(ctx, now, 100)
 		}, now, logger),
 		newPreparationSweep("observation_detail_cleanup", time.Hour, func(ctx context.Context, now time.Time) (int, error) {
-			return st.PruneUnusedObservationDetails(ctx, now, 100)
+			n, err := st.PruneUnusedObservationDetails(ctx, now, 100)
+			if err != nil || n > 0 {
+				return n, err
+			}
+			return st.PruneUnusedObservationMetadata(ctx, now, 100)
 		}, now, logger),
 	}
 

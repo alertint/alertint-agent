@@ -39,7 +39,9 @@ func (s *Server) toolListObservationRuns() (mcplib.Tool, mcpserver.ToolHandlerFu
 		mcplib.WithDescription("Page one Situation's bounded evidence-preparation runs, oldest first: each "+
 			"capability read's immutable result status, coverage, and normalized facts (or an explicit "+
 			"detail_state=\"expired\" once its 10-day unused-detail retention window has passed — never a "+
-			"fabricated or reconstructed value). Page with the returned next_cursor. Never returns a raw "+
+			"fabricated or reconstructed value). Old unused cycles may be removed after ten days; "+
+			"decision evidence and observations still needed for current work remain retained. "+
+			"Page with the returned next_cursor. Never returns a raw "+
 			"connector request, provider response, or claim owner/token."),
 		mcplib.WithString("id", mcplib.Description("Situation ID. Exactly one of id/handle is required.")),
 		mcplib.WithString("handle", mcplib.Description("Situation public handle. Exactly one of id/handle is required.")),

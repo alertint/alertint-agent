@@ -46,6 +46,13 @@ policy, remote action execution, or installation-wide health notifications.
 
 ## Durable Situation foundation and controller
 
+From v0.15, unused observation payloads and obsolete preparation records are
+cleaned up after ten days. Evidence behind decisions, current query results,
+reuse sources and source provenance stays retained. This bounds unused
+bookkeeping rather than total lifetime storage. SQLite reuses freed pages;
+cleanup does not immediately shrink the database file on disk. Upgrades retain
+older metadata conservatively where the exact decision basis was not recorded.
+
 Every accepted alert delivery is now immutable and durably queued, and the
 Incidents it produces are grouped under a durable per-exact-group
 **Situation** — visible through the `alertint_list_situations`

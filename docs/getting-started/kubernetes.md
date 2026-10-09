@@ -102,6 +102,12 @@ Things worth knowing before the first real install:
 - **Persistence is on by default.** Disabling it means every restart starts
   from an empty incident and memory history. Back the volume up the way
   [Backup & restore](backup-restore.md) describes.
+- **Health probes.** From v0.15, startup and liveness use `/live`, which does
+  not wait for SQLite or external sources. Readiness uses `/ready`, with a
+  one-second storage check. Startup allows five minutes for migrations and
+  recovery; increase `probes.startup.failureThreshold` for larger backlogs.
+  `/health` remains available for diagnostic status. When overriding the image
+  with v0.14 or earlier, use its matching chart: those images lack these routes.
 - **Configuration is the same YAML** as everywhere else, rendered into a
   ConfigMap from the `config` value. Helm deep-merges a partial `config`
   override with the chart defaults; when you need the file taken exactly as

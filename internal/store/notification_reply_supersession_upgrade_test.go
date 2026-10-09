@@ -190,8 +190,8 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 41 {
-		t.Fatalf("MaxSchemaVersion = %d, want 41", got)
+	if got != 42 {
+		t.Fatalf("MaxSchemaVersion = %d, want 42", got)
 	}
 
 	assertNoForeignKeyViolations(ctx, t, st)

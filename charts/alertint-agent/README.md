@@ -1,6 +1,6 @@
 # alertint-agent
 
-![Version: 0.2.7](https://img.shields.io/badge/Version-0.2.7-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.14.3](https://img.shields.io/badge/AppVersion-0.14.3-informational?style=flat-square)
+![Version: 0.2.8](https://img.shields.io/badge/Version-0.2.8-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.15.0](https://img.shields.io/badge/AppVersion-0.15.0-informational?style=flat-square)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/alertint-agent)](https://artifacthub.io/packages/helm/alertint-agent/alertint-agent)
 
 AI-powered alert-triage agent that correlates Alertmanager/Zabbix alerts into incidents, enriches them with Mimir/Loki/Sentry evidence, and produces LLM findings.
@@ -88,6 +88,15 @@ notifications, not higher availability. Restart handling
 (`strategy.type: Recreate`) and persistence are built around this
 single-writer assumption.
 
+## Health probes
+
+Startup and liveness use `/live`, which never waits for SQLite or external
+sources. Readiness uses `/ready`, with a one-second storage check. Startup
+allows five minutes for migrations and recovery by default; increase
+`probes.startup.failureThreshold` for larger backlogs. `/health` remains the
+diagnostic endpoint. These probe routes require AlertINT v0.15 or later;
+use the matching older chart when rolling back to an earlier image.
+
 The chart mounts an ephemeral `/tmp` volume for SQLite temporary work, even
 with the default read-only root filesystem. If you already provide a `/tmp`
 mount through `extraVolumeMounts`, the chart keeps yours instead.
@@ -140,7 +149,9 @@ mount through `extraVolumeMounts`, the chart keeps yours instead.
 | tolerations | list | `[]` |  |
 | affinity | object | `{}` |  |
 | topologySpreadConstraints | list | `[]` |  |
-| probes | object | `{"enabled":true,"failureThreshold":3,"initialDelaySeconds":5,"periodSeconds":15,"timeoutSeconds":5}` | Liveness/readiness probing. Uses GET /health, served alongside the webhook receivers on service.webhookPort — this requires at least one receiver (config.alertmanager, config.changes.ingress or config.zabbix.ingress) to be enabled, which is the default here (alertmanager). If you disable every receiver, disable these probes too, or the pod will never go Ready. |
+| probes | object | `{"enabled":true,"failureThreshold":3,"initialDelaySeconds":5,"periodSeconds":15,"startup":{"failureThreshold":60,"periodSeconds":5},"timeoutSeconds":5}` | Startup/liveness use GET /live; readiness uses the bounded storage check at GET /ready, served alongside the webhook receivers on service.webhookPort — this requires at least one receiver (config.alertmanager, config.changes.ingress or config.zabbix.ingress) to be enabled, which is the default here (alertmanager). If you disable every receiver, disable these probes too, or the pod will never go Ready. |
+| probes.startup.periodSeconds | int | `5` | Seconds between startup checks. Startup protects migrations and recovery. |
+| probes.startup.failureThreshold | int | `60` | Consecutive failures before restarting during startup (default budget: five minutes). |
 | persistence.enabled | bool | `true` | Persists the SQLite store across restarts. Disabling this means every restart starts from an empty incident/memory history — fine for a throwaway demo, not for a real deployment. |
 | persistence.storageClassName | string | `""` |  |
 | persistence.accessMode | string | `"ReadWriteOnce"` |  |

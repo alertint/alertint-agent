@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-09
+
 ### Added
 
 - ntfy Situation notifications with configurable material events, authenticated
@@ -18,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The shadow classifier uses Claude Haiku 5.5 instead of Haiku 4.5;
   each verdict records the answering model in the audit log.
-
 - ntfy notifications use compact Markdown cards with service/outcome titles,
   explicit actions and uncertainty, evidence bullets and copyable references.
   Dynamic content is escaped and bounded without cutting Markdown formatting.
@@ -26,7 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Model refusals report their category instead of an empty-response error.
-
+- Prune unused observation preparation metadata after ten days while retaining
+  decision evidence, current query results, reuse sources and source provenance.
+  Index reference ownership and reused runs to avoid growing historical scans.
+- Kubernetes liveness no longer waits for SQLite or external sources. A startup
+  probe protects migration and recovery; readiness checks storage with a timeout.
 - Build with Go 1.26.9 and golang.org/x/net 0.60.0 to address the
   October 2026 Go and HTTP/2 security advisories.
 
@@ -1048,7 +1053,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.3...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/alertint/alertint-agent/compare/v0.14.3...v0.15.0
 [0.14.3]: https://github.com/alertint/alertint-agent/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/alertint/alertint-agent/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/alertint/alertint-agent/compare/v0.14.0...v0.14.1

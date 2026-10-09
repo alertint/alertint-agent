@@ -107,7 +107,8 @@ tolerations: []
 affinity: {}
 topologySpreadConstraints: []
 
-# -- Liveness/readiness probing. Uses GET /health, served alongside the
+# -- Startup/liveness use GET /live; readiness uses the bounded storage check
+# at GET /ready, served alongside the
 # webhook receivers on service.webhookPort — this requires at least one
 # receiver (config.alertmanager, config.changes.ingress or config.zabbix.ingress)
 # to be enabled, which is the default here (alertmanager). If you disable
@@ -118,6 +119,11 @@ probes:
   periodSeconds: 15
   timeoutSeconds: 5
   failureThreshold: 3
+  startup:
+    # -- Seconds between startup checks. Startup protects migrations and recovery.
+    periodSeconds: 5
+    # -- Consecutive failures before restarting during startup (default budget: five minutes).
+    failureThreshold: 60
 
 persistence:
   # -- Persists the SQLite store across restarts. Disabling this means every
@@ -253,8 +259,7 @@ config:
 
   notify:
     stdout: true
-    # Requires the upcoming 0.15 image. Keep omitted for the default v0.14.3
-    # image, whose strict config loader does not recognize this section.
+    # Optional ntfy Situation notifications (available from AlertINT 0.15).
     # ntfy:
     #   enabled: true
     #   base_url: https://ntfy.sh

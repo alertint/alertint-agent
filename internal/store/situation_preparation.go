@@ -1530,10 +1530,10 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 		SELECT r.id FROM situation_observation_runs r
 		WHERE r.completed_at <= ?
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
-		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND ref.superseded = 0)
+		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND ref.superseded = 0 AND ref.metadata_only = 0)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM situation_observation_runs p
-		      JOIN situation_observation_references pref ON pref.run_id = p.id AND pref.superseded = 0
+		      JOIN situation_observation_references pref ON pref.run_id = p.id AND pref.superseded = 0 AND pref.metadata_only = 0
 		      WHERE p.reused_from_run_id = r.id)
 		ORDER BY r.completed_at ASC, r.id ASC
 		LIMIT ?`, cutoff, limit)
@@ -1722,7 +1722,7 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, no
 	}, nil
 }
 
-// Permanent observation reference kinds (migration 0022): a dispatched
+// Permanent observation reference kinds (migration 0027): a dispatched
 // Assessment attempt, a committed lifecycle decision, and a Transition each
 // protect their complete evidence basis forever (ADR-0051, review F7).
 const (
@@ -1731,12 +1731,10 @@ const (
 	ObservationReferenceTransition        = "transition"
 )
 
-// insertPermanentObservationReferencesTx protects every run of cycleID —
-// and, for a reuse projection, the source run it projects — with a
-// permanent reference of kind on behalf of ownerID. Idempotent (INSERT OR
-// IGNORE on the deterministic id). A run whose detail already expired is
-// skipped: it never was part of a live basis, and 0026 forbids referencing
-// it.
+// insertPermanentObservationReferencesTx protects the bounded decision view,
+// including reuse projections and their sources. Expired outcomes and reuse
+// projections receive metadata-only references; retained source payloads remain
+// protected. Deterministic reference IDs make repeated pinning idempotent.
 func insertPermanentObservationReferencesTx(ctx context.Context, tx *sql.Tx, cycleID, kind, ownerID string, now time.Time) error {
 	if cycleID == "" || ownerID == "" {
 		return nil
@@ -1752,29 +1750,26 @@ func insertPermanentObservationReferencesTx(ctx context.Context, tx *sql.Tx, cyc
 	if err != nil {
 		return err
 	}
-	var runIDs []string
+	runIDs := make(map[string]bool)
 	for _, run := range runs {
-		id := run.ID
-		if run.ReusedFromRunID != nil {
-			id = *run.ReusedFromRunID
-		}
-		if id == "" {
+		if run.ID == "" {
 			continue
 		}
-		var expired bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM situation_observation_detail_expirations WHERE run_id = ?)`, id).Scan(&expired); err != nil {
-			return err
-		}
-		if !expired {
-			runIDs = append(runIDs, id)
+		runIDs[run.ID] = run.ReusedFromRunID != nil
+		if run.ReusedFromRunID != nil {
+			runIDs[*run.ReusedFromRunID] = false
 		}
 	}
 	createdAt := canonicalTime(now)
-	for _, runID := range runIDs {
+	for runID, metadataOnly := range runIDs {
+		var expired bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM situation_observation_detail_expirations WHERE run_id = ?)`, runID).Scan(&expired); err != nil {
+			return err
+		}
 		refID := "ref:" + kind + ":" + ownerID + ":" + runID
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO situation_observation_references (id, run_id, reference_kind, owner_id, permanent, created_at)
-			VALUES (?, ?, ?, ?, 1, ?)`, refID, runID, kind, ownerID, createdAt); err != nil {
+			INSERT OR IGNORE INTO situation_observation_references (id, run_id, reference_kind, owner_id, permanent, created_at, metadata_only)
+			VALUES (?, ?, ?, ?, 1, ?, ?)`, refID, runID, kind, ownerID, createdAt, metadataOnly || expired); err != nil {
 			return fmt.Errorf("store: insert permanent %s reference for run %s: %w", kind, runID, err)
 		}
 	}
