@@ -172,7 +172,7 @@ correlates alerts into incidents, and produces an AI finding for each.
   [OpenAI-compatible endpoint](../integrations/openai-compatible.md)
 - Enable Slack notifications: [Slack](../notifications/slack.md)
 - Receive selected Situation changes on your phone with
-  [ntfy](../notifications/ntfy.md) (planned for AlertINT 0.15)
+  [ntfy](../notifications/ntfy.md)
 - Tune grouping and every other knob: [Configuration](configuration.md)
 - Understand what the agent will and won't do:
   [Scope and limits](../concepts/scope-and-limits.md)

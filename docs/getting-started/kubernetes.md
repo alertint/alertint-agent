@@ -90,9 +90,8 @@ helm upgrade --install my-alertint oci://ghcr.io/alertint/charts/alertint-agent 
   --version <chart version> -f values.yaml
 ```
 
-For selected mobile notifications, see [ntfy](../notifications/ntfy.md#kubernetes).
-That integration is planned for AlertINT 0.15; use a chart and image from the
-release that includes it, rather than the current v0.14.3 image.
+For selected mobile notifications, see [ntfy](../notifications/ntfy.md).
+Supply its publisher token through your existing Secret or `extraEnv`.
 
 Things worth knowing before the first real install:
 

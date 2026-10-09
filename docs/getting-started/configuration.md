@@ -39,7 +39,7 @@ ANTHROPIC_API_KEY=sk-ant-...                           # console.anthropic.com â
 # Optional integrations (uncomment what you connect)
 # PROMETHEUS_BEARER_TOKEN=...     # https://alertint.com/docs/integrations/prometheus
 # SLACK_BOT_TOKEN=xoxb-...        # https://alertint.com/docs/notifications/slack
-# NTFY_TOKEN=tk_...              # https://alertint.com/docs/notifications/ntfy (0.15)
+# NTFY_TOKEN=tk_...              # https://alertint.com/docs/notifications/ntfy
 # LOKI_BEARER_TOKEN=...           # https://alertint.com/docs/integrations/loki
 # SENTRY_AUTH_TOKEN=...           # https://alertint.com/docs/integrations/sentry
 ```
@@ -389,8 +389,7 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 
 ## `notify`
 
-The ntfy fields below are planned for AlertINT 0.15; v0.14.3 does not accept
-them. See [ntfy](../notifications/ntfy.md) for source-build testing before release.
+See [ntfy setup](../notifications/ntfy.md) for server, topic and credentials.
 
 | Field | Type | Default | Description |
 |---|---|---|---|

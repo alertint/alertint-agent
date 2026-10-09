@@ -82,9 +82,8 @@ binary. See [Backup & restore](docs/getting-started/backup-restore.md).
    For user-facing changes, synchronize the website's committed `docs-preview/`
    edition and integration listings through a website PR. Its default build
    does not fetch new agent docs merely because the docs deploy hook ran.
-   For the upcoming 0.15 ntfy feature, replace the planned-release notices with
-   the actual application/chart versions after publication and verify the
-   guide at `/docs/notifications/ntfy` before submitting its upstream listing.
+   Verify the guide at `/docs/notifications/ntfy` before submitting its
+   upstream integration listing.
 
    Preview the pending application notes:
 

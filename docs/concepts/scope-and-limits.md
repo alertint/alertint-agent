@@ -39,7 +39,7 @@ re-route alerts, run scripts or runbooks, or page ticketing systems for
 you. Several of these are natural future directions — remediation, if it
 lands, will be gated behind explicit operator approval flows.
 
-The [ntfy integration](../notifications/ntfy.md), planned for 0.15, delivers
+The [ntfy integration](../notifications/ntfy.md) delivers
 selected Situation changes as mobile pushes. It can run alongside Slack or
 without it. It does not add an on-call rota, acknowledgement or escalation
 policy, remote action execution, or installation-wide health notifications.
