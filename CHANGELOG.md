@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit actions and uncertainty, evidence bullets and copyable references.
   Dynamic content is escaped and bounded without cutting Markdown formatting.
 
+### Fixed
+
+- Build with Go 1.26.9 and golang.org/x/net 0.60.0 to address the
+  October 2026 Go and HTTP/2 security advisories.
+
 ## [0.14.3] - 2026-10-05
 
 ### Added
