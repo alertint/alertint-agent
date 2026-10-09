@@ -806,7 +806,10 @@ func newPreparationRuntime(
 			if err != nil || n > 0 {
 				return n, err
 			}
-			return st.PruneUnusedObservationMetadata(ctx, now, 100)
+			// Each cycle deletes several runs and their child records. Keep
+			// these batches smaller so readiness can use the single connection
+			// between transactions while a large backlog is being removed.
+			return st.PruneUnusedObservationMetadata(ctx, now, 25)
 		}, now, logger),
 	}
 

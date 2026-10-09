@@ -256,10 +256,10 @@ func (s *Store) BeginPreparation(ctx context.Context, f observationmodel.Fence, 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE situation_observation_references SET superseded = 1
 		WHERE superseded = 0 AND reference_kind IN ('current_cycle','open_cycle') AND owner_id != ?
-		  AND run_id IN (
-		      SELECT r.id FROM situation_observation_runs r
+		  AND EXISTS (
+		      SELECT 1 FROM situation_observation_runs r
 		      JOIN situation_preparation_cycles c ON c.id = r.cycle_id
-		      WHERE c.situation_id = ?
+		      WHERE r.id = situation_observation_references.run_id AND c.situation_id = ?
 		  )`, cycleID, f.SituationID); err != nil {
 		return observationmodel.Cycle{}, fmt.Errorf("store: supersede prior cycle references: %w", err)
 	}
@@ -1527,15 +1527,16 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT r.id FROM situation_observation_runs r
-		WHERE r.completed_at <= ?
+		SELECT r.id FROM situation_observation_query_runs h
+		CROSS JOIN situation_observation_runs r ON r.id = h.run_id
+		WHERE h.detail_expired = 0 AND h.completed_at <= ?
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND ref.superseded = 0 AND ref.metadata_only = 0)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM situation_observation_runs p
 		      JOIN situation_observation_references pref ON pref.run_id = p.id AND pref.superseded = 0 AND pref.metadata_only = 0
 		      WHERE p.reused_from_run_id = r.id)
-		ORDER BY r.completed_at ASC, r.id ASC
+		ORDER BY h.completed_at ASC, h.run_id ASC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {
 		return 0, fmt.Errorf("store: query prunable observation runs: %w", err)
