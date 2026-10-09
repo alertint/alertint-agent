@@ -74,6 +74,19 @@ cooldown hiding a newly required action. Installation-wide health notices
 
 ## Delivery and configuration changes
 
+Messages use Markdown with compact service/outcome titles, readable alert names,
+bold section labels, evidence bullets and a copyable Situation reference. Required
+actions and uncertainty appear before bounded analysis details. Historical analysis
+is labeled separately; recovery confirmation does not imply a confirmed cause.
+The app's notification list and expanded message show the rich layout. Android
+app version 1.17.8 or newer renders Markdown; system notification previews may
+show a simpler layout. See [ntfy's formatting guide](https://docs.ntfy.sh/publish/#markdown-formatting).
+
+Only the renderer supplies Markdown syntax. Alert, journal and analysis text is
+escaped, and long content is shortened by section with an explicit MCP history
+notice. Existing queued messages keep their frozen payload when an agent upgrade
+changes the layout; new messages use the updated presentation.
+
 Delivery work is written atomically with the Situation transition to an
 independent SQLite queue. Slack acknowledgements do not consume ntfy work.
 The worker makes bounded HTTP requests outside database transactions. Valid
@@ -108,7 +121,7 @@ and link to their replacement.
 For example, an operator-action notification delayed until after recovery says:
 
 ```text
-ntfy delivery resumed · Recovered · S-104
+ntfy delivery resumed · ✅ Recovered · payment
 Notifications were delayed while ntfy delivery was unavailable or paused.
 This is the current committed Situation state.
 ```

@@ -130,7 +130,7 @@ func TestNTFYStaleUnattemptedActionUsesRecoveredState(t *testing.T) {
 	s5RecoveryCycle(t, st, sit, observed, osMonitoringContract(grace), model.LifecycleRecoveryPending, briefing, observed)
 	s5RecoveryCycle(t, st, sit, grace, model.ActionContract{NextActor: model.NextActorNone}, model.LifecycleRecovered, briefing, observed)
 	got, err := st.ClaimNTFY(ctx, "b", grace.Add(time.Second), time.Minute)
-	if err != nil || len(got) != 1 || strings.Contains(got[0].Message.Body, "Required action:") || !strings.Contains(got[0].Message.Title, "Recovered") {
+	if err != nil || len(got) != 1 || strings.Contains(got[0].Message.Body, "Investigate this Situation") || !strings.Contains(got[0].Message.Title, "Recovered") {
 		t.Fatalf("obsolete action replay: %v %v", got, err)
 	}
 }

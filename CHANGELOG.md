@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Omitted events use five defaults; explicit lists replace them and `[]` selects
   none. Same-commit updates coalesce into one push; drills are clearly marked.
 
+### Changed
+
+- ntfy notifications use compact Markdown cards with service/outcome titles,
+  explicit actions and uncertainty, evidence bullets and copyable references.
+  Dynamic content is escaped and bounded without cutting Markdown formatting.
+
 ## [0.14.3] - 2026-10-05
 
 ### Added
