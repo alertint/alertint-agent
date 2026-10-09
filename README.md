@@ -34,7 +34,7 @@
 2. **Investigates** with read-only evidence: recent changes, logs and metrics. A
    [verification round](https://alertint.com/docs/concepts/verification-round)
    challenges the draft before the finding is posted.
-3. **Posts** one evolving Slack thread per Situation.
+3. **Notifies** through an evolving Slack thread or selected ntfy pushes per Situation.
 4. **Hands off** the full record to Claude Code, Codex or any MCP client.
    Corrections captured there steer the next triage of the same failure.
 
@@ -48,7 +48,7 @@ Read-only by design. Local state. You bring the LLM key.
 | **Read-only evidence** | Prometheus, Loki, Zabbix, Sentry, change-event webhooks (deploys, config, flags) |
 | **Correlation rules** | Open YAML schema, built-in baseline pack, your own local packs |
 | **LLM** | Anthropic, or a self-hosted OpenAI-compatible endpoint (vLLM, SGLang, Ollama, LM Studio) |
-| **Delivers to** | Slack, stdout JSON, and MCP clients (Claude Code, Codex, Cursor, Windsurf) |
+| **Delivers to** | Slack, ntfy, stdout JSON, and MCP clients (Claude Code, Codex, Cursor, Windsurf) |
 | **Runs as** | Single Go binary, Docker image, or signed Helm chart |
 | **State** | Local SQLite with a hash-chained, verifiable audit log |
 
@@ -93,6 +93,8 @@ every step.
   [Scope and limits](https://alertint.com/docs/concepts/scope-and-limits) ·
   [FAQ](https://alertint.com/docs/concepts/faq)
 - [Changelog](CHANGELOG.md)
+- [ntfy notifications](docs/notifications/ntfy.md): configurable mobile updates
+  through ntfy.sh or a self-hosted server, independently of Slack.
 
 The [`docs/`](docs/) folder is the source of alertint.com/docs. Documentation
 PRs are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).

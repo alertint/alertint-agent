@@ -19,7 +19,10 @@ expectations.
   AlertINT state: feedback into AlertINT's own incident record,
   semantic-profile corrections, and explicit time-bounded Situation judgments.
 - **Self-hosted and local** — your alert data and incident context stay on
-  your machine.
+  your machine as the local system of record. Configured LLM providers receive
+  investigation evidence; notification services receive the selected message
+  content. ntfy.sh is an external service; a self-hosted ntfy server can keep
+  that delivery inside your network. Protect topics with access control.
 - **Fair Source** — the runtime and all baseline and community packs are
   [Fair Source](https://fair.io) under the [FSL-1.1-ALv2](https://fsl.software)
   license: free to read, use, modify, and self-host at any scale, with each
@@ -35,6 +38,11 @@ expectations.
 re-route alerts, run scripts or runbooks, or page ticketing systems for
 you. Several of these are natural future directions — remediation, if it
 lands, will be gated behind explicit operator approval flows.
+
+The [ntfy integration](../notifications/ntfy.md) delivers
+selected Situation changes as mobile pushes. It can run alongside Slack or
+without it. It does not add an on-call rota, acknowledgement or escalation
+policy, remote action execution, or installation-wide health notifications.
 
 ## Durable Situation foundation and controller
 
@@ -88,7 +96,8 @@ is and isn't:
 - **No mode switch:** there is no `state_controller_mode`, shadow-output
   path, or legacy/new runtime toggle to configure — one build runs one
   grouping/dispatch path, and one Slack writer, at a time. There is no dual
-  or shadow notification mode.
+  or shadow controller mode. Independent Slack and ntfy delivery destinations
+  do not create a second controller.
 
 ## Known weaknesses
 

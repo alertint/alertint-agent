@@ -21,6 +21,16 @@ correlator:
 
 notify:
   stdout: true
+  # Planned for AlertINT 0.15. Enable in your gitignored local config copy.
+  # Put the publisher token in NTFY_TOKEN in .env; use token_env: "" for
+  # anonymous publishing. Subscribe to this server/topic in the ntfy app.
+  # Uncomment in your local copy only with a build that includes ntfy.
+  # ntfy:
+  #   enabled: true
+  #   base_url: https://ntfy.sh
+  #   topic: your-reserved-topic
+  #   token_env: NTFY_TOKEN
+  #   # events omitted = five defaults; [] = none; explicit list replaces defaults
   # To deliver findings to Slack: set enabled: true, put a bot token
   # (xoxb-…, chat:write scope) in SLACK_BOT_TOKEN in your .env, and set
   # your channel. The stack runs fine without Slack — findings go to stdout.

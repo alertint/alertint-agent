@@ -79,6 +79,12 @@ binary. See [Backup & restore](docs/getting-started/backup-restore.md).
    `charts/alertint-agent/CHANGELOG.md` when there are any; it may otherwise be
    empty because the release command adds the application-version change.
 
+   For user-facing changes, synchronize the website's committed `docs-preview/`
+   edition and integration listings through a website PR. Its default build
+   does not fetch new agent docs merely because the docs deploy hook ran.
+   Verify the guide at `/docs/notifications/ntfy` before submitting its
+   upstream integration listing.
+
    Preview the pending application notes:
 
    ```bash

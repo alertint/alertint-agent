@@ -25,7 +25,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.26.6"
+          go-version: "1.26.9"
           check-latest: false
 
       - name: Test release scripts
@@ -68,7 +68,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.26.6"
+          go-version: "1.26.9"
           check-latest: false
 
       - name: Show toolchain
@@ -110,7 +110,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.26.6"
+          go-version: "1.26.9"
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
@@ -127,7 +127,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.26.6"
+          go-version: "1.26.9"
 
       - name: Validate docs
         run: go run ./docs/scripts
@@ -143,7 +143,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.26.6"
+          go-version: "1.26.9"
 
       - name: gosec
         run: |
@@ -169,7 +169,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: "1.26.6"
+          go-version: "1.26.9"
 
       # Blocks copyleft (GPL/LGPL = restricted, AGPL = forbidden).
       # modernc.org/mathutil reports Unknown to the classifier; verified

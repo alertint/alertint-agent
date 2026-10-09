@@ -28,6 +28,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/logs"
+	"github.com/alertint/alertint-agent/internal/notify/ntfy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -556,6 +557,7 @@ func (c ClassifierConfig) Enabled() bool {
 
 // NotifyConfig configures notifiers.
 type NotifyConfig struct {
+	NTFY   ntfy.Config `yaml:"ntfy"`
 	Stdout bool        `yaml:"stdout"`
 	Slack  SlackConfig `yaml:"slack"`
 }
@@ -618,6 +620,7 @@ func Defaults() Config {
 			// grouping identity; a non-empty list is an operator override.
 		},
 		Notify: NotifyConfig{
+			NTFY:   ntfy.Config{BaseURL: "https://ntfy.sh"},
 			Stdout: true,
 			Slack: SlackConfig{
 				Enabled:        false,
@@ -1333,8 +1336,11 @@ func (c *Config) validateNotify() []string {
 			errs = append(errs, fmt.Sprintf("notify.slack.recurrence_mode %q must be one of change-gated, off", c.Notify.Slack.RecurrenceMode))
 		}
 	}
-	if !c.Notify.Stdout && !c.Notify.Slack.Enabled {
-		errs = append(errs, "at least one notifier must be enabled (notify.stdout or notify.slack.enabled)")
+	if err := c.Notify.NTFY.Validate(); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if !c.Notify.Stdout && !c.Notify.Slack.Enabled && !c.Notify.NTFY.Enabled {
+		errs = append(errs, "at least one notifier must be enabled (notify.stdout, notify.slack.enabled or notify.ntfy.enabled)")
 	}
 	return errs
 }

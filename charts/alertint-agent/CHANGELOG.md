@@ -9,6 +9,12 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Added
+
+- Optional `config.notify.ntfy` settings for selected Situation notifications,
+  with publisher tokens supplied through Kubernetes Secrets. Requires the
+  upcoming AlertINT 0.15 image; the current v0.14.3 image has no ntfy support.
+
 ## [0.2.7] - 2026-10-05
 
 

@@ -70,7 +70,7 @@ Helm:
 secret:
   # A Secret you manage yourself (External Secrets, Sealed Secrets, SOPS, ...)
   # holding every *_env name the config references:
-  # ALERTINT_WEBHOOK_TOKEN, ANTHROPIC_API_KEY, and any tokens for Slack,
+  # ALERTINT_WEBHOOK_TOKEN, ANTHROPIC_API_KEY, and any tokens for Slack, ntfy,
   # MCP, changes or Zabbix you enable.
   existingSecret: alertint-agent
 
@@ -89,6 +89,9 @@ config:
 helm upgrade --install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
   --version <chart version> -f values.yaml
 ```
+
+For selected mobile notifications, see [ntfy](../notifications/ntfy.md).
+Supply its publisher token through your existing Secret or `extraEnv`.
 
 Things worth knowing before the first real install:
 

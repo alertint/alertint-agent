@@ -39,6 +39,7 @@ ANTHROPIC_API_KEY=sk-ant-...                           # console.anthropic.com �
 # Optional integrations (uncomment what you connect)
 # PROMETHEUS_BEARER_TOKEN=...     # https://alertint.com/docs/integrations/prometheus
 # SLACK_BOT_TOKEN=xoxb-...        # https://alertint.com/docs/notifications/slack
+# NTFY_TOKEN=tk_...              # https://alertint.com/docs/notifications/ntfy
 # LOKI_BEARER_TOKEN=...           # https://alertint.com/docs/integrations/loki
 # SENTRY_AUTH_TOKEN=...           # https://alertint.com/docs/integrations/sentry
 ```
@@ -388,16 +389,23 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 
 ## `notify`
 
+See [ntfy setup](../notifications/ntfy.md) for server, topic and credentials.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
+| `ntfy.enabled` | bool | `false` | Deliver selected Situation changes to one ntfy topic, independently of Slack. |
+| `ntfy.base_url` | string | `https://ntfy.sh` | ntfy server URL; HTTP is accepted for private servers. No embedded credentials, query or fragment. |
+| `ntfy.topic` | string | — | Required when enabled; 1–64 letters, digits, underscores or hyphens. |
+| `ntfy.token_env` | string | — | Optional environment variable holding an access token. A named but unset or empty variable fails startup. |
+| `ntfy.events` | list | — | Omitted uses five defaults; an explicit list replaces them; `[]` selects none. See the [event catalogue and delivery rules](../notifications/ntfy.md). |
 | `slack.enabled` | bool | `false` | Turn on Slack delivery. In v0.14 this enables the Situation delivery worker, which posts one Situation root plus an immutable ordered journal thread. |
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope; no history-read scope is ever requested) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
 | `slack.min_severity` | string | `low` | The minimum **interruption priority** a new main-channel interruption must meet — never alert severity and never a model claim. `critical` always passes; a withheld interruption is durably recorded; the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
 | `slack.recurrence_mode` | string | `change-gated` | Controls Situation recurrence milestone replies: `change-gated` posts one quiet thread reply at ×5/×10/×25/×50/×100 and then every ×100; `off` keeps only the silent root edit. Neither mode re-pages the channel. |
 
-At startup the agent logs one `notifiers ready` line listing the active sinks
+At startup the agent logs one `notifiers ready` line listing the finding sinks
 (and the Slack channel) so you can see where findings will go. Every analysis
 then logs, at INFO regardless of format:
 
@@ -424,6 +432,11 @@ reads a replayed stream, may legitimately see the same transition line more
 than once.
 
 See [Slack](../notifications/slack.md) for the full setup walkthrough.
+The independent ntfy worker reports its delivery outcomes in `ntfy notified`
+or `ntfy delivery unavailable; notification retained` logs and the audit history. A committed stdout transition
+does not prove ntfy delivery. ntfy is not included in the startup integration
+health probes; receipt of a selected update verifies the delivery path.
+See [ntfy](../notifications/ntfy.md) for setup and troubleshooting.
 
 ## `mcp`
 

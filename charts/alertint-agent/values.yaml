@@ -253,6 +253,14 @@ config:
 
   notify:
     stdout: true
+    # Requires the upcoming 0.15 image. Keep omitted for the default v0.14.3
+    # image, whose strict config loader does not recognize this section.
+    # ntfy:
+    #   enabled: true
+    #   base_url: https://ntfy.sh
+    #   topic: your-reserved-topic
+    #   token_env: NTFY_TOKEN
+    #   # events omitted = defaults; [] = none; explicit list replaces defaults
     slack:
       enabled: false
       bot_token_env: SLACK_BOT_TOKEN
