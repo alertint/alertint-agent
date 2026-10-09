@@ -19,8 +19,9 @@ import (
 // ClassifierModel is the Anthropic model the shadow classifier runs on: Haiku,
 // the cheapest tier, since it answers one small structured yes/no question. A
 // second Anthropic client on the same key stays inside the no-multi-provider
-// scope guard.
-const ClassifierModel = "claude-haiku-4-5"
+// scope guard. Each verdict's audit row records the model that answered, so an
+// installation's graduation evidence can be split at a model change.
+const ClassifierModel = "claude-haiku-5-5"
 
 // Classifier modes, mirrored from config as plain strings so this package does
 // not import config. The serve wiring passes config.ClassifierMode through.
@@ -67,6 +68,7 @@ Do not add prose or markdown.`
 type ClassifierResult struct {
 	Verdict   ClassifierVerdict
 	Candidate string // the prior incident id judged
+	Model     string // the model that answered; empty when no call was made
 	Tokens    int
 	Err       error // the call error behind an unsure-* verdict; nil on a clean reply
 }
@@ -86,6 +88,7 @@ func Classify(ctx context.Context, client LLMClient, currentKey string, candidat
 
 	user := classifierUserPrompt(currentKey, candidate)
 	comp, err := completeWithAnalysisUsage(ctx, client, classifierSystemPrompt, llm.Prompt{Prefix: user}, classifierRequiredKeys)
+	res.Model = comp.Model
 	res.Tokens = comp.InputTokens + comp.OutputTokens
 	if err != nil {
 		// res.Verdict already holds VerdictUnsureError; only a timeout refines it.
@@ -176,6 +179,7 @@ func (s *Skill) maybeClassify(ctx context.Context, inc store.Incident, memory *M
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "memory.classifier_verdict", map[string]any{
 			"incident_id": inc.ID,
 			"verdict":     string(result.Verdict),
+			"model":       result.Model,
 			"tokens":      result.Tokens,
 			"candidates":  []string{result.Candidate},
 		})

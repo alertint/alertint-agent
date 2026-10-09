@@ -131,6 +131,8 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc(r.Route(), s.handleReceiver(r))
 	}
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /live", s.handleLive)
+	mux.HandleFunc("GET /ready", s.handleReady)
 	return mux
 }
 
@@ -195,6 +197,30 @@ func (s *Server) handleReceiver(r Receiver) http.HandlerFunc {
 			)
 		}
 	}
+}
+
+// handleLive checks the serving process without waiting for storage or sources.
+func (s *Server) handleLive(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := io.WriteString(w, `{"status":"ok"}`); err != nil {
+		s.logger.Warn("ingress: encode liveness response", "err", err)
+	}
+}
+
+// handleReady bounds storage checks independently of the caller's timeout.
+// Storage congestion removes readiness; it must never trigger a process restart.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	defer cancel()
+	if err := s.store.DB().PingContext(ctx); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if _, writeErr := io.WriteString(w, `{"status":"degraded"}`); writeErr != nil {
+			s.logger.Warn("ingress: encode readiness response", "err", writeErr)
+		}
+		return
+	}
+	s.handleLive(w, r)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

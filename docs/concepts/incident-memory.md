@@ -166,7 +166,8 @@ question — "same underlying condition?" — for the top weak candidate.
 
 It renders only the structured group-key delta (the shared labels and the one
 that differs) plus a short, capped summary of the prior hypothesis — never raw
-alert labels — so the call is ~250 tokens, roughly **$0.0003 on Haiku**. The
+alert labels — so the call is a few hundred tokens, well under **$0.0001 on
+Claude Haiku 5.5**. Each verdict's audit row records the model that answered. The
 verdict enum is fail-open (`matched` / `no-match` / `unsure-timeout` /
 `unsure-error`): a timeout or a malformed reply can never produce a match.
 

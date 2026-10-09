@@ -268,7 +268,8 @@ type messagesRequest struct {
 // thinkingConfig is the extended-thinking selector on the Messages API.
 // Triage is a single-shot JSON extraction, so up-front thinking is disabled
 // explicitly to avoid spending MaxTokens on thinking instead of the JSON reply.
-// Sonnet 5.5 uses "between_tools" for this mode; earlier models use "disabled".
+// Sonnet 5.5 uses "between_tools" for this mode; earlier models and Haiku 5.5
+// use "disabled" (Haiku 5.5 accepts it at its default effort).
 type thinkingConfig struct {
 	Type string `json:"type"`
 }
@@ -315,9 +316,12 @@ func userContent(p llm.Prompt) any {
 
 // messagesResponse is the relevant subset of the Anthropic response.
 type messagesResponse struct {
-	Content    []contentBlock `json:"content"`
-	StopReason string         `json:"stop_reason"`
-	Usage      struct {
+	Content     []contentBlock `json:"content"`
+	StopReason  string         `json:"stop_reason"`
+	StopDetails *struct {
+		Category string `json:"category"`
+	} `json:"stop_details"`
+	Usage struct {
 		InputTokens              int `json:"input_tokens"`
 		OutputTokens             int `json:"output_tokens"`
 		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
@@ -434,6 +438,18 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 			hint = "per-call max_output_tokens"
 		}
 		return nil, usage, fmt.Errorf("%w=%d (%s)", llm.ErrResponseTruncated, maxTokens, hint)
+	}
+
+	// A refusal stop means the provider's safety classifier declined the
+	// request (Sonnet 5.x, Haiku 5.5). It carries no usable text, so it stays
+	// in the ErrResponseInvalid content class every caller already handles;
+	// the message names it so it is not misread as an empty reply.
+	if parsed.StopReason == "refusal" {
+		category := "unspecified"
+		if parsed.StopDetails != nil && parsed.StopDetails.Category != "" {
+			category = parsed.StopDetails.Category
+		}
+		return nil, usage, fmt.Errorf("%w: model declined the request (stop_reason refusal, category %s)", llm.ErrResponseInvalid, category)
 	}
 
 	text := firstTextBlock(parsed.Content)

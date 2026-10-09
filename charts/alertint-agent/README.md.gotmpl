@@ -89,6 +89,15 @@ notifications, not higher availability. Restart handling
 (`strategy.type: Recreate`) and persistence are built around this
 single-writer assumption.
 
+## Health probes
+
+Startup and liveness use `/live`, which never waits for SQLite or external
+sources. Readiness uses `/ready`, with a one-second storage check. Startup
+allows five minutes for migrations and recovery by default; increase
+`probes.startup.failureThreshold` for larger backlogs. `/health` remains the
+diagnostic endpoint. These probe routes require AlertINT v0.15 or later;
+use the matching older chart when rolling back to an earlier image.
+
 The chart mounts an ephemeral `/tmp` volume for SQLite temporary work, even
 with the default read-only root filesystem. If you already provide a `/tmp`
 mount through `extraVolumeMounts`, the chart keeps yours instead.

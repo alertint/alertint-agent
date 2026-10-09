@@ -9,11 +9,23 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-10-09
+
 ### Added
 
+- Configurable startup probes with a default five-minute migration/recovery budget.
 - Optional `config.notify.ntfy` settings for selected Situation notifications,
-  with publisher tokens supplied through Kubernetes Secrets. Requires the
-  upcoming AlertINT 0.15 image; the current v0.14.3 image has no ntfy support.
+  with publisher tokens supplied through Kubernetes Secrets.
+
+### Fixed
+
+- Separate process liveness (`/live`) from bounded storage readiness (`/ready`)
+  so ordinary database work cannot trigger false liveness restarts.
+
+
+### Changed
+
+- Update the default alertint-agent image to `v0.15.0`.
 
 ## [0.2.7] - 2026-10-05
 

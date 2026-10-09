@@ -8,6 +8,53 @@ set:
   secret.data.ALERTINT_WEBHOOK_TOKEN: x
   secret.data.ANTHROPIC_API_KEY: x
 tests:
+  - it: protects startup and separates process liveness from storage readiness
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.path
+          value: /live
+        template: deployment.yaml
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 60
+        template: deployment.yaml
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /live
+        template: deployment.yaml
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /ready
+        template: deployment.yaml
+
+  - it: allows a longer startup budget for large backlogs
+    set:
+      probes.startup.periodSeconds: 10
+      probes.startup.failureThreshold: 90
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.periodSeconds
+          value: 10
+        template: deployment.yaml
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 90
+        template: deployment.yaml
+
+  - it: disables all probes together
+    set:
+      probes.enabled: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe
+        template: deployment.yaml
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe
+        template: deployment.yaml
+      - notExists:
+          path: spec.template.spec.containers[0].readinessProbe
+        template: deployment.yaml
+
   - it: provides writable temporary storage with a read-only root filesystem
     asserts:
       - equal:

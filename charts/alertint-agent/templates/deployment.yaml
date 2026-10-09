@@ -66,9 +66,16 @@ spec:
               containerPort: 9912
               protocol: TCP
           {{- if .Values.probes.enabled }}
+          startupProbe:
+            httpGet:
+              path: /live
+              port: webhook
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
           livenessProbe:
             httpGet:
-              path: /health
+              path: /live
               port: webhook
             initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.periodSeconds }}
@@ -76,7 +83,7 @@ spec:
             failureThreshold: {{ .Values.probes.failureThreshold }}
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: webhook
             initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.periodSeconds }}
