@@ -120,6 +120,7 @@ alertint validate --config config.yaml
 
 ## What to expect
 
+- Messages include affected alert context and source reports even before model analysis is available. Long reports are shortened, and additional reports may be omitted. Recovery messages label retained reports as historical, not current measurements.
 - Only selected Situation changes send pushes; routine refreshes do not. Several events in one change produce one message.
 - Failed deliveries retry across restarts; rate limits delay delivery. After a pause/outage, an **ntfy delivery resumed** recap shows the current state instead of obsolete action requests. A retry can occasionally duplicate a message.
 - Event changes affect future updates; already queued messages remain. Changing the server/topic does not forward old pending messages to the new destination.
