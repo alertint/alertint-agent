@@ -116,7 +116,7 @@ func Select(t model.Transition, prior *model.Transition, published bool, enabled
 }
 
 func limitationCodes(t model.Transition) []string {
-	var codes []string
+	codes := situation.CoverageLimitationCodes(t.Projection)
 	if t.Projection.Assessment != nil {
 		codes = append(codes, t.Projection.Assessment.LimitationCodes...)
 	}

@@ -5,7 +5,6 @@ package connectors
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -64,53 +63,18 @@ func (e *PrometheusExecutor) Execute(ctx context.Context, plan model.Plan, recor
 	if err != nil {
 		return unresolvedRun(plan, now), nil
 	}
-
-	reservation, err := recorder.BeforeRequest(ctx)
-	if err != nil {
-		if errors.Is(err, model.ErrBudgetExhausted) {
-			return withheldRun(plan, now), nil
+	var params struct {
+		AlertName string `json:"alert_name"`
+	}
+	if len(plan.Parameters) > 0 {
+		if err := json.Unmarshal(plan.Parameters, &params); err != nil {
+			return unresolvedRun(plan, now), nil
 		}
-		return model.Run{}, fmt.Errorf("connectors: reserve prometheus request: %w", err)
 	}
-
-	limit := plan.Limit
-	if limit <= 0 {
-		limit = 100
+	if plan.Scope.Source != "alertmanager" {
+		params.AlertName = ""
 	}
-	raw, execErr := e.Client.QueryRangeBounded(ctx, expr, plan.Start, plan.End, 0, limit+1)
-
-	if outcomeErr := recorder.AfterRequest(ctx, model.RequestOutcome{
-		ReservationID: reservation.ID, RequestStarted: model.RequestStartedTrue, Code: outcomeCode(execErr), CompletedAt: e.clock(),
-	}); outcomeErr != nil {
-		return model.Run{}, fmt.Errorf("connectors: record prometheus outcome: %w", outcomeErr)
-	}
-	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
-	if execErr != nil {
-		if isResponseTooLarge(execErr) {
-			return responseTooLargeRun(plan, now, expiresAt), nil
-		}
-		return model.Run{}, fmt.Errorf("connectors: prometheus query: %w", execErr)
-	}
-
-	summary, truncated, err := summarizePrometheusMatrix(raw, limit)
-	if err != nil {
-		return model.Run{}, fmt.Errorf("connectors: parse prometheus response: %w", err)
-	}
-
-	value, kept, err := fitFactValue(len(summary.Series), func(n int) ([]byte, error) {
-		return json.Marshal(metricSummary{Series: summary.Series[:n]})
-	})
-	if err != nil {
-		return model.Run{}, fmt.Errorf("connectors: marshal metric summary: %w", err)
-	}
-	omitted := len(summary.Series) - kept
-	if truncated {
-		omitted++ // the overflow sentinel series: at least one more exists
-	}
-	return boundedRun(plan, now, boundedResult{
-		Kind: "metric_summary", Value: value, Returned: kept, Omitted: omitted,
-		Truncated: truncated, Capped: kept < len(summary.Series), ExpiresAt: expiresAt,
-	}), nil
+	return e.executeMetrics(ctx, plan, recorder, expr, params.AlertName, now)
 }
 
 func (e *PrometheusExecutor) executeRuleDefinition(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder, now time.Time) (model.Run, error) {

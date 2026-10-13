@@ -622,7 +622,8 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 	triage := triageStateChanged(change)
 	judgmentChanged := expectedJudgmentProjectionChanged(prior.Projection.Briefing, change.Projection.Briefing)
 	expectedBehaviorChanged := expectedBehaviorProjectionChanged(prior.Projection.Briefing, change.Projection.Briefing)
-	if canonicalDigest(current) == canonicalDigest(previous) && !triage && !operatorBriefingChanged(prior.Projection.Briefing, change.Projection.Briefing) {
+	coverageChanged := canonicalDigest(CoverageLimitationCodes(prior.Projection)) != canonicalDigest(CoverageLimitationCodes(change.Projection))
+	if canonicalDigest(current) == canonicalDigest(previous) && !triage && !coverageChanged && !operatorBriefingChanged(prior.Projection.Briefing, change.Projection.Briefing) {
 		return "", false
 	}
 
