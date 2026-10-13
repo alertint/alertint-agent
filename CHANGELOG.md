@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ntfy notifications include affected alert context and source annotations before
+  model analysis is available. Recovery messages label retained source reports as
+  historical so an old failure annotation is not mistaken for a current reading.
+
+### Fixed
+
 - Keep observation preparation and cleanup responsive as retained history grows
   by indexing exact query results, live temporary references and pending detail
   expiration, with smaller background metadata deletion batches. Preserve

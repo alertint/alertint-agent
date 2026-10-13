@@ -67,6 +67,9 @@ func render(t model.Transition, events []string, catchup, delayed bool) Message 
 	body := messageBody{limit: 4000 - len(footer) - 100}
 	renderOverview(&body, t, state, delayed, catchup)
 	renderContract(&body, t)
+	if b := t.Projection.Briefing; b != nil {
+		renderSourceAlerts(&body, b)
+	}
 	renderLimits(&body, t)
 	if b := t.Projection.Briefing; b != nil {
 		renderAnalyses(&body, b)
@@ -130,6 +133,75 @@ func alertCounts(b *model.OperatorBriefing) string {
 		}
 	}
 	return strings.Join(counts, " · ")
+}
+
+// Source context is independent of LLM analysis. Bound it separately so source
+// annotations cannot consume the space needed for uncertainty and analysis.
+func renderSourceAlerts(body *messageBody, b *model.OperatorBriefing) {
+	source := messageBody{limit: 1500}
+	displayed := 0
+	for _, a := range b.Alerts {
+		context := strings.TrimSpace(a.Context)
+		if context == "" {
+			context = strings.TrimSpace(a.Service)
+		}
+		if context == "" && strings.TrimSpace(a.SourceSummary) == "" {
+			continue
+		}
+		if displayed == 3 {
+			source.omitted = true
+			break
+		}
+		displayed++
+		label := "Source report"
+		historical := a.State == "resolved" || b.Historical
+		if historical {
+			label = "Historical source report"
+		}
+		lines := []string{"**" + label + "**"}
+		var identity []string
+		for _, value := range []string{a.Name, a.State} {
+			if strings.TrimSpace(value) != "" {
+				identity = append(identity, source.text(value, 120))
+			}
+		}
+		if len(identity) > 0 {
+			lines[0] += " · " + strings.Join(identity, " · ")
+		}
+		if context != "" {
+			lines = append(lines, "**Affected:** "+source.text(context, 240))
+		}
+		if strings.TrimSpace(a.SourceSummary) == "" {
+			source.add(strings.Join(lines, "  \n"))
+			continue
+		}
+		qualifier := ""
+		if historical {
+			qualifier = "  \nRetained annotation, not a current measurement."
+		}
+		available := source.limit - len(strings.Join(lines, "  \n")) - len("  \n") - len(qualifier) - 2
+		if available < 6 {
+			source.omitted = true
+			source.add(strings.Join(lines, "  \n"))
+			continue
+		}
+		report := source.text(a.SourceSummary, 500)
+		if len(report) > available {
+			// Escaping can double the byte length. Shorten the raw text
+			// first so a source annotation never drops its identity block
+			// or leaves an incomplete Markdown escape.
+			report = source.text(a.SourceSummary, available/2)
+			source.omitted = true
+		}
+		lines = append(lines, report+qualifier)
+		source.add(strings.Join(lines, "  \n"))
+	}
+	for _, part := range source.parts {
+		body.add(part)
+	}
+	if source.omitted || b.AlertsOmitted > 0 {
+		body.omitted = true
+	}
 }
 
 func renderContract(body *messageBody, t model.Transition) {
