@@ -7,19 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-13
+
 ### Fixed
 
 - ntfy notifications include affected alert context and source annotations before
   model analysis is available. Recovery messages label retained source reports as
   historical so an old failure annotation is not mistaken for a current reading.
 
-### Fixed
-
 - Keep observation preparation and cleanup responsive as retained history grows
   by indexing exact query results, live temporary references and pending detail
   expiration, with smaller background metadata deletion batches. Preserve
-  evidence ordering,
-  version fences and retention protections; backfill the index during upgrades.
+  evidence ordering, version fences and retention protections; backfill the
+  index during upgrades.
+
+### Upgrade notes
+
+- Startup applies database migration 0043 and indexes existing observation
+  history. Allow extra time for the first start on large databases. Create a
+  backup with the currently installed version before upgrading; rollback to an
+  older binary requires restoring that backup. See
+  [Backup & restore](https://github.com/alertint/alertint-agent/blob/v0.15.1/docs/getting-started/backup-restore.md#upgrade-and-rollback).
 
 ## [0.15.0] - 2026-10-09
 
@@ -1067,7 +1075,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/alertint/alertint-agent/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/alertint/alertint-agent/compare/v0.14.3...v0.15.0
 [0.14.3]: https://github.com/alertint/alertint-agent/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/alertint/alertint-agent/compare/v0.14.1...v0.14.2
