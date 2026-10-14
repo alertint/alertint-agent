@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Index assessment outcomes by call ID so startup recovery remains responsive
+  as completed assessment history grows. Recovery behavior and retained
+  evidence are unchanged.
+
+### Upgrade notes
+
+- Migration 0044 builds the assessment recovery index on first startup; allow
+  extra time for that upgrade and back up before upgrading. Subsequent starts
+  reuse the index. Rollback requires restoring the backup with the older binary.
+
 ## [0.15.1] - 2026-10-13
 
 ### Fixed
