@@ -655,6 +655,50 @@ func TestLoadProfileGuidanceForDeliveriesDedupesSharedSignature(t *testing.T) {
 	}
 }
 
+func TestLoadProfileGuidanceForDeliveriesLargeHistory(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	d1, _ := signatureDeliveryFixture(t, st, "guidance-shared-a", "group-guidance-shared-a", now)
+	d2, _ := signatureDeliveryFixture(t, st, "guidance-shared-b", "group-guidance-shared-b", now)
+	var sig1, sig2 string
+	if err := st.db.QueryRowContext(ctx, `SELECT signature_key FROM delivery_semantic_signatures WHERE delivery_id = ?`, d1).Scan(&sig1); err != nil {
+		t.Fatalf("read signature 1: %v", err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT signature_key FROM delivery_semantic_signatures WHERE delivery_id = ?`, d2).Scan(&sig2); err != nil {
+		t.Fatalf("read signature 2: %v", err)
+	}
+	if sig1 != sig2 {
+		t.Fatalf("fixture invariant: expected both deliveries to share one signature (same proven signal id/version), got %q and %q", sig1, sig2)
+	}
+
+	correction := profilemodel.Correction{
+		Signature: sig1,
+		Profile: profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "minutes",
+		},
+		Confirm: true, AssertedBy: "operator:guidance-shared",
+	}
+	if _, err := st.CorrectSemanticProfile(ctx, correction, now); err != nil {
+		t.Fatalf("CorrectSemanticProfile: %v", err)
+	}
+
+	ids := make([]string, 100000)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("missing-%d", i)
+	}
+	ids[0], ids[len(ids)-1] = d1, d2
+	guidance, _, err := st.LoadProfileGuidanceForDeliveries(ctx, ids)
+	if err != nil {
+		t.Fatalf("LoadProfileGuidanceForDeliveries: %v", err)
+	}
+	if len(guidance) != 1 {
+		t.Fatalf("guidance = %+v, want exactly 1 deduped entry for the shared signature", guidance)
+	}
+}
+
 func TestExtendSemanticInferenceJobLeaseExtendsLiveClaim(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)

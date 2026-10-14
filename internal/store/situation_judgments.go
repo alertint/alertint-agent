@@ -327,7 +327,7 @@ func loadSituationJudgmentInputTx(ctx context.Context, tx *sql.Tx, situationID s
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
-	deliveries, err := loadSituationDeliveriesTx(ctx, tx, situationID)
+	deliveries, err := loadSituationJudgmentDeliveriesTx(ctx, tx, situationID, sit.TerminalAt)
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}

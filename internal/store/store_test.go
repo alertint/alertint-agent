@@ -491,8 +491,8 @@ func TestMaxSchemaVersion(t *testing.T) {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
 	// Released migration 0013 precedes the state-controller migrations.
-	if got != 44 {
-		t.Errorf("MaxSchemaVersion = %d, want 44", got)
+	if got != 45 {
+		t.Errorf("MaxSchemaVersion = %d, want 45", got)
 	}
 }
 
