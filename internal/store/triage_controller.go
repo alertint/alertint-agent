@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -151,22 +150,6 @@ func incidentDigestsTx(ctx context.Context, tx *sql.Tx, incidentID string) (memb
 		return "", "", err
 	}
 	return situation.MembershipDigest(incidentID, deliveries), situation.IncidentInputDigest(incidentID, groupKey, deliveries), nil
-}
-
-// memberDeliveryIDsTx returns the sorted, bounded immutable delivery IDs
-// currently attached to incidentID — the "bounded immutable member/delivery
-// identities used for analysis" a claim freezes and returns verbatim.
-func memberDeliveryIDsTx(ctx context.Context, tx *sql.Tx, incidentID string) ([]string, error) {
-	_, deliveries, err := loadIncidentDeliveriesTx(ctx, tx, incidentID)
-	if err != nil {
-		return nil, err
-	}
-	ids := make([]string, 0, len(deliveries))
-	for _, d := range deliveries {
-		ids = append(ids, d.ID)
-	}
-	sort.Strings(ids)
-	return ids, nil
 }
 
 // canonicalDigest is this package's own "sha256:<hex>" digest helper — the
@@ -400,7 +383,7 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 	}
 	now = now.UTC()
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, history, err := s.beginIncidentHistoryTx(ctx, incidentID)
 	if err != nil {
 		return ClaimedTriageAttempt{}, fmt.Errorf("store: begin claim incident triage attempt: %w", err)
 	}
@@ -458,10 +441,7 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 		return ClaimedTriageAttempt{}, ErrNotFound
 	}
 
-	membership, inputDigest, err := incidentDigestsTx(ctx, tx, incidentID)
-	if err != nil {
-		return ClaimedTriageAttempt{}, err
-	}
+	membership, inputDigest := history.membership, history.input
 	// S2-05: the controller's own decision (applyRequestFromAwaitingDecisionTx
 	// / applyRefreshDecisionTx) froze membership_digest/incident_input_digest
 	// onto this row at decision time. If current membership no longer
@@ -475,10 +455,7 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 	if decidedMembershipDigest.String != membership || decidedIncidentInputDigest.String != inputDigest {
 		return ClaimedTriageAttempt{}, ErrNotFound
 	}
-	memberDeliveryIDs, err := memberDeliveryIDsTx(ctx, tx, incidentID)
-	if err != nil {
-		return ClaimedTriageAttempt{}, err
-	}
+	memberDeliveryIDs := history.deliveryIDs
 	memberDeliveryIDsJSON, err := json.Marshal(memberDeliveryIDs)
 	if err != nil {
 		return ClaimedTriageAttempt{}, fmt.Errorf("store: marshal member delivery ids: %w", err)
@@ -698,7 +675,7 @@ func (s *Store) CompleteIncidentTriageAttempt(ctx context.Context, attemptID, in
 	}
 	now = now.UTC()
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, history, err := s.beginIncidentHistoryTx(ctx, incidentID)
 	if err != nil {
 		return TriageCompletionResult{}, fmt.Errorf("store: begin complete incident triage attempt: %w", err)
 	}
@@ -720,10 +697,7 @@ func (s *Store) CompleteIncidentTriageAttempt(ctx context.Context, attemptID, in
 		return result, tx.Commit()
 	}
 
-	currentMembership, currentInputDigest, err := incidentDigestsTx(ctx, tx, incidentID)
-	if err != nil {
-		return TriageCompletionResult{}, err
-	}
+	currentMembership, currentInputDigest := history.membership, history.input
 
 	// S2-06 (R3 repair): the claim-time guard in ClaimIncidentTriageAttempt
 	// only fences closure BEFORE claim — it cannot see a Situation that

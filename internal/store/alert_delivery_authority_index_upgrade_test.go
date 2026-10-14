@@ -43,6 +43,12 @@ func TestAlertDeliveryAuthorityIndexUpgradePreservesRetainedHistory(t *testing.T
 	if _, err := fixture.AcceptDeliveries(ctx, deliveries); err != nil {
 		t.Fatal(err)
 	}
+	if err := fixture.InsertIncident(ctx, Incident{ID: "upgrade-page-owner", GroupKey: "upgrade", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO incident_alert_deliveries(incident_id,delivery_id,created_at) VALUES (?,?,?)`, "upgrade-page-owner", deliveries[0].ID, canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -57,13 +63,32 @@ func TestAlertDeliveryAuthorityIndexUpgradePreservesRetainedHistory(t *testing.T
 	if err := upgraded.DB().QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 44 {
-		t.Fatalf("schema version = %d, want 44", version)
+	if version != 45 {
+		t.Fatalf("schema version = %d, want 45", version)
 	}
 	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='alert_deliveries_alert_authority_idx'`).Scan(&indexCount); err != nil {
 		t.Fatal(err)
 	}
 	if indexCount != 1 {
 		t.Fatalf("authority index count = %d, want 1", indexCount)
+	}
+	for _, name := range []string{"alert_deliveries_alert_id_page_idx", "alert_deliveries_judgment_authority_idx"} {
+		var count int
+		if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name=?`, name).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("index %s count=%d err=%v", name, count, err)
+		}
+	}
+	var projected int
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_delivery_alerts WHERE incident_id='upgrade-page-owner' AND alert_id=?`, deliveries[0].Alert.ID).Scan(&projected); err != nil || projected != 1 {
+		t.Fatalf("backfilled owned Alert keys=%d err=%v", projected, err)
+	}
+	if err := upgraded.InsertIncident(ctx, Incident{ID: "upgrade-page-new-owner", GroupKey: "upgrade-new", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := upgraded.DB().ExecContext(ctx, `INSERT INTO incident_alert_deliveries(incident_id,delivery_id,created_at) VALUES (?,?,?)`, "upgrade-page-new-owner", deliveries[1].ID, canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_delivery_alerts WHERE incident_id='upgrade-page-new-owner' AND alert_id=?`, deliveries[1].Alert.ID).Scan(&projected); err != nil || projected != 1 {
+		t.Fatalf("new owned Alert keys=%d err=%v", projected, err)
 	}
 }

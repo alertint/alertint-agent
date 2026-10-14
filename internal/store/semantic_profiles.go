@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -510,19 +509,19 @@ func (s *Store) LoadProfileGuidanceForDeliveries(ctx context.Context, deliveryID
 		return nil, nil, nil
 	}
 
-	placeholders := make([]string, len(deliveryIDs))
-	args := make([]any, len(deliveryIDs))
-	for i, id := range deliveryIDs {
-		placeholders[i] = "?"
-		args[i] = id
+	// One bound JSON array avoids SQLite's variable limit while retaining a
+	// single statement snapshot of every current profile head.
+	idsJSON, err := json.Marshal(deliveryIDs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: encode profile guidance delivery IDs: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT dss.signature_key, h.version_id, v.profile_json
 		FROM delivery_semantic_signatures dss
 		JOIN semantic_profile_heads h ON h.signature_key = dss.signature_key
 		JOIN semantic_profile_versions v ON v.id = h.version_id
-		WHERE dss.delivery_id IN (`+strings.Join(placeholders, ",")+`)
-		ORDER BY dss.signature_key ASC`, args...) // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(deliveryIDs) only; all runtime values bound via ? in args
+		WHERE dss.delivery_id IN (SELECT value FROM json_each(?))
+		ORDER BY dss.signature_key ASC`, string(idsJSON))
 	if err != nil {
 		return nil, nil, fmt.Errorf("store: query profile guidance for deliveries: %w", err)
 	}

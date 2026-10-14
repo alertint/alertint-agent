@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep readiness responsive with large delivery histories by paging immutable
+  reconciliation reads and fencing triage snapshots outside mutation transactions.
+  Preserve complete history, coverage digests and source lifecycle semantics.
+- Support profile guidance lookup for large delivery sets without exceeding
+  SQLite's bound-parameter limit.
+
+### Upgrade notes
+
+- Migration 0045 builds delivery paging/authority indexes and backfills distinct
+  owned Alert keys on first startup. Allow extra upgrade time and back up first;
+  rollback requires restoring the backup with the older binary.
+
 ## [0.15.2] - 2026-10-14
 
 ### Fixed
