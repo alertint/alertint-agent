@@ -18,6 +18,7 @@ func (s *Store) PruneUnusedObservationMetadata(ctx context.Context, now time.Tim
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
+	upperBound, cutoff := observationRetentionCutoff(now)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("store: begin observation metadata retention: %w", err)
@@ -29,7 +30,9 @@ func (s *Store) PruneUnusedObservationMetadata(ctx context.Context, now time.Tim
 		  SELECT DISTINCT cycle_id FROM situation_observation_current_heads
 		)
 		SELECT c.id FROM situation_preparation_cycles c
-		WHERE c.sealed = 1 AND c.sealed_at <= ?
+		WHERE c.sealed = 1 AND c.sealed_at < ?
+		  AND (substr(c.sealed_at, 1, 19) || '.' ||
+		       substr(substr(rtrim(c.sealed_at, 'Z'), 21) || '000000000', 1, 9) || 'Z') <= ?
 		  AND NOT EXISTS (SELECT 1 FROM situations s WHERE s.current_preparation_cycle_id = c.id)
 		  AND c.id NOT IN (SELECT cycle_id FROM protected_heads)
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_refresh f WHERE f.admitted_cycle_id = c.id)
@@ -43,7 +46,7 @@ func (s *Store) PruneUnusedObservationMetadata(ctx context.Context, now time.Tim
 		      OR EXISTS (SELECT 1 FROM zabbix_source_observations z WHERE z.run_id = r.id)
 		    )
 		  )
-		ORDER BY c.sealed_at DESC, c.generation DESC, c.id DESC LIMIT ?`, canonicalTime(now.Add(-observationDetailRetention)), limit)
+		ORDER BY c.sealed_at DESC, c.generation DESC, c.id DESC LIMIT ?`, upperBound, cutoff, limit)
 	if err != nil {
 		return 0, fmt.Errorf("store: select unused observation metadata: %w", err)
 	}
@@ -87,4 +90,14 @@ func pruneObservationCycleTx(ctx context.Context, tx *sql.Tx, cycleID string) er
 		}
 	}
 	return nil
+}
+
+// Stored UTC RFC3339Nano timestamps omit trailing zeros, so their text order
+// differs from time order within a second. Retention queries use an indexed
+// next-second upper bound, then compare zero-padded fractions for exact expiry.
+// Existing rows keep their original representation; no migration is needed.
+func observationRetentionCutoff(now time.Time) (upperBound, cutoff string) {
+	at := now.UTC().Add(-observationDetailRetention)
+	const layout = "2006-01-02T15:04:05.000000000Z"
+	return at.Truncate(time.Second).Add(time.Second).Format(layout), at.Format(layout)
 }

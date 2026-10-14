@@ -23,8 +23,12 @@ func metadataRetentionCycles(t *testing.T, st *Store, count int, reuse bool, pin
 
 func metadataRetentionCyclesWithSpacing(t *testing.T, st *Store, count int, reuse bool, pinFirst bool, spacing time.Duration, plans ...observationmodel.Plan) (string, []observationmodel.Cycle) {
 	t.Helper()
+	return metadataRetentionCyclesAt(t, st, count, reuse, pinFirst, spacing, time.Now().UTC(), plans...)
+}
+
+func metadataRetentionCyclesAt(t *testing.T, st *Store, count int, reuse bool, pinFirst bool, spacing time.Duration, now time.Time, plans ...observationmodel.Plan) (string, []observationmodel.Cycle) {
+	t.Helper()
 	ctx := context.Background()
-	now := time.Now().UTC()
 	id := newSituationForGroup(t, st, "service=retention", now)
 	claim := claimSituation(t, st, id, "metadata-retention", now)
 	fence := observationmodel.Fence{SituationID: id, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}

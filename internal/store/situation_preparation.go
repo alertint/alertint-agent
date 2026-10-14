@@ -1518,7 +1518,7 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	cutoff := canonicalTime(now.Add(-observationDetailRetention))
+	upperBound, cutoff := observationRetentionCutoff(now)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1529,7 +1529,9 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 	rows, err := tx.QueryContext(ctx, `
 		SELECT r.id FROM situation_observation_query_runs h
 		CROSS JOIN situation_observation_runs r ON r.id = h.run_id
-		WHERE h.detail_expired = 0 AND h.completed_at <= ?
+		WHERE h.detail_expired = 0 AND h.completed_at < ?
+		  AND (substr(h.completed_at, 1, 19) || '.' ||
+		       substr(substr(rtrim(h.completed_at, 'Z'), 21) || '000000000', 1, 9) || 'Z') <= ?
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND ref.superseded = 0 AND ref.metadata_only = 0)
 		  AND NOT EXISTS (
@@ -1537,7 +1539,7 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 		      JOIN situation_observation_references pref ON pref.run_id = p.id AND pref.superseded = 0 AND pref.metadata_only = 0
 		      WHERE p.reused_from_run_id = r.id)
 		ORDER BY h.completed_at ASC, h.run_id ASC
-		LIMIT ?`, cutoff, limit)
+		LIMIT ?`, upperBound, cutoff, limit)
 	if err != nil {
 		return 0, fmt.Errorf("store: query prunable observation runs: %w", err)
 	}
