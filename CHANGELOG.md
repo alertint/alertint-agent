@@ -7,19 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-10-14
+
 ### Fixed
 
-- Keep readiness responsive with large delivery histories by paging immutable
-  reconciliation reads and fencing triage snapshots outside mutation transactions.
-  Preserve complete history, coverage digests and source lifecycle semantics.
-- Support profile guidance lookup for large delivery sets without exceeding
-  SQLite's bound-parameter limit.
+- Prevent readiness timeouts with large delivery histories while preserving full
+  history and lifecycle semantics (#147).
+- Support large profile-guidance lookups without SQLite parameter-limit errors.
 
 ### Upgrade notes
 
-- Migration 0045 builds delivery paging/authority indexes and backfills distinct
-  owned Alert keys on first startup. Allow extra upgrade time and back up first;
-  rollback requires restoring the backup with the older binary.
+- Migration 0045 builds indexes and owned Alert keys on first startup. Back up
+  before upgrading; rollback requires restoring the backup.
 
 ## [0.15.2] - 2026-10-14
 
@@ -1112,7 +1111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.15.2...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.15.3...HEAD
+[0.15.3]: https://github.com/alertint/alertint-agent/compare/v0.15.2...v0.15.3
 [0.15.2]: https://github.com/alertint/alertint-agent/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/alertint/alertint-agent/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/alertint/alertint-agent/compare/v0.14.3...v0.15.0
