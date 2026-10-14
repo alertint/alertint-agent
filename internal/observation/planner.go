@@ -356,6 +356,13 @@ func buildCandidate(in PlannerInput, m MemberSubject, subject string, capability
 	if err != nil {
 		return Candidate{}, err
 	}
+	if capability == model.CapabilityPrometheusQuery {
+		if len(params) == 0 {
+			maxRequests = 1
+		} else if maxRequests > in.CycleCap {
+			maxRequests = in.CycleCap
+		}
+	}
 	return Candidate{
 		Subject: subject, Capability: capability, Scope: scope, Phase: phase,
 		Window: [2]time.Time{start, in.Anchor}, Limit: limit, MaxRequests: maxRequests, Purpose: purpose,
@@ -422,7 +429,14 @@ func capabilityParameters(in PlannerInput, capability model.Capability, member M
 			Project     string `json:"project"`
 			Environment string `json:"environment,omitempty"`
 		}{Project: project, Environment: env})
-	case model.CapabilityPrometheusQuery, model.CapabilityLokiQuery, model.CapabilityChangeEvents:
+	case model.CapabilityPrometheusQuery:
+		if member.Source == "alertmanager" && member.Firing && labels["alertname"] != "" {
+			return json.Marshal(struct {
+				AlertName string `json:"alert_name"`
+			}{labels["alertname"]})
+		}
+		return nil, nil
+	case model.CapabilityLokiQuery, model.CapabilityChangeEvents:
 		return nil, nil // Scope (allowlisted selector labels) alone is enough.
 	default:
 		return nil, nil

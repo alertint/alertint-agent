@@ -4,6 +4,7 @@ package observation
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -22,6 +23,50 @@ func basicInput(anchor time.Time) PlannerInput {
 			{Capability: model.CapabilityPrometheusQuery, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 1},
 		},
 		CycleCap: 6,
+	}
+}
+
+func TestPrometheusPlanFreezesFiringAlertNameForRuleSelection(t *testing.T) {
+	in := basicInput(time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC))
+	in.Members[0].Labels = map[string]string{"alertname": "ReplicationFailed", "job": "windows"}
+	in.Members[0].SelectorLabels = map[string]string{"job": "windows"}
+	in.Members[0].Firing = true
+	plans, _, err := BuildPlans(in)
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%v err=%v", plans, err)
+	}
+	var params struct {
+		AlertName string `json:"alert_name"`
+	}
+	if json.Unmarshal(plans[0].Parameters, &params) != nil || params.AlertName != "ReplicationFailed" {
+		t.Fatalf("missing frozen rule identity: %s", plans[0].Parameters)
+	}
+	if _, ok := plans[0].Scope.Labels["alertname"]; ok {
+		t.Fatal("alert-only metadata entered metric scope")
+	}
+	in.Members[0].Firing = false
+	plans, _, err = BuildPlans(in)
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%v err=%v", plans, err)
+	}
+	if len(plans[0].Parameters) != 0 {
+		t.Fatalf("resolved member must not select a firing rule: %s", plans[0].Parameters)
+	}
+}
+
+func TestPrometheusPriorityAdaptsToSmallCycleBudget(t *testing.T) {
+	for _, cap := range []int{1, 2, 3} {
+		t.Run(fmt.Sprint(cap), func(t *testing.T) {
+			in := basicInput(time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC))
+			in.Members[0].Labels = map[string]string{"alertname": "ReplicationFailed"}
+			in.Members[0].Firing = true
+			in.Configured[0].MaxRequestsHint = 3
+			in.CycleCap = cap
+			plans, alloc, err := BuildPlans(in)
+			if err != nil || len(plans) != 1 || plans[0].MaxRequests != cap || len(alloc.PhaseAllocation.Deferred) > 0 {
+				t.Fatalf("cap=%d plans=%v alloc=%+v err=%v", cap, plans, alloc, err)
+			}
+		})
 	}
 }
 

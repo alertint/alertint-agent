@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Index assessment outcomes by call ID so startup recovery remains responsive
   as completed assessment history grows. Recovery behavior and retained
   evidence are unchanged.
+- Prioritize metrics referenced by a uniquely matched current firing Prometheus
+  rule before broader diagnostic metrics, retaining primary evidence when later
+  reads reach collection limits. Unsupported or unavailable rule lookups use
+  bounded scope collection with an explicit limitation.
+- Explain Prometheus coverage limits in ntfy and Slack notifications with the
+  specific cause, known retained/omitted counts and an observation reference,
+  independently of model-selected warnings.
 
 ### Upgrade notes
 

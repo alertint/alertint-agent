@@ -315,6 +315,7 @@ func (a AssessmentConclusion) Validate() error {
 // Episode fold and renderers may read (R3). The optional operator briefing
 // adds bounded selected analysis prose; it never enters assessment prompts.
 type ProjectionFacts struct {
+	CoverageLimitations     []CoverageLimitation  `json:"coverage_limitations,omitempty"`
 	OperatorDelta           *OperatorDelta        `json:"operator_delta,omitempty"`
 	Briefing                *OperatorBriefing     `json:"briefing,omitempty"`
 	PublicHandle            *string               `json:"public_handle,omitempty"`
@@ -332,6 +333,14 @@ type ProjectionFacts struct {
 // captured instant's UTC-ness, the terminal_at/terminal_reason pairing, and
 // the nested AssessmentConclusion when present.
 func (p ProjectionFacts) Validate() error {
+	if len(p.CoverageLimitations) > 32 {
+		return errors.New("projection_facts: too many coverage limitations")
+	}
+	for _, l := range p.CoverageLimitations {
+		if err := l.Validate(); err != nil {
+			return err
+		}
+	}
 	if p.PublicHandle != nil && strings.TrimSpace(*p.PublicHandle) == "" {
 		return errors.New("projection_facts: public_handle must not be empty when set")
 	}

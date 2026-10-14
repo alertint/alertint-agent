@@ -67,10 +67,10 @@ func render(t model.Transition, events []string, catchup, delayed bool) Message 
 	body := messageBody{limit: 4000 - len(footer) - 100}
 	renderOverview(&body, t, state, delayed, catchup)
 	renderContract(&body, t)
+	renderLimits(&body, t)
 	if b := t.Projection.Briefing; b != nil {
 		renderSourceAlerts(&body, b)
 	}
-	renderLimits(&body, t)
 	if b := t.Projection.Briefing; b != nil {
 		renderAnalyses(&body, b)
 	}
@@ -242,8 +242,20 @@ func renderLimits(body *messageBody, t model.Transition) {
 			body.add("**Investigation limited**  \n" + body.text(strings.ReplaceAll(b.BlockedReason, "_", " "), 200))
 		}
 	}
-	if t.Projection.Assessment != nil && len(t.Projection.Assessment.LimitationCodes) > 0 {
-		body.add("**Coverage limitations**  \n" + body.text(strings.ReplaceAll(strings.Join(t.Projection.Assessment.LimitationCodes, ", "), "_", " "), 400))
+	lines := situation.CoverageLimitationLines(t.Projection)
+	if t.Projection.Assessment != nil {
+		for _, code := range t.Projection.Assessment.LimitationCodes {
+			if code == "prometheus_query_truncated" {
+				if len(t.Projection.CoverageLimitations) == 0 {
+					lines = append(lines, "Prometheus metrics incomplete; detailed cause unavailable in this older notification. Inspect Situation observations through MCP.")
+				}
+			} else {
+				lines = append(lines, strings.ReplaceAll(code, "_", " "))
+			}
+		}
+	}
+	if len(lines) > 0 {
+		body.add("**Coverage limitations**  \n" + body.text(strings.Join(lines, "\n"), 1600))
 	}
 }
 

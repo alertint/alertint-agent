@@ -552,7 +552,7 @@ func capabilityDescriptorsFromConfig(cfg *config.Config) []observation.Capabilit
 	}
 	if cfg.PrometheusEnabled() {
 		descs = append(descs, observation.CapabilityDescriptor{
-			Capability: model.CapabilityPrometheusQuery, DefaultWindow: time.Hour, DefaultLimit: 1000, MaxRequestsHint: 1,
+			Capability: model.CapabilityPrometheusQuery, DefaultWindow: time.Hour, DefaultLimit: 1000, MaxRequestsHint: 3,
 		})
 	}
 	if cfg.LogsEnabled() {

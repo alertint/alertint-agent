@@ -92,6 +92,33 @@ firing signal that opens or updates a Situation.
 
 ### How it works
 
+Situation evidence preparation first looks for a uniquely named current alerting
+rule at the configured Prometheus `/api/v1/rules` endpoint. A firing member must
+match every configured scope label. When the rule expression can be parsed into
+exact metric names without recording-rule dependencies, preparation collects
+those metrics first, then other metrics in the same scope within the remaining
+request and evidence budgets. It preserves all scope labels on both queries.
+This selects current evidence; it does not prove the historical rule version or
+establish reusable schedule authority.
+
+Rule lookup and the two metric reads use at most three accounted source calls.
+With a two-call cycle budget, preparation can read the rule and its metrics;
+with a one-call budget it uses the bounded scope query. Ambiguous rules,
+unsupported expressions, missing firing members and lookup failures also use
+bounded scope collection and record why rule-first selection was unavailable.
+
+Coverage warnings in ntfy and Slack distinguish a series-count limit, the
+16 KiB evidence-summary limit and the 1 MiB decoded-response limit. They include
+known retained/omitted counts and the observation run reference. An overflow
+sentinel only proves a minimum omitted count; a response rejected before parsing
+has an unknown count. Evidence from earlier successful reads remains available
+if a later diagnostic read fails. Use `alertint_list_observation_runs` with the
+Situation's `id` or `handle` to inspect its coverage and detailed limitation
+codes. Older notifications without that metadata explicitly say the cause is
+unavailable instead of guessing which limit was reached.
+
+The incident analysis path also performs the following enrichment:
+
 For alerts fired by Prometheus rules, AlertINT reads the rule expression from
 Alertmanager's stored `generatorURL` query string and runs it unchanged against
 the configured Prometheus. It never contacts the URL's host. Matching series

@@ -120,6 +120,7 @@ func RenderSituationRoot(in SituationRootInput) (RenderedMessage, error) {
 // A compact card retains the current state, next action and MCP handle when
 // unusually long source data defeats the normal root's bounds.
 func boundedRoot(in SituationRootInput, rendered RenderedMessage) RenderedMessage {
+	rendered = withCoverageLimitations(rendered, in.SourceTransition.Projection)
 	if len(rendered.Text) <= maxRootTextBytes && len(rendered.Blocks) <= maxRootBlocks {
 		return rendered
 	}
@@ -145,7 +146,18 @@ func boundedRoot(in SituationRootInput, rendered RenderedMessage) RenderedMessag
 	for _, line := range lines {
 		blocks = append(blocks, sectionBlock(line))
 	}
-	return RenderedMessage{Text: strings.Join(lines, "\n\n"), Blocks: blocks}
+	return withCoverageLimitations(RenderedMessage{Text: strings.Join(lines, "\n\n"), Blocks: blocks}, in.SourceTransition.Projection)
+}
+
+func withCoverageLimitations(message RenderedMessage, p model.ProjectionFacts) RenderedMessage {
+	lines := situation.CoverageLimitationLines(p)
+	if len(lines) == 0 {
+		return message
+	}
+	text := "*Coverage limitations*\n" + briefingText(strings.Join(lines, " "), 1800)
+	message.Text += "\n\n" + text
+	message.Blocks = append(message.Blocks, sectionBlock(text))
+	return message
 }
 
 func validateRootInput(in SituationRootInput) error {
