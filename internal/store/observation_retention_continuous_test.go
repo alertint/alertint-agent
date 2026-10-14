@@ -12,24 +12,33 @@ import (
 )
 
 func TestObservationRetentionExactTenDayCutoff(t *testing.T) {
-	st := newTestStore(t)
-	_, cycles := metadataRetentionCycles(t, st, 3, false, false)
-	cutoff := cycles[0].Draft.Anchor.Add(10 * 24 * time.Hour)
-	ctx := context.Background()
-	for _, at := range []time.Time{cutoff.Add(-time.Nanosecond), cutoff} {
-		want := 0
-		if at.Equal(cutoff) {
-			want = 2
+	// RFC3339Nano omits trailing zeros. Exercise both shortened fractions
+	// and adjacent nanoseconds rather than relying on wall-clock precision.
+	for _, nanos := range []int{0, 1, 10, 81, 100000000, 862946881, 999999999} {
+		for _, offset := range []time.Duration{0, time.Nanosecond} {
+			t.Run(fmt.Sprintf("nanos=%d/offset=%s", nanos, offset), func(t *testing.T) {
+				st := newTestStore(t)
+				start := time.Date(2026, 9, 1, 0, 0, 0, nanos, time.UTC)
+				_, cycles := metadataRetentionCyclesAt(t, st, 3, false, false, 0, start)
+				cutoff := cycles[0].Draft.Anchor.Add(10 * 24 * time.Hour)
+				ctx := context.Background()
+				for _, at := range []time.Time{cutoff.Add(-time.Nanosecond), cutoff.Add(offset)} {
+					want := 0
+					if !at.Before(cutoff) {
+						want = 2
+					}
+					if n, err := st.PruneUnusedObservationDetails(ctx, at, 100); err != nil || n != want {
+						t.Fatalf("details at %s: %d %v, want %d", at, n, err, want)
+					}
+					if n, err := st.PruneUnusedObservationMetadata(ctx, at, 25); err != nil || n != want {
+						t.Fatalf("metadata at %s: %d %v, want %d", at, n, err, want)
+					}
+				}
+				if n := metadataCount(t, st, "situation_preparation_cycles"); n != 1 {
+					t.Fatalf("current head lost: cycles=%d", n)
+				}
+			})
 		}
-		if n, err := st.PruneUnusedObservationDetails(ctx, at, 100); err != nil || n != want {
-			t.Fatalf("details at %s: %d %v, want %d", at, n, err, want)
-		}
-		if n, err := st.PruneUnusedObservationMetadata(ctx, at, 25); err != nil || n != want {
-			t.Fatalf("metadata at %s: %d %v, want %d", at, n, err, want)
-		}
-	}
-	if n := metadataCount(t, st, "situation_preparation_cycles"); n != 1 {
-		t.Fatalf("current head lost: cycles=%d", n)
 	}
 }
 

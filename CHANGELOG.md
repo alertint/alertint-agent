@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Compare observation retention timestamps at nanosecond precision so shortened
+  fractional timestamps cannot expire evidence before the ten-day boundary.
 - Index assessment outcomes by call ID so startup recovery remains responsive
   as completed assessment history grows. Recovery behavior and retained
   evidence are unchanged.
