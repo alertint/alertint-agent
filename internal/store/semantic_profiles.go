@@ -16,7 +16,6 @@ import (
 
 	"github.com/google/uuid"
 
-	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/semanticprofile"
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
@@ -490,68 +489,6 @@ func releaseExpiredSemanticInferenceLeasesTx(ctx context.Context, tx *sql.Tx, no
 		released += int(n)
 	}
 	return released, nil
-}
-
-// LoadProfileGuidanceForDeliveries reads the CURRENT head profile for every
-// distinct signature deliveryIDs map to (via delivery_semantic_signatures),
-// projected down to the narrow observationmodel.ProfileGuidance shape the
-// planner consumes — never the full advisory Profile content (subject_kind/
-// event_kind/possible_role/companion_signal_kinds/uncertainty are the
-// model's own prose, meaningless to plan construction). A delivery with no
-// signature mapping yet, or a signature with no head yet (never corrected
-// or inferred), contributes nothing — never a synthesized placeholder. The
-// result is deduplicated by signature: multiple deliveries sharing one
-// signature contribute exactly one guidance entry. versionIDs is the
-// parallel slice of frozen version IDs the returned guidance came from,
-// for CycleDraft.ProfileVersionIDs.
-func (s *Store) LoadProfileGuidanceForDeliveries(ctx context.Context, deliveryIDs []string) ([]observationmodel.ProfileGuidance, []string, error) {
-	if len(deliveryIDs) == 0 {
-		return nil, nil, nil
-	}
-
-	// One bound JSON array avoids SQLite's variable limit while retaining a
-	// single statement snapshot of every current profile head.
-	idsJSON, err := json.Marshal(deliveryIDs)
-	if err != nil {
-		return nil, nil, fmt.Errorf("store: encode profile guidance delivery IDs: %w", err)
-	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT dss.signature_key, h.version_id, v.profile_json
-		FROM delivery_semantic_signatures dss
-		JOIN semantic_profile_heads h ON h.signature_key = dss.signature_key
-		JOIN semantic_profile_versions v ON v.id = h.version_id
-		WHERE dss.delivery_id IN (SELECT value FROM json_each(?))
-		ORDER BY dss.signature_key ASC`, string(idsJSON))
-	if err != nil {
-		return nil, nil, fmt.Errorf("store: query profile guidance for deliveries: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var guidance []observationmodel.ProfileGuidance
-	var versionIDs []string
-	for rows.Next() {
-		var signatureKey, versionID, profileJSON string
-		if err := rows.Scan(&signatureKey, &versionID, &profileJSON); err != nil {
-			return nil, nil, fmt.Errorf("store: scan profile guidance: %w", err)
-		}
-		var profile profilemodel.Profile
-		if err := json.Unmarshal([]byte(profileJSON), &profile); err != nil {
-			return nil, nil, fmt.Errorf("store: unmarshal profile guidance content: %w", err)
-		}
-		capabilities := make([]observationmodel.Capability, 0, len(profile.UsefulCapabilities))
-		for _, c := range profile.UsefulCapabilities {
-			capabilities = append(capabilities, observationmodel.Capability(c))
-		}
-		guidance = append(guidance, observationmodel.ProfileGuidance{
-			SignatureKey: signatureKey, VersionID: versionID, HorizonTier: profile.HorizonTier,
-			UsefulCapabilities: capabilities, CandidateScope: profile.CandidateScope,
-		})
-		versionIDs = append(versionIDs, versionID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("store: iterate profile guidance: %w", err)
-	}
-	return guidance, versionIDs, nil
 }
 
 // CorrectSemanticProfile applies an MCP-submitted, confirmed operator

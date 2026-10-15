@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep readiness responsive during large profile-guidance reads while preserving
+  complete guidance and a consistent committed snapshot of mappings and heads.
+
+### Upgrade notes
+
+- Migration 0046 records published profile-head history for bounded reads and
+  backfills existing heads. Back up before upgrading; rollback requires restoring
+  the backup.
+
 ## [0.15.3] - 2026-10-14
 
 ### Fixed
