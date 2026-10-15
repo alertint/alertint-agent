@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestAlertRuleMetricsRequiresUniqueFiringRuleAndExactMetricNames(t *testing.T) {
+func TestAlertRuleMetricsRequiresUniqueRuleAndExactMetricNames(t *testing.T) {
 	for _, tc := range []struct {
 		name, query, alerts, extra string
 		want                       []string
@@ -23,8 +23,11 @@ func TestAlertRuleMetricsRequiresUniqueFiringRuleAndExactMetricNames(t *testing.
 		{name: "anonymous name regex", query: `{__name__=~"windows_.*"} > 0`, reason: "unsupported_expression"},
 		{name: "scalar only", query: `vector(1)`, reason: "unsupported_expression"},
 		{name: "duplicate rule", query: `replication_failed > 0`, extra: `,{"name":"other","rules":[{"type":"alerting","name":"ReplicationFailed","query":"other > 0"}]}`, reason: "ambiguous_rule"},
-		{name: "wrong partition", query: `replication_failed > 0`, alerts: `[{"state":"firing","labels":{"job":"windows","instance":"exchange01","cluster":"other"}}]`, reason: "member_not_firing"},
-		{name: "no firing member", query: `replication_failed > 0`, alerts: `[]`, reason: "member_not_firing"},
+		{name: "wrong partition is advisory", query: `replication_failed > 0`, alerts: `[{"state":"firing","labels":{"job":"windows","instance":"exchange01","cluster":"other"}}]`, want: []string{"replication_failed"}, reason: "current_definition_hint"},
+		{name: "no firing member is advisory", query: `replication_failed > 0`, alerts: `[]`, want: []string{"replication_failed"}, reason: "current_definition_hint"},
+		{name: "pending member is advisory", query: `replication_failed > 0`, alerts: `[{"state":"pending","labels":{"job":"windows","instance":"exchange01","cluster":"prod"}}]`, want: []string{"replication_failed"}, reason: "current_definition_hint"},
+		{name: "inactive recording dependency still falls back", query: `service:errors > 0`, alerts: `[]`, extra: `,{"name":"recorded","rules":[{"type":"recording","name":"service:errors","query":"sum(errors_total)"}]}`, reason: "recording_dependency"},
+		{name: "inactive unsupported expression still falls back", query: `{__name__=~"windows_.*"} > 0`, alerts: `[]`, reason: "unsupported_expression"},
 		{name: "recording dependency", query: `service:errors > 0`, extra: `,{"name":"recorded","rules":[{"type":"recording","name":"service:errors","query":"sum(errors_total)"}]}`, reason: "recording_dependency"},
 		{name: "metric text in string is not a reference", query: `label_replace(up,"note","service:errors","job",".*")`, extra: `,{"name":"recorded","rules":[{"type":"recording","name":"service:errors","query":"sum(errors_total)"}]}`, want: []string{"up"}},
 	} {

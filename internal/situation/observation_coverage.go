@@ -62,6 +62,8 @@ func CoverageLimitationLines(p model.ProjectionFacts) []string {
 				reasons = append(reasons, fmt.Sprintf("Additional diagnostic metrics could not be read; retained %d series; omitted count unknown.", l.Returned))
 			case "rule_metrics_ambiguous_rule":
 				reasons = append(reasons, "Current alert rule is ambiguous; used bounded scope metrics as fallback.")
+			case "rule_metrics_current_definition_hint":
+				reasons = append(reasons, "No matching alert is currently firing; metric selection uses the current rule definition as an advisory hint, not proof of the historical rule.")
 			case "rule_metrics_response_too_large":
 				reasons = append(reasons, "Current rule lookup exceeded the 1 MiB response size limit; used bounded scope metrics as fallback.")
 			case "rule_metrics_empty":

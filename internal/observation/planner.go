@@ -430,7 +430,9 @@ func capabilityParameters(in PlannerInput, capability model.Capability, member M
 			Environment string `json:"environment,omitempty"`
 		}{Project: project, Environment: env})
 	case model.CapabilityPrometheusQuery:
-		if member.Source == "alertmanager" && member.Firing && labels["alertname"] != "" {
+		// Alert identity survives resolution; the connector treats current
+		// rule names as advisory selection, independently of lifecycle state.
+		if member.Source == "alertmanager" && labels["alertname"] != "" {
 			return json.Marshal(struct {
 				AlertName string `json:"alert_name"`
 			}{labels["alertname"]})

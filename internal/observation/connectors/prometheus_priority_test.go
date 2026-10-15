@@ -90,7 +90,7 @@ func TestPrometheusPriorityRetainsAlertMetricAndReportsIncompleteDiagnostics(t *
 				}
 				var series []any
 				for i := 0; i < 200; i++ {
-					series = append(series, map[string]any{"metric": map[string]string{"__name__": "a_cpu_metric", "core": fmt.Sprint(i), "pad": strings.Repeat("p", 200)}, "values": [][2]any{{1, "1"}}})
+					series = append(series, map[string]any{"metric": map[string]string{"__name__": "a_cpu_metric", "core": fmt.Sprint(i), "pad": strings.Repeat("p", 600)}, "values": [][2]any{{1, "1"}}})
 				}
 				_ = json.NewEncoder(w).Encode(map[string]any{"status": "success", "data": map[string]any{"resultType": "matrix", "result": series}})
 			}))

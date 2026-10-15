@@ -12,8 +12,9 @@ import (
 )
 
 // AlertRuleMetrics discovers exact metric names in one uniquely named current
-// rule with a firing alert matching every frozen scope label. It is advisory
-// evidence selection, never proof of the rule that emitted an older delivery.
+// rule. Without a firing alert matching every frozen scope label, names are
+// returned with an explicit current-definition hint. Selection is advisory,
+// never proof of lifecycle state or the rule that emitted an older delivery.
 // The caller must reserve/settle this single bounded physical request.
 func (c *Client) AlertRuleMetrics(ctx context.Context, alertName string, scope map[string]string) ([]string, string, error) {
 	raw, err := c.apiGetBounded(ctx, "/api/v1/rules", nil)
@@ -69,8 +70,9 @@ func (c *Client) AlertRuleMetrics(ctx context.Context, alertName string, scope m
 		}
 		firing = firing || match
 	}
+	reason := ""
 	if !firing {
-		return nil, "member_not_firing", nil
+		reason = "current_definition_hint"
 	}
 	exprText := matches[0].Query
 	if len(exprText) > 8192 {
@@ -111,5 +113,5 @@ func (c *Client) AlertRuleMetrics(ctx context.Context, alertName string, scope m
 		out = append(out, name)
 	}
 	sort.Strings(out)
-	return out, "", nil
+	return out, reason, nil
 }

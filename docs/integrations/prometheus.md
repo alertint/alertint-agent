@@ -93,18 +93,27 @@ firing signal that opens or updates a Situation.
 ### How it works
 
 Situation evidence preparation first looks for a uniquely named current alerting
-rule at the configured Prometheus `/api/v1/rules` endpoint. A firing member must
-match every configured scope label. When the rule expression can be parsed into
+rule at the configured Prometheus `/api/v1/rules` endpoint. When its expression can be parsed into
 exact metric names without recording-rule dependencies, preparation collects
 those metrics first, then other metrics in the same scope within the remaining
 request and evidence budgets. It preserves all scope labels on both queries.
-This selects current evidence; it does not prove the historical rule version or
-establish reusable schedule authority.
+The alert name remains available after a resolved delivery. If no firing member
+matches the scope, notifications explicitly identify current-rule selection as
+an advisory hint. Current definitions can change after an alert: they do not
+prove the historical rule version, establish lifecycle state or grant reusable
+schedule authority.
+
+Primary rule metrics keep the plan's series limit. Optional diagnostics and
+Alertmanager scope fallback collect at most 32 series, plus one overflow sentinel,
+at the original time resolution. This small background sample leaves room for
+primary evidence in the 16 KiB summary; it can omit whole metric families and is
+reported as incomplete when the sentinel is returned. Large labels or primary
+queries can still reach the independent response and summary byte limits.
 
 Rule lookup and the two metric reads use at most three accounted source calls.
 With a two-call cycle budget, preparation can read the rule and its metrics;
 with a one-call budget it uses the bounded scope query. Ambiguous rules,
-unsupported expressions, missing firing members and lookup failures also use
+unsupported expressions and lookup failures also use
 bounded scope collection and record why rule-first selection was unavailable.
 
 Coverage warnings in ntfy and Slack distinguish a series-count limit, the

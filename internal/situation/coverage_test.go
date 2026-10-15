@@ -57,3 +57,13 @@ func TestCoverageCountsAreLowerBoundsWhenOtherReadsAreUnknown(t *testing.T) {
 		t.Fatalf("partial omissions must be a lower bound: %+v", rows)
 	}
 }
+
+func TestCoverageCurrentRuleHintDoesNotClaimFailedFallback(t *testing.T) {
+	p := model.ProjectionFacts{CoverageLimitations: []model.CoverageLimitation{{
+		RunID: "run:hint", Capability: "prometheus_query", Codes: []string{"rule_metrics_current_definition_hint"}, Returned: 4,
+	}}}
+	text := strings.Join(CoverageLimitationLines(p), " ")
+	if strings.Contains(text, "unavailable") || strings.Contains(text, "used bounded scope metrics as fallback") || !strings.Contains(text, "advisory") || !strings.Contains(text, "historical") {
+		t.Fatalf("current-rule hint must be advisory provenance, not a failed read or historical proof: %s", text)
+	}
+}
