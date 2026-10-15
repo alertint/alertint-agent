@@ -126,7 +126,7 @@ func TestProfileGuidanceKeepsHeadAcrossDeletionAndReinsertion(t *testing.T) {
 
 func TestProfileGuidanceKeepsCommittedMappingAndHeadSnapshot(t *testing.T) {
 	st := newTestStore(t)
-	ids := seedGuidanceProfiles(t, st, 2)
+	ids := seedGuidanceProfiles(t, st, 3)
 	ctx := context.Background()
 	// The second requested delivery initially has no mapping or profile head.
 	// Its immutable version exists, but is not published yet.
@@ -134,7 +134,8 @@ func TestProfileGuidanceKeepsCommittedMappingAndHeadSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	unmapped := deliveryFixture("guidance-unmapped", "fp-guidance-unmapped", time.Now().UTC())
-	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{unmapped}); err != nil {
+	lateMapping := deliveryFixture("guidance-late-mapping", "fp-guidance-late-mapping", time.Now().UTC())
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{unmapped, lateMapping}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(ctx, `INSERT INTO semantic_profile_versions(id,signature_key,version,schema_version,prompt_version,semantic_input_digest,origin,profile_json,created_at,asserted_by)
@@ -159,6 +160,9 @@ func TestProfileGuidanceKeepsCommittedMappingAndHeadSnapshot(t *testing.T) {
 			{`UPDATE semantic_profile_heads SET current_version=2,version_id='guidance-version-new' WHERE signature_key='guidance-signature-0000'`, nil},
 			{`INSERT INTO delivery_semantic_signatures(delivery_id,signature_key,signature_digest,schema_version,material_json,mode,advisory_only,created_at) VALUES (?,'guidance-signature-0001','digest',1,'{}','fallback',1,'2026-10-15T00:00:00Z')`, []any{unmapped.ID}},
 			{`INSERT INTO semantic_profile_heads(signature_key,current_version,version_id,updated_at) VALUES ('guidance-signature-0001',1,'guidance-version-0001','2026-10-15T00:00:00Z')`, nil},
+			// This signature already had a published head at snapshot time.
+			// Its late mapping must be excluded independently of head fencing.
+			{`INSERT INTO delivery_semantic_signatures(delivery_id,signature_key,signature_digest,schema_version,material_json,mode,advisory_only,created_at) VALUES (?,'guidance-signature-0002','digest',1,'{}','fallback',1,'2026-10-15T00:00:00Z')`, []any{lateMapping.ID}},
 		} {
 			if _, err := tx.ExecContext(ctx, statement.sql, statement.args...); err != nil {
 				mutationErr = err
@@ -168,7 +172,7 @@ func TestProfileGuidanceKeepsCommittedMappingAndHeadSnapshot(t *testing.T) {
 		mutationErr = tx.Commit()
 	}})
 	// Put the unmapped ID first and the mapped ID last, across page boundaries.
-	requested := []string{unmapped.ID}
+	requested := []string{unmapped.ID, lateMapping.ID}
 	for n := 0; n < 300; n++ {
 		requested = append(requested, fmt.Sprintf("absent-%03d", n))
 	}
