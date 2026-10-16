@@ -147,12 +147,12 @@ func TestSemanticProfilesUpgradeMigration22Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 45 {
-		t.Fatalf("MaxSchemaVersion = %d, want 45", got)
+	if got != 46 {
+		t.Fatalf("MaxSchemaVersion = %d, want 46", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 45 {
-		t.Fatalf("applied schema version = %d (err=%v), want 45", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 46 {
+		t.Fatalf("applied schema version = %d (err=%v), want 46", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {
