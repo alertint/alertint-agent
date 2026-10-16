@@ -14,6 +14,9 @@
 //     pins chat_template_kwargs {"enable_thinking": <cfg.Thinking>} — except
 //     against hosted OpenAI (api.openai.com), which rejects the field as an
 //     unrecognized request argument; the leading-<think> strip still applies.
+//     Any other endpoint that refuses the field (a 400/422 naming it, e.g.
+//     Mistral's API) gets the request resent once without it; when the
+//     endpoint accepts the resend, the pin stays off for the client's lifetime.
 //   - Retries: 429 plus any 5xx (local runtimes signal transient overload /
 //     loading / respawn with generic 500/503, unlike Anthropic's 529).
 package openaicompat
@@ -22,12 +25,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -46,6 +51,10 @@ const (
 	// returned error text.
 	maxErrorBodyExcerpt = 512
 )
+
+// errTemplateKwargsRejected marks a response that refused the request for
+// carrying chat_template_kwargs; callWithRetry resends once without the field.
+var errTemplateKwargsRejected = errors.New("llm: endpoint rejected chat_template_kwargs")
 
 // responseFormatHint is appended to a 400 whose body mentions
 // response_format — the actionable fix, not just the failure.
@@ -101,10 +110,12 @@ type Client struct {
 	logger   *slog.Logger
 	now      func() time.Time
 	endpoint string
-	// pinChatTemplateKwargs sends the enable_thinking pin. Off for hosted
-	// OpenAI, which 400s on the unrecognized field; its models have no
-	// chat-template thinking toggle to pin anyway.
-	pinChatTemplateKwargs bool
+	// pinChatTemplateKwargs sends the enable_thinking pin. Off from the
+	// start for hosted OpenAI, which 400s on the unrecognized field; its
+	// models have no chat-template thinking toggle to pin anyway. Turned off
+	// for good once any other endpoint rejects the field and then accepts the
+	// same request without it.
+	pinChatTemplateKwargs atomic.Bool
 	// hosted marks the endpoint as hosted OpenAI: Probe uses the model-
 	// metadata route instead of the generic health/models routes.
 	hosted bool
@@ -116,17 +127,17 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Client{
+	c := &Client{
 		cfg:      cfg,
 		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, Transport: cfg.Budget.Transport(nil)},
 		auditor:  auditor,
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },
 		endpoint: cfg.BaseURL + "/v1/chat/completions",
-
-		pinChatTemplateKwargs: !isHostedOpenAI(cfg.BaseURL),
-		hosted:                isHostedOpenAI(cfg.BaseURL),
+		hosted:   isHostedOpenAI(cfg.BaseURL),
 	}
+	c.pinChatTemplateKwargs.Store(!c.hosted)
+	return c
 }
 
 // isHostedOpenAI reports whether baseURL points at the hosted OpenAI API.
@@ -199,6 +210,13 @@ func (c *Client) Complete(
 // identical here). It shares doRequest/callWithRetry with Complete, calling
 // callWithRetry with maxRetries=0, and classifies the outcome into
 // RequestStartStatus via llm.ClassifyRequestStart.
+//
+// One exception to "one physical request": when the endpoint refuses the
+// request for carrying chat_template_kwargs, it is resent once without the
+// field. The refused request generated nothing, and once the endpoint
+// accepts the resend the field is never sent again, so this happens once per
+// client lifetime (plus any concurrent call that raced the first refusal);
+// the outcome reported is the resend's.
 func (c *Client) CompleteOnce(
 	ctx context.Context,
 	systemPrompt string, prompt llm.Prompt,
@@ -300,18 +318,40 @@ type tokenUsage struct {
 // backoff loop, retrying on 429 and any 5xx (wrapped by doRequest as
 // llm.RetryableError) up to maxRetries times. Complete calls this with
 // MaxRetries; CompleteOnce calls it with 0 — see anthropic's callWithRetry
-// doc comment for the shared rationale.
+// doc comment for the shared rationale. A request refused for carrying
+// chat_template_kwargs is resent once without it, outside that retry count.
 func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt, maxRetries int) (json.RawMessage, tokenUsage, error) {
 	return llm.CallWithRetry(ctx, c.logger, maxRetries, c.cfg.BaseRetryDelay,
 		func(ctx context.Context) (json.RawMessage, tokenUsage, error) {
-			raw, usage, err := c.doRequest(ctx, system, prompt)
-			llm.ObserveRequest(ctx, llm.Completion{Raw: raw, InputTokens: usage.input, OutputTokens: usage.output}, err)
+			raw, usage, err := c.observedRequest(ctx, system, prompt, c.pinChatTemplateKwargs.Load())
+			if !errors.Is(err, errTemplateKwargsRejected) {
+				return raw, usage, err
+			}
+			rejected := err
+			raw, usage, err = c.observedRequest(ctx, system, prompt, false)
+			if errors.Is(err, llm.ErrRequestNotSent) {
+				// The resend never left (e.g. the budget declined it), but
+				// the refused request did: report that one, so the caller
+				// does not record this call as never sent.
+				return nil, tokenUsage{}, rejected
+			}
+			if acceptedResponse(err) {
+				c.stopTemplateKwargs(rejected)
+			}
 			return raw, usage, err
 		})
 }
 
-// doRequest performs a single HTTP call to the chat-completions API.
-func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
+// observedRequest is one physical request, reported to the request observer.
+func (c *Client) observedRequest(ctx context.Context, system string, prompt llm.Prompt, templateKwargs bool) (json.RawMessage, tokenUsage, error) {
+	raw, usage, err := c.doRequest(ctx, system, prompt, templateKwargs)
+	llm.ObserveRequest(ctx, llm.Completion{Raw: raw, InputTokens: usage.input, OutputTokens: usage.output}, err)
+	return raw, usage, err
+}
+
+// doRequest performs a single HTTP call to the chat-completions API;
+// templateKwargs sends the chat_template_kwargs pin.
+func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt, templateKwargs bool) (json.RawMessage, tokenUsage, error) {
 	maxTokens := prompt.OutputTokenLimit(c.cfg.MaxTokens)
 	body := chatRequest{
 		Model:     c.cfg.Model,
@@ -321,7 +361,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 			{Role: "user", Content: prompt.Text()},
 		},
 	}
-	if c.pinChatTemplateKwargs {
+	if templateKwargs {
 		body.ChatTemplateKwargs = map[string]any{"enable_thinking": c.cfg.Thinking}
 		if c.cfg.ReasoningEffort != "" {
 			body.ChatTemplateKwargs["reasoning_effort"] = c.cfg.ReasoningEffort
@@ -359,7 +399,11 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 		return nil, tokenUsage{}, &llm.RetryableError{StatusCode: resp.StatusCode}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, tokenUsage{}, apiError(resp.StatusCode, respBody)
+		err := apiError(resp.StatusCode, respBody)
+		if templateKwargs && rejectsTemplateKwargs(resp.StatusCode, respBody) {
+			return nil, tokenUsage{}, fmt.Errorf("%w: %w", errTemplateKwargsRejected, err)
+		}
+		return nil, tokenUsage{}, err
 	}
 
 	var parsed chatResponse
@@ -405,6 +449,40 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 		return nil, usage, fmt.Errorf("%w: response is not valid JSON: %w", llm.ErrResponseInvalid, err)
 	}
 	return raw, usage, nil
+}
+
+// rejectsTemplateKwargs reports whether a non-retryable response may have
+// refused the chat_template_kwargs field itself: a 400 (OpenAI-style
+// "unrecognized argument") or a 422 (schema validation, e.g. Mistral's
+// extra_forbidden) whose body names it. A body that merely echoes the request
+// matches too, which is why only an accepted resend turns the pin off.
+func rejectsTemplateKwargs(status int, body []byte) bool {
+	return (status == http.StatusBadRequest || status == http.StatusUnprocessableEntity) &&
+		bytes.Contains(body, []byte("chat_template_kwargs"))
+}
+
+// acceptedResponse reports whether a request's outcome proves the endpoint
+// accepted it: a 200, even one whose content then failed to parse.
+func acceptedResponse(err error) bool {
+	return err == nil || errors.Is(err, llm.ErrResponseInvalid) || errors.Is(err, llm.ErrResponseTruncated)
+}
+
+// stopTemplateKwargs turns the pin off for the client's lifetime, logging
+// once: concurrent calls that raced the first refusal find it already off.
+func (c *Client) stopTemplateKwargs(rejected error) {
+	if !c.pinChatTemplateKwargs.CompareAndSwap(true, false) {
+		return
+	}
+	var status int
+	var api *llm.APIError
+	if errors.As(rejected, &api) {
+		status = api.StatusCode
+	}
+	c.logger.Warn("llm: endpoint rejected chat_template_kwargs; sending requests without it until restart (llm.thinking and llm.reasoning_effort have no effect on this endpoint)",
+		slog.Int("status", status),
+		slog.String("model", c.cfg.Model),
+		slog.Bool("thinking", c.cfg.Thinking),
+		slog.String("reasoning_effort", c.cfg.ReasoningEffort))
 }
 
 // apiError renders a non-2xx, non-retryable status as an error carrying a

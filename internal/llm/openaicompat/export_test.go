@@ -13,14 +13,14 @@ import (
 // since isHostedOpenAI(cfg.BaseURL) can never match a test server's host.
 func NewForTest(cfg Config, hosted bool) *Client {
 	cfg.defaults()
-	return &Client{
+	c := &Client{
 		cfg:      cfg,
 		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
 		logger:   slog.Default(),
 		now:      func() time.Time { return time.Now().UTC() },
 		endpoint: cfg.BaseURL + "/v1/chat/completions",
-
-		pinChatTemplateKwargs: !hosted,
-		hosted:                hosted,
+		hosted:   hosted,
 	}
+	c.pinChatTemplateKwargs.Store(!hosted)
+	return c
 }

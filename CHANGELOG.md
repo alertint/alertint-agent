@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete guidance and a consistent committed snapshot of mappings and heads.
 - Let local observations complete under the controller deadline after the external
   source I/O budget expires, while preserving cancellation and external limits.
+- Resend an OpenAI-compatible request once without `chat_template_kwargs` when the
+  endpoint rejects that field (a 400 or 422 naming it, as Mistral's API returns),
+  and stop sending it until restart. Previously every LLM call against such an
+  endpoint failed. `llm.thinking` and `llm.reasoning_effort` have no effect there.
 
 ### Upgrade notes
 
