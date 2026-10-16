@@ -19,6 +19,12 @@ type alertRuleMetricClient interface {
 	AlertRuleMetrics(ctx context.Context, alertName string, scope map[string]string) ([]string, string, error)
 }
 
+// Background reads are a small diagnostic sample, not another full primary
+// query. A 32-series sample leaves room for primary evidence in a typical
+// 16 KiB summary. Large labels/windows remain subject to the independent byte
+// caps; this series budget cannot guarantee that a response fits in memory.
+const prometheusBackgroundSeries = 32
+
 // metricReadSession accounts the bounded rule/primary/diagnostic reads of one
 // frozen plan. A settlement failure is never mistaken for source unavailability.
 type metricReadSession struct {
@@ -71,6 +77,9 @@ func (s *metricReadSession) ruleMetricNames(ctx context.Context, alertName strin
 		return nil, "rule_metrics_api_unavailable", nil
 	}
 	if len(names) > 0 {
+		if reason != "" {
+			return names, "rule_metrics_" + reason, nil
+		}
 		return names, "", nil
 	}
 	if reason == "" {
@@ -120,7 +129,7 @@ func (s *metricReadSession) appendDiagnostics(ctx context.Context, c *metricColl
 		c.extra = append(c.extra, code)
 		return nil
 	}
-	diagnostics, more, err := s.query(ctx, metricNameSelector(scope, names, true), remaining)
+	diagnostics, more, err := s.query(ctx, metricNameSelector(scope, names, true), min(remaining, prometheusBackgroundSeries))
 	if s.settlementErr != nil {
 		return s.settlementErr
 	}
@@ -172,7 +181,11 @@ func (e *PrometheusExecutor) executeMetrics(ctx context.Context, plan model.Plan
 	if len(names) > 0 {
 		expr = metricNameSelector(scope, names, false)
 	}
-	c.summary, c.truncated, err = s.query(ctx, expr, limit)
+	readLimit := limit
+	if len(names) == 0 && plan.Scope.Source == "alertmanager" {
+		readLimit = min(limit, prometheusBackgroundSeries)
+	}
+	c.summary, c.truncated, err = s.query(ctx, expr, readLimit)
 	if s.settlementErr != nil {
 		return model.Run{}, s.settlementErr
 	}

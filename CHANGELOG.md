@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bound optional Prometheus diagnostics and Alertmanager fallback to small series
+  samples so wide exporter queries leave room for primary alert evidence. Retain
+  rule identity after resolution and explicitly label current-rule metric hints
+  as advisory when no matching alert is firing; preserve scope, sampling resolution,
+  request budgets and truthful coverage limits (#138).
 - Keep readiness responsive during large profile-guidance reads while preserving
   complete guidance and a consistent committed snapshot of mappings and heads.
 - Let local observations complete under the controller deadline after the external

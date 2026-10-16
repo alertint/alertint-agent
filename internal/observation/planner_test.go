@@ -26,7 +26,7 @@ func basicInput(anchor time.Time) PlannerInput {
 	}
 }
 
-func TestPrometheusPlanFreezesFiringAlertNameForRuleSelection(t *testing.T) {
+func TestPrometheusPlanRetainsAlertNameAfterResolution(t *testing.T) {
 	in := basicInput(time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC))
 	in.Members[0].Labels = map[string]string{"alertname": "ReplicationFailed", "job": "windows"}
 	in.Members[0].SelectorLabels = map[string]string{"job": "windows"}
@@ -49,8 +49,11 @@ func TestPrometheusPlanFreezesFiringAlertNameForRuleSelection(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%v err=%v", plans, err)
 	}
-	if len(plans[0].Parameters) != 0 {
-		t.Fatalf("resolved member must not select a firing rule: %s", plans[0].Parameters)
+	if json.Unmarshal(plans[0].Parameters, &params) != nil || params.AlertName != "ReplicationFailed" {
+		t.Fatalf("resolved member lost advisory rule identity: %s", plans[0].Parameters)
+	}
+	if in.Members[0].Firing {
+		t.Fatal("metric selection changed member lifecycle")
 	}
 }
 
@@ -59,7 +62,7 @@ func TestPrometheusPriorityAdaptsToSmallCycleBudget(t *testing.T) {
 		t.Run(fmt.Sprint(cap), func(t *testing.T) {
 			in := basicInput(time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC))
 			in.Members[0].Labels = map[string]string{"alertname": "ReplicationFailed"}
-			in.Members[0].Firing = true
+			in.Members[0].Firing = false
 			in.Configured[0].MaxRequestsHint = 3
 			in.CycleCap = cap
 			plans, alloc, err := BuildPlans(in)
