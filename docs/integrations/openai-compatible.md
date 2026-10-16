@@ -103,6 +103,13 @@ reply was cut off before the JSON closed. Raise `llm.max_tokens`, or if
 thinking — reasoning output competes with the JSON reply for the same token
 budget.
 
+**WARN `llm: endpoint rejected chat_template_kwargs; …` once after startup** —
+the endpoint does not accept `chat_template_kwargs`, the field self-hosted
+runtimes read for the thinking toggle (some hosted APIs, such as Mistral's,
+answer 400 or 422). AlertINT resends that request without the field and
+leaves it off until the next restart, so analysis carries on;
+`llm.thinking` and `llm.reasoning_effort` have no effect on such an endpoint.
+
 **404 on the very first triage call** — `llm.base_url` is pointed at the
 wrong path. The client always appends `/v1/chat/completions` itself; set
 `base_url` to the endpoint root (`http://localhost:30000`), not a path that

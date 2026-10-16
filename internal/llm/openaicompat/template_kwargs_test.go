@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package openaicompat_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llm/openaicompat"
+)
+
+// Rejection bodies as the hosted APIs return them for the self-hosted
+// chat_template_kwargs extension.
+const (
+	mistralRejection = `{"object":"error","message":{"detail":[{"type":"extra_forbidden",` +
+		`"loc":["body","chat_template_kwargs"],"msg":"Extra inputs are not permitted",` +
+		`"input":{"enable_thinking":false}}]},"type":"invalid_request_error"}`
+	openAIRejection = `{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs",` +
+		`"type":"invalid_request_error","param":null,"code":null}}`
+)
+
+// strictEndpoint rejects any request carrying chat_template_kwargs with the
+// given status and body, and answers everything else successfully. It records
+// whether each request carried the field, in arrival order.
+type strictEndpoint struct {
+	status int
+	body   string
+
+	mu      sync.Mutex
+	carried []bool
+}
+
+func (s *strictEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	_, present := req["chat_template_kwargs"]
+	s.mu.Lock()
+	s.carried = append(s.carried, present)
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if present {
+		w.WriteHeader(s.status)
+		_, _ = w.Write([]byte(s.body))
+		return
+	}
+	_, _ = w.Write([]byte(chatBody(`{"k":1}`, 3, 2)))
+}
+
+func (s *strictEndpoint) requests() []bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]bool(nil), s.carried...)
+}
+
+func TestRejectedTemplateKwargsResentWithoutAndRemembered(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"mistral 422", http.StatusUnprocessableEntity, mistralRejection},
+		{"openai-style 400", http.StatusBadRequest, openAIRejection},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ep := &strictEndpoint{status: tc.status, body: tc.body}
+			srv := httptest.NewServer(ep)
+			defer srv.Close()
+			c := newClient(srv, nil)
+
+			comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "p"}, []string{"k"})
+			if err != nil {
+				t.Fatalf("first Complete: %v", err)
+			}
+			if string(comp.Raw) != `{"k":1}` || comp.InputTokens != 3 || comp.OutputTokens != 2 {
+				t.Errorf("completion = %s in=%d out=%d, want the resend's reply and usage", comp.Raw, comp.InputTokens, comp.OutputTokens)
+			}
+			if got := ep.requests(); len(got) != 2 || !got[0] || got[1] {
+				t.Fatalf("requests carrying the field = %v, want [true false]", got)
+			}
+
+			if _, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+				t.Fatalf("second Complete: %v", err)
+			}
+			if got := ep.requests(); len(got) != 3 || got[2] {
+				t.Fatalf("requests carrying the field = %v, want the later call sent once without it", got)
+			}
+		})
+	}
+}
+
+// TestCompleteOnceRejectedTemplateKwargsResendsOnce pins the one exception to
+// CompleteOnce's single physical request: a request the endpoint refused for
+// the field is resent once, and the dispatch reports the resend's outcome.
+func TestCompleteOnceRejectedTemplateKwargsResendsOnce(t *testing.T) {
+	ep := &strictEndpoint{status: http.StatusUnprocessableEntity, body: mistralRejection}
+	srv := httptest.NewServer(ep)
+	defer srv.Close()
+	c := newClient(srv, nil)
+
+	comp, err := c.CompleteOnce(context.Background(), "", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err != nil {
+		t.Fatalf("CompleteOnce: %v", err)
+	}
+	if comp.RequestStarted != llm.RequestStartStatusTrue {
+		t.Errorf("RequestStarted = %q, want %q", comp.RequestStarted, llm.RequestStartStatusTrue)
+	}
+	if got := ep.requests(); len(got) != 2 || !got[0] || got[1] {
+		t.Fatalf("requests carrying the field = %v, want [true false]", got)
+	}
+
+	if _, err := c.CompleteOnce(context.Background(), "", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+		t.Fatalf("second CompleteOnce: %v", err)
+	}
+	if got := ep.requests(); len(got) != 3 || got[2] {
+		t.Fatalf("requests carrying the field = %v, want the later call sent once without it", got)
+	}
+}
+
+func TestResendObservedAsSeparateRequests(t *testing.T) {
+	ep := &strictEndpoint{status: http.StatusUnprocessableEntity, body: mistralRejection}
+	srv := httptest.NewServer(ep)
+	defer srv.Close()
+	c := newClient(srv, nil)
+
+	var observed []error
+	ctx := llm.WithRequestObserver(context.Background(), func(_ llm.Completion, err error) {
+		observed = append(observed, err)
+	})
+	if _, err := c.Complete(ctx, "sys", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(observed) != 2 {
+		t.Fatalf("observed %d requests, want 2 (the refused one and the resend)", len(observed))
+	}
+	var api *llm.APIError
+	if !errors.As(observed[0], &api) || api.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("first observation = %v, want the 422 APIError", observed[0])
+	}
+	if observed[1] != nil {
+		t.Errorf("second observation = %v, want nil", observed[1])
+	}
+}
+
+func TestUnrelatedValidationErrorNotResent(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"detail":[{"type":"missing","loc":["body","messages"]}]}`))
+	}))
+	defer srv.Close()
+	c := newClient(srv, nil)
+
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "p"}, nil)
+	var api *llm.APIError
+	if !errors.As(err, &api) || api.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("err = %v, want the 422 APIError", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
+	}
+}
+
+// TestRejectionNamingUnsentFieldNotResent covers a body that names the field
+// although the request never carried it: there is nothing to drop, so the
+// error stands.
+func TestRejectionNamingUnsentFieldNotResent(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(openAIRejection))
+	}))
+	defer srv.Close()
+	c := openaicompat.NewForTest(openaicompat.Config{BaseURL: srv.URL, Model: "gpt-5", TimeoutSeconds: 5}, true)
+
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "p"}, nil)
+	var api *llm.APIError
+	if !errors.As(err, &api) || api.StatusCode != http.StatusBadRequest {
+		t.Fatalf("err = %v, want the 400 APIError", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
+	}
+}
+
+// TestEchoedFieldKeepsPin covers a validation error that merely echoes the
+// request body, field included: the resend fails the same way, so the field
+// was not the problem and later calls still carry the pin.
+func TestEchoedFieldKeepsPin(t *testing.T) {
+	var mu sync.Mutex
+	var carried []bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_, present := req["chat_template_kwargs"]
+		mu.Lock()
+		carried = append(carried, present)
+		mu.Unlock()
+		echo, _ := json.Marshal(req)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"detail":[{"type":"string_too_long","loc":["body"],"input":` + string(echo) + `}]}`))
+	}))
+	defer srv.Close()
+	c := newClient(srv, nil)
+
+	for i := 0; i < 2; i++ {
+		_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "p"}, nil)
+		var api *llm.APIError
+		if !errors.As(err, &api) || api.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("call %d: err = %v, want the 422 APIError", i+1, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []bool{true, false, true, false}; fmt.Sprint(carried) != fmt.Sprint(want) {
+		t.Fatalf("requests carrying the field = %v, want %v", carried, want)
+	}
+}
+
+// TestInconclusiveResendKeepsPin: a rate-limited resend proves nothing about
+// the field, so the pin stays on and the dispatch reports the rate limit.
+func TestInconclusiveResendKeepsPin(t *testing.T) {
+	var mu sync.Mutex
+	var carried []bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_, present := req["chat_template_kwargs"]
+		mu.Lock()
+		carried = append(carried, present)
+		mu.Unlock()
+		if present {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(mistralRejection))
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	c := newClient(srv, nil)
+
+	for i := 0; i < 2; i++ {
+		comp, err := c.CompleteOnce(context.Background(), "", llm.Prompt{Prefix: "p"}, nil)
+		var retry *llm.RetryableError
+		if !errors.As(err, &retry) || retry.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("call %d: err = %v, want the 429 RetryableError", i+1, err)
+		}
+		if comp.RequestStarted != llm.RequestStartStatusTrue {
+			t.Errorf("call %d: RequestStarted = %q, want %q", i+1, comp.RequestStarted, llm.RequestStartStatusTrue)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []bool{true, false, true, false}; fmt.Sprint(carried) != fmt.Sprint(want) {
+		t.Fatalf("requests carrying the field = %v, want %v", carried, want)
+	}
+}
