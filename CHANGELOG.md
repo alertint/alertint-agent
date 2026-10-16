@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule identity after resolution and explicitly label current-rule metric hints
   as advisory when no matching alert is firing; preserve scope, sampling resolution,
   request budgets and truthful coverage limits (#138).
+- Keep readiness responsive during large profile-guidance reads while preserving
+  complete guidance and a consistent committed snapshot of mappings and heads.
+- Let local observations complete under the controller deadline after the external
+  source I/O budget expires, while preserving cancellation and external limits.
+
+### Upgrade notes
+
+- Migration 0046 records published profile-head history for bounded reads and
+  backfills existing heads. Back up before upgrading; rollback requires restoring
+  the backup.
 
 ## [0.15.3] - 2026-10-14
 
