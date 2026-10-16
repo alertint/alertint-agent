@@ -105,9 +105,9 @@ func (r *Runner) RunPhase(ctx context.Context, f model.Fence, cycle model.Cycle,
 // RunPhaseBounded executes every plan in cycle.Draft.Plans whose Phase
 // matches phase and that has no committed run yet, in fairness-tier order
 // (local, time-sensitive, optional, routine, reuse). ioCtx bounds connector
-// I/O only (the preparation wall); ctx bounds persistence (the still-live
-// controller claim), so a source that exhausts the wall still leaves
-// durable, honest evidence: every remaining plan commits as
+// I/O only (the preparation wall); ctx bounds local reads and persistence
+// under the still-live controller claim, so an exhausted wall still leaves
+// durable, honest evidence: every remaining external plan commits as
 // withheld_by_budget with LimitationWallExhausted and the controller keeps
 // its own commit. While the cycle's protected optional plan is still
 // pending, time-sensitive work runs under ioCtx shortened by the frozen
@@ -164,6 +164,9 @@ func (r *Runner) RunPhaseBounded(ctx, ioCtx context.Context, f model.Fence, cycl
 			run = withheldByWallRun(p, r.clock())
 		default:
 			planCtx := ioCtx
+			if p.Tier == model.TierLocal {
+				planCtx = ctx
+			}
 			var cancel context.CancelFunc
 			if optionalPending && p.Tier == model.TierTimeSensitive && optionalWall > 0 {
 				if deadline, ok := ioCtx.Deadline(); ok {
@@ -185,8 +188,9 @@ func (r *Runner) RunPhaseBounded(ctx, ioCtx context.Context, f model.Fence, cycl
 	return nil
 }
 
-// runOne dispatches p through its executor: connector I/O under ioCtx,
-// every durable reservation/outcome under ctx.
+// runOne dispatches p through its executor under the selected execution
+// context: the I/O wall for external calls, the controller context for local
+// reads. Every durable reservation/outcome remains under ctx.
 func (r *Runner) runOne(ctx, ioCtx context.Context, f model.Fence, cycle model.Cycle, p model.Plan) model.Run {
 	executor, ok := r.executors[p.Capability]
 	if !ok {
