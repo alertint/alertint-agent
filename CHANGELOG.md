@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Keep readiness responsive during large profile-guidance reads while preserving
   complete guidance and a consistent committed snapshot of mappings and heads.
+- Let local observations complete under the controller deadline after the external
+  source I/O budget expires, while preserving cancellation and external limits.
 
 ### Upgrade notes
 
