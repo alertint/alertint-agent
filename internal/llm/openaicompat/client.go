@@ -116,6 +116,10 @@ type Client struct {
 	// for good once any other endpoint rejects the field and then accepts the
 	// same request without it.
 	pinChatTemplateKwargs atomic.Bool
+	// pendingRejection holds a refusal of the field whose resend never left
+	// (the budget declined it). The next request is sent without the field
+	// first, so a one-call budget does not spend every slot on the refusal.
+	pendingRejection atomic.Pointer[error]
 	// hosted marks the endpoint as hosted OpenAI: Probe uses the model-
 	// metadata route instead of the generic health/models routes.
 	hosted bool
@@ -320,9 +324,24 @@ type tokenUsage struct {
 // MaxRetries; CompleteOnce calls it with 0 — see anthropic's callWithRetry
 // doc comment for the shared rationale. A request refused for carrying
 // chat_template_kwargs is resent once without it, outside that retry count.
+// When the budget declines that resend, the next request goes without the
+// field instead of repeating the refused one.
 func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt, maxRetries int) (json.RawMessage, tokenUsage, error) {
 	return llm.CallWithRetry(ctx, c.logger, maxRetries, c.cfg.BaseRetryDelay,
 		func(ctx context.Context) (json.RawMessage, tokenUsage, error) {
+			if prev := c.pendingRejection.Load(); prev != nil && c.pinChatTemplateKwargs.Load() {
+				raw, usage, err := c.observedRequest(ctx, system, prompt, false)
+				if errors.Is(err, llm.ErrRequestNotSent) {
+					return raw, usage, err
+				}
+				c.pendingRejection.CompareAndSwap(prev, nil)
+				if acceptedResponse(err) {
+					c.stopTemplateKwargs(*prev)
+				}
+				// Any other outcome leaves the field unproven: later
+				// requests carry it again.
+				return raw, usage, err
+			}
 			raw, usage, err := c.observedRequest(ctx, system, prompt, c.pinChatTemplateKwargs.Load())
 			if !errors.Is(err, errTemplateKwargsRejected) {
 				return raw, usage, err
@@ -333,6 +352,7 @@ func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Pr
 				// The resend never left (e.g. the budget declined it), but
 				// the refused request did: report that one, so the caller
 				// does not record this call as never sent.
+				c.pendingRejection.Store(&rejected)
 				return nil, tokenUsage{}, rejected
 			}
 			if acceptedResponse(err) {

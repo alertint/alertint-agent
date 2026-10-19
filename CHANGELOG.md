@@ -20,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source I/O budget expires, while preserving cancellation and external limits.
 - Resend an OpenAI-compatible request once without `chat_template_kwargs` when the
   endpoint rejects that field (a 400 or 422 naming it, as Mistral's API returns),
-  and stop sending it until restart. Previously every LLM call against such an
-  endpoint failed. `llm.thinking` and `llm.reasoning_effort` have no effect there.
+  and stop sending it until restart once a request without it is accepted. When
+  `llm.budget.calls_per_hour` declines the resend, the next permitted request goes
+  without the field. Previously every LLM call against such an endpoint failed.
+  `llm.thinking` and `llm.reasoning_effort` have no effect there.
 
 ### Upgrade notes
 
