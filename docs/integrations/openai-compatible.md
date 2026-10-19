@@ -106,9 +106,12 @@ budget.
 **WARN `llm: endpoint rejected chat_template_kwargs; …` once after startup** —
 the endpoint does not accept `chat_template_kwargs`, the field self-hosted
 runtimes read for the thinking toggle (some hosted APIs, such as Mistral's,
-answer 400 or 422). AlertINT resends that request without the field and
-leaves it off until the next restart, so analysis carries on;
-`llm.thinking` and `llm.reasoning_effort` have no effect on such an endpoint.
+answer 400 or 422). AlertINT resends that request without the field and,
+once the endpoint accepts it, leaves the field off until the next restart, so
+analysis carries on; `llm.thinking` and `llm.reasoning_effort` have no effect
+on such an endpoint. If `llm.budget.calls_per_hour` declines the resend, the
+next permitted request goes without the field instead: with a one-call budget,
+the first hour's call is spent on the refusal.
 
 **404 on the very first triage call** — `llm.base_url` is pointed at the
 wrong path. The client always appends `/v1/chat/completions` itself; set

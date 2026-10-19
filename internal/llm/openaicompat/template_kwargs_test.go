@@ -3,14 +3,18 @@
 package openaicompat_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llm/openaicompat"
@@ -262,5 +266,142 @@ func TestInconclusiveResendKeepsPin(t *testing.T) {
 	defer mu.Unlock()
 	if want := []bool{true, false, true, false}; fmt.Sprint(carried) != fmt.Sprint(want) {
 		t.Fatalf("requests carrying the field = %v, want %v", carried, want)
+	}
+}
+
+// memBudgetStore is an in-memory llm.BudgetStore; nextHour drops the recorded
+// calls, as the rolling hour passing would.
+type memBudgetStore struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (s *memBudgetStore) UpdateLLMBudget(_ context.Context, update func([]byte) ([]byte, error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data == nil {
+		s.data = []byte("{}")
+	}
+	next, err := update(s.data)
+	if err == nil {
+		s.data = next
+	}
+	return err
+}
+
+func (s *memBudgetStore) nextHour(t *testing.T) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var state map[string]any
+	if err := json.Unmarshal(s.data, &state); err != nil {
+		t.Fatal(err)
+	}
+	state["calls"] = []any{}
+	next, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.data = next
+}
+
+// TestBudgetDeclinedResendSendsNextWithoutField covers a call budget that the
+// refusals use up, so every resend is declined: with one call per hour, or
+// two calls racing the first refusal under two per hour. The next permitted
+// request goes without the field, and once it is accepted the field stays off.
+func TestBudgetDeclinedResendSendsNextWithoutField(t *testing.T) {
+	for _, racers := range []int{1, 2} {
+		t.Run(fmt.Sprintf("%d per hour", racers), func(t *testing.T) {
+			var mu sync.Mutex
+			var carried []bool
+			var refusals int
+			allRefused := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				_, present := req["chat_template_kwargs"]
+				mu.Lock()
+				carried = append(carried, present)
+				if present {
+					refusals++
+					if refusals == racers {
+						close(allRefused)
+					}
+				}
+				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				if present {
+					// Hold each refusal until every racer has sent, so
+					// all of them reserve before any resend does.
+					select {
+					case <-allRefused:
+					case <-time.After(5 * time.Second):
+					}
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_, _ = w.Write([]byte(mistralRejection))
+					return
+				}
+				_, _ = w.Write([]byte(chatBody(`{"k":1}`, 3, 2)))
+			}))
+			defer srv.Close()
+			store := &memBudgetStore{}
+			var logs bytes.Buffer
+			c := openaicompat.New(openaicompat.Config{
+				BaseURL:        srv.URL,
+				Model:          "mistral-medium-latest",
+				TimeoutSeconds: 5,
+				Budget:         llm.NewBudget(store, llm.BudgetLimits{CallsPerHour: racers}),
+			}, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+			call := func() (llm.OneShotCompletion, error) {
+				return c.CompleteOnce(context.Background(), "", llm.Prompt{Prefix: "p"}, []string{"k"})
+			}
+
+			var wg sync.WaitGroup
+			for i := 0; i < racers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					comp, err := call()
+					var api *llm.APIError
+					if !errors.As(err, &api) || api.StatusCode != http.StatusUnprocessableEntity {
+						t.Errorf("first hour: err = %v, want the 422 APIError", err)
+					}
+					if comp.RequestStarted != llm.RequestStartStatusTrue {
+						t.Errorf("first hour: RequestStarted = %q, want %q", comp.RequestStarted, llm.RequestStartStatusTrue)
+					}
+				}()
+			}
+			wg.Wait()
+
+			// Same hour: the budget is spent, nothing leaves.
+			comp, err := call()
+			if !errors.Is(err, llm.ErrRequestNotSent) || comp.RequestStarted != llm.RequestStartStatusFalse {
+				t.Fatalf("spent hour: err = %v RequestStarted = %q, want not sent", err, comp.RequestStarted)
+			}
+
+			for hour := 1; hour <= 2; hour++ {
+				store.nextHour(t)
+				comp, err := call()
+				if err != nil {
+					t.Fatalf("hour %d: %v", hour, err)
+				}
+				if string(comp.Raw) != `{"k":1}` {
+					t.Errorf("hour %d: Raw = %s, want the reply", hour, comp.Raw)
+				}
+			}
+			mu.Lock()
+			got := fmt.Sprint(carried)
+			mu.Unlock()
+			want := make([]bool, racers, racers+2)
+			for i := range want {
+				want[i] = true
+			}
+			if want = append(want, false, false); got != fmt.Sprint(want) {
+				t.Fatalf("requests carrying the field = %s, want %v", got, want)
+			}
+			if n := strings.Count(logs.String(), "endpoint rejected chat_template_kwargs"); n != 1 {
+				t.Errorf("warnings = %d, want 1:\n%s", n, logs.String())
+			}
+		})
 	}
 }
