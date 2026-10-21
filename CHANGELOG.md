@@ -9,8 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Read Situation delivery history from a small per-Transition summary instead of
+  every stored projection, so the reply history check and the controller's input
+  load no longer grow in time and memory with a long-lived Situation's alert list
+  (#99).
 - Build with Go 1.26.10 to address the Go `crypto/x509` security advisory
   GO-2026-6809.
+
+### Upgrade notes
+
+- Migration 0047 adds a summary row per Situation Transition and backfills it from
+  existing Transitions on first startup. The backfill reads every stored
+  projection once, so first startup takes longer on large databases (about 10s
+  for 850 MB). Back up before upgrading; rollback requires restoring the backup.
 
 ## [0.15.4] - 2026-10-19
 
