@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every stored projection, so the reply history check and the controller's input
   load no longer grow in time and memory with a long-lived Situation's alert list
   (#99).
+- Run readiness and health checks on their own read-only database connection, so
+  a long store call no longer fails `/ready`. `/health` reports store connection
+  waits under `storage`, and the agent logs `store: connection congested` when
+  store calls wait 10s or more in total within a minute.
 - Build with Go 1.26.10 to address the Go `crypto/x509` security advisory
   GO-2026-6809.
 

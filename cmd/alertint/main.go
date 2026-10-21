@@ -189,6 +189,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer func() { _ = st.Close() }()
 	finalizeStagedRestoreIfApplied(ctx, st, stagedInfo, logger)
+	go st.WatchConnectionWait(ctx, logger, time.Minute, 10*time.Second)
 
 	pruneChangesAtStartup(ctx, cfg, st, logger)
 

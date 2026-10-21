@@ -104,7 +104,8 @@ Things worth knowing before the first real install:
   [Backup & restore](backup-restore.md) describes.
 - **Health probes.** From v0.15, startup and liveness use `/live`, which does
   not wait for SQLite or external sources. Readiness uses `/ready`, with a
-  one-second storage check. Startup allows five minutes for migrations and
+  one-second storage check on its own read-only connection, so a long store
+  call does not remove readiness. Startup allows five minutes for migrations and
   recovery; increase `probes.startup.failureThreshold` for larger backlogs.
   `/health` remains available for diagnostic status. When overriding the image
   with v0.14 or earlier, use its matching chart: those images lack these routes.

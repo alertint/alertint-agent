@@ -42,6 +42,10 @@ var migrationsFS embed.FS
 // Store is the agent's persistence handle.
 type Store struct {
 	db *sql.DB
+	// probe is a second, read-only, one-connection handle on the same
+	// database for readiness and health checks (see Probe). db keeps one
+	// connection, so a probe queued on it waited out every long store call.
+	probe *sql.DB
 
 	// semanticProfileMaxAttempts is Plan 4 Task 7's own injected config
 	// value — see SetSemanticProfileMaxAttempts.
@@ -73,6 +77,13 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	probe, err := sql.Open("sqlite", buildProbeDSN(dbPath))
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: open probe %s: %w", dbPath, err)
+	}
+	probe.SetMaxOpenConns(1)
+	s.probe = probe
 	return s, nil
 }
 
@@ -82,7 +93,13 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 func (s *Store) DB() *sql.DB { return s.db }
 
 // Close releases resources held by the store.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.probe != nil {
+		err = errors.Join(err, s.probe.Close())
+	}
+	return err
+}
 
 // buildDSN constructs the modernc.org/sqlite DSN. We use file: URIs so
 // PRAGMA arguments compose cleanly. ":memory:" is converted to a unique
