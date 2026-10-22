@@ -62,14 +62,31 @@ type membershipDigestDTO struct {
 // earliest delivery (deliveryLess' (source_time,received_at,id) ordering —
 // never row/slice/insertion order, and never a lexical comparison of IDs).
 func MembershipDigest(incidentID string, deliveries []Delivery) string {
-	scoped := make([]Delivery, 0, len(deliveries))
-	for _, d := range deliveries {
-		if d.IncidentID != incidentID {
-			continue
-		}
-		scoped = append(scoped, d)
-	}
+	return membershipDigest(incidentID, incidentMembers(incidentID, deliveries))
+}
 
+// incidentMembers returns incidentID's deliveries, allocated for those
+// alone: callers pass every delivery of a Situation, which can be thousands
+// across hundreds of Incidents (#99).
+func incidentMembers(incidentID string, deliveries []Delivery) []Delivery {
+	n := 0
+	for i := range deliveries {
+		if deliveries[i].IncidentID == incidentID {
+			n++
+		}
+	}
+	scoped := make([]Delivery, 0, n)
+	for _, d := range deliveries {
+		if d.IncidentID == incidentID {
+			scoped = append(scoped, d)
+		}
+	}
+	return scoped
+}
+
+// membershipDigest is MembershipDigest over deliveries already scoped to
+// incidentID.
+func membershipDigest(incidentID string, scoped []Delivery) string {
 	earliestByAlert := make(map[string]Delivery, len(scoped))
 	for _, d := range scoped {
 		cur, ok := earliestByAlert[d.AlertID]
@@ -158,14 +175,8 @@ type incidentInputDigestDTO struct {
 // evidence cannot reach this function because it has no parameter that
 // could carry them.
 func IncidentInputDigest(incidentID, groupKey string, deliveries []Delivery) string {
-	membership := MembershipDigest(incidentID, deliveries)
-
-	scoped := make([]Delivery, 0, len(deliveries))
-	for _, d := range deliveries {
-		if d.IncidentID == incidentID {
-			scoped = append(scoped, d)
-		}
-	}
+	scoped := incidentMembers(incidentID, deliveries)
+	membership := membershipDigest(incidentID, scoped)
 	sort.Slice(scoped, func(i, j int) bool { return deliveryLess(scoped[i], scoped[j]) })
 
 	dtos := make([]incidentInputDeliveryDTO, 0, len(scoped))

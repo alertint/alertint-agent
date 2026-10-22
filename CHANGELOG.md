@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different content` when an alert joined one of its Incidents between two
   reconciles of the same input. Incident membership and symptom facts now record
   each distinct observation, as the triage facts already did.
+- Cut the CPU and memory a long-lived Situation's reconcile spends on per-Incident
+  digests and delivery history. Each digest now allocates for its Incident's own
+  deliveries rather than every delivery of the Situation, and each history load
+  prepares its page queries once. At 255 Incidents and 2,827 deliveries, one pass
+  of the digests went from 607 MB allocated to 5 MB.
 - Build with Go 1.26.10 to address the Go `crypto/x509` security advisory
   GO-2026-6809.
 

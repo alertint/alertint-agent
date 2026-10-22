@@ -80,6 +80,18 @@ type deliveryHistoryPointer struct {
 }
 
 func (s *Store) loadDeliveryHistory(ctx context.Context, snapshot deliveryHistorySnapshot) ([]situation.Delivery, error) {
+	// One load reads hundreds of pages for a long-lived Situation; preparing
+	// each page query once spares SQLite parsing it again per page (#99).
+	byIncident, err := s.db.PrepareContext(ctx, `SELECT ad.id,ad.received_at,owner.created_at FROM incident_alert_deliveries owner JOIN alert_deliveries ad ON ad.id=owner.delivery_id WHERE owner.incident_id=? AND owner.delivery_id>? AND owner.rowid<=? AND ad.rowid<=? ORDER BY owner.delivery_id LIMIT ?`)
+	if err != nil {
+		return nil, fmt.Errorf("store: prepare delivery page: %w", err)
+	}
+	defer func() { _ = byIncident.Close() }()
+	byAlert, err := s.db.PrepareContext(ctx, `SELECT ad.id,ad.received_at,owner.created_at FROM alert_deliveries ad INDEXED BY alert_deliveries_alert_id_page_idx JOIN incident_alert_deliveries owner ON owner.delivery_id=ad.id WHERE ad.alert_id=? AND ad.id>? AND ad.rowid<=? AND owner.rowid<=? ORDER BY ad.id LIMIT ?`)
+	if err != nil {
+		return nil, fmt.Errorf("store: prepare delivery page: %w", err)
+	}
+	defer func() { _ = byAlert.Close() }()
 	out := []situation.Delivery{}
 	type key struct{ incidentID, deliveryID string }
 	seen := make(map[key]bool)
@@ -93,9 +105,9 @@ func (s *Store) loadDeliveryHistory(ctx context.Context, snapshot deliveryHistor
 			var rows *sql.Rows
 			var err error
 			if alertID == "" {
-				rows, err = s.db.QueryContext(ctx, `SELECT ad.id,ad.received_at,owner.created_at FROM incident_alert_deliveries owner JOIN alert_deliveries ad ON ad.id=owner.delivery_id WHERE owner.incident_id=? AND owner.delivery_id>? AND owner.rowid<=? AND ad.rowid<=? ORDER BY owner.delivery_id LIMIT ?`, incidentID, cursor, snapshot.ownershipMax, snapshot.deliveryMax, deliveryHistoryPageSize)
+				rows, err = byIncident.QueryContext(ctx, incidentID, cursor, snapshot.ownershipMax, snapshot.deliveryMax, deliveryHistoryPageSize)
 			} else {
-				rows, err = s.db.QueryContext(ctx, `SELECT ad.id,ad.received_at,owner.created_at FROM alert_deliveries ad INDEXED BY alert_deliveries_alert_id_page_idx JOIN incident_alert_deliveries owner ON owner.delivery_id=ad.id WHERE ad.alert_id=? AND ad.id>? AND ad.rowid<=? AND owner.rowid<=? ORDER BY ad.id LIMIT ?`, alertID, cursor, snapshot.deliveryMax, snapshot.ownershipMax, deliveryHistoryPageSize)
+				rows, err = byAlert.QueryContext(ctx, alertID, cursor, snapshot.deliveryMax, snapshot.ownershipMax, deliveryHistoryPageSize)
 			}
 			if err != nil {
 				return fmt.Errorf("store: read delivery page: %w", err)
