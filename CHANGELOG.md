@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a long store call no longer fails `/ready`. `/health` reports store connection
   waits under `storage`, and the agent logs `store: connection congested` when
   store calls wait 10s or more in total within a minute.
+- Stop a Situation's reconcile failing with `immutable record already exists with
+  different content` when an alert joined one of its Incidents between two
+  reconciles of the same input. Incident membership and symptom facts now record
+  each distinct observation, as the triage facts already did.
 - Build with Go 1.26.10 to address the Go `crypto/x509` security advisory
   GO-2026-6809.
 

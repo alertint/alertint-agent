@@ -258,6 +258,70 @@ func TestCapabilityLimitationFactIdentityChangesWhenReservedListChangesAtSameInp
 	}
 }
 
+// ----------------------------------------------------------------------
+// Live member deliveries (#99): incident_membership, source_symptom_state
+// and source_lifecycle_summary derive from the Situation's member
+// deliveries, which the controller reads live when it loads its input. A
+// delivery can be attached to an Incident before the Situation input that
+// announces it is applied, so a second reconcile of the same input_version
+// can see one more delivery. Their identity folds in the content digest,
+// as for the triage kinds above, or that reconcile fails closed with
+// ErrImmutableConflict.
+// ----------------------------------------------------------------------
+
+func TestIncidentMembershipFactIdentityChangesWhenADeliveryAttachesAtSameInputVersion(t *testing.T) {
+	in := baseSnapshotInput(t)
+	before := findFact(t, DeriveStoreFacts(in), "incident_membership", "incident-1")
+
+	in2 := in
+	in2.Deliveries = append([]Delivery{}, in.Deliveries...)
+	in2.Deliveries = append(in2.Deliveries, deliveryFor("delivery-2", "incident-1", "payload-digest-2", in.Situation.EffectiveStartedAt.Add(time.Minute)))
+	after := findFact(t, DeriveStoreFacts(in2), "incident_membership", "incident-1")
+
+	if before.Digest == after.Digest {
+		t.Fatal("test setup: the attached delivery must change the membership content")
+	}
+	if before.ID == after.ID {
+		t.Fatalf("incident_membership fact ID unchanged although a delivery attached at the same input_version %d: %q",
+			in.Situation.InputVersion, before.ID)
+	}
+}
+
+func TestSymptomFactIdentitiesChangeWhenAResolveArrivesAtSameInputVersion(t *testing.T) {
+	in := baseSnapshotInput(t)
+	facts := DeriveStoreFacts(in)
+	symptomBefore := findFact(t, facts, "source_symptom_state", "incident-1")
+	summaryBefore := findFact(t, facts, "source_lifecycle_summary", sourceLifecycleSummarySubject)
+
+	resolve := deliveryFor("delivery-1-resolved", "incident-1", "payload-digest-1r", in.Situation.EffectiveStartedAt.Add(time.Minute))
+	resolve.AlertID = "delivery-1"
+	resolve.Status = model.DeliveryStatusResolved
+	in2 := in
+	in2.Deliveries = append(append([]Delivery{}, in.Deliveries...), resolve)
+	facts2 := DeriveStoreFacts(in2)
+	symptomAfter := findFact(t, facts2, "source_symptom_state", "incident-1")
+	summaryAfter := findFact(t, facts2, "source_lifecycle_summary", sourceLifecycleSummarySubject)
+
+	if symptomBefore.Digest == symptomAfter.Digest || summaryBefore.Digest == summaryAfter.Digest {
+		t.Fatal("test setup: the resolve must change the symptom state and the lifecycle summary")
+	}
+	if symptomBefore.ID == symptomAfter.ID {
+		t.Fatalf("source_symptom_state fact ID unchanged although a resolve arrived at the same input_version: %q", symptomBefore.ID)
+	}
+	if summaryBefore.ID == summaryAfter.ID {
+		t.Fatalf("source_lifecycle_summary fact ID unchanged although a resolve arrived at the same input_version: %q", summaryBefore.ID)
+	}
+}
+
+func TestNovelSymptomReasonCitesTheSymptomFactIDs(t *testing.T) {
+	in := baseSnapshotInput(t)
+	symptoms := deriveSymptoms(in.Deliveries)
+	want := findFact(t, DeriveStoreFacts(in), "source_symptom_state", "incident-1").ID
+	if got := sourceSymptomStateFactID(in.Situation.ID, in.Situation.InputVersion, symptoms[0]); got != want {
+		t.Fatalf("novel_symptom evidence ref = %q, want the source_symptom_state fact ID %q", got, want)
+	}
+}
+
 func TestStoreFactsSortedByKindSubjectID(t *testing.T) {
 	in := baseSnapshotInput(t)
 	facts := DeriveStoreFacts(in)

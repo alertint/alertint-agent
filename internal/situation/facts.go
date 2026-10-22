@@ -169,13 +169,17 @@ func factIdentity(prefix, situationID string, inputVersion int, subject string) 
 // request/skip decision, applied inside CommitController) already changes
 // what the VERY NEXT reconcile of the unchanged input observes, and so does
 // an independent Acute Triage worker completing/backing off/exhausting an
-// attempt in between two controller cycles. Every other fact kind
-// (incident_membership, source_symptom_state, current_duration, ...) reads
-// only data that changes exactly when input_version does, so
-// factIdentity's plain (prefix, situationID, inputVersion, subject) scheme
-// is already a stable identity for those. For these two, appending the
-// content digest makes each genuinely DISTINCT observation (a different
-// Phase, a newly-completed attempt) its own immutable row — collapsing back
+// attempt in between two controller cycles. incident_membership,
+// source_symptom_state and source_lifecycle_summary are content-keyed for
+// the same reason (#99): they derive from the member deliveries the
+// controller reads live, and a delivery can be attached to an Incident
+// before the Situation input announcing it is applied, so a second
+// reconcile of the same input_version can see one more delivery.
+// current_duration and prior_situation_duration_distribution keep
+// factIdentity's plain (prefix, situationID, inputVersion, subject) scheme.
+// For the content-keyed kinds, appending the content digest makes each
+// genuinely DISTINCT observation (a different Phase, a newly-completed
+// attempt, one more member delivery) its own immutable row — collapsing back
 // to the SAME id, and so a safe idempotent no-op via AppendSituationFacts'
 // own ON CONFLICT DO NOTHING, only when the content is ALSO unchanged.
 // Without this, a second reconcile of an unchanged input that observes
@@ -223,9 +227,9 @@ type sourceSymptomStateFactValue struct {
 func deriveSymptomStateFacts(situationID string, inputVersion int, now time.Time, symptoms []Symptom) []model.Fact {
 	facts := make([]model.Fact, 0, len(symptoms))
 	for _, s := range symptoms {
-		value := sourceSymptomStateFactValue{Key: s.Key, Status: string(s.Status), FirstObservedAt: s.FirstObservedAt}
+		value := symptomStateFactValue(s)
 		facts = append(facts, model.Fact{
-			ID:           factIdentity(factKindSourceSymptomState, situationID, inputVersion, s.Key),
+			ID:           sourceSymptomStateFactID(situationID, inputVersion, s),
 			SituationID:  situationID,
 			Kind:         factKindSourceSymptomState,
 			Subject:      s.Key,
@@ -238,6 +242,16 @@ func deriveSymptomStateFacts(situationID string, inputVersion int, now time.Time
 		})
 	}
 	return facts
+}
+
+func symptomStateFactValue(s Symptom) sourceSymptomStateFactValue {
+	return sourceSymptomStateFactValue{Key: s.Key, Status: string(s.Status), FirstObservedAt: s.FirstObservedAt}
+}
+
+// sourceSymptomStateFactID is s's source_symptom_state fact ID, which the
+// novel_symptom reason also cites as evidence.
+func sourceSymptomStateFactID(situationID string, inputVersion int, s Symptom) string {
+	return factIdentityWithContent(factKindSourceSymptomState, situationID, inputVersion, s.Key, canonicalDigest(symptomStateFactValue(s)))
 }
 
 // ---- source_lifecycle_summary ----
@@ -266,12 +280,13 @@ func deriveLifecycleSummaryFact(situationID string, inputVersion int, now time.T
 		// acute_finding's unwired-reader nil case below.
 		status = model.FactConfirmedEmpty
 	}
+	digest := canonicalDigest(value)
 	return model.Fact{
-		ID:           factIdentity(factKindSourceLifecycleSummary, situationID, inputVersion, sourceLifecycleSummarySubject),
+		ID:           factIdentityWithContent(factKindSourceLifecycleSummary, situationID, inputVersion, sourceLifecycleSummarySubject, digest),
 		SituationID:  situationID,
 		Kind:         factKindSourceLifecycleSummary,
 		Subject:      sourceLifecycleSummarySubject,
-		Digest:       canonicalDigest(value),
+		Digest:       digest,
 		InputVersion: inputVersion,
 		Value:        mustMarshal(value),
 		ResultStatus: status,
@@ -328,12 +343,13 @@ func deriveIncidentMembershipFacts(in SnapshotInput) []model.Fact {
 			IncidentInputDigest: IncidentInputDigest(inc.ID, inc.GroupKey, in.Deliveries),
 			MemberCount:         memberCount,
 		}
+		digest := canonicalDigest(value)
 		facts = append(facts, model.Fact{
-			ID:           factIdentity(factKindIncidentMembership, in.Situation.ID, in.Situation.InputVersion, inc.ID),
+			ID:           factIdentityWithContent(factKindIncidentMembership, in.Situation.ID, in.Situation.InputVersion, inc.ID, digest),
 			SituationID:  in.Situation.ID,
 			Kind:         factKindIncidentMembership,
 			Subject:      inc.ID,
-			Digest:       canonicalDigest(value),
+			Digest:       digest,
 			InputVersion: in.Situation.InputVersion,
 			Value:        mustMarshal(value),
 			ResultStatus: model.FactConfirmedValue,

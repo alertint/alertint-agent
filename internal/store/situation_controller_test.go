@@ -137,6 +137,39 @@ func TestAppendSituationFactsConflictingContentFailsClosed(t *testing.T) {
 	}
 }
 
+// TestAppendDerivedFactsAfterADeliveryAttachesAtSameInputVersion is #99's
+// fact conflict: a delivery attached to an Incident before its Situation
+// input is applied is visible to a second reconcile of the same
+// input_version. The facts that reconcile derives must append, not fail
+// closed with ErrImmutableConflict.
+func TestAppendDerivedFactsAfterADeliveryAttachesAtSameInputVersion(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-facts-attach", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	delivery := func(id string, at time.Time) situation.Delivery {
+		return situation.Delivery{ID: id, IncidentID: "inc-1", AlertID: id, Status: situationmodel.DeliveryStatusFiring,
+			PayloadDigest: "payload-" + id, ReceivedAt: at}
+	}
+	in := situation.SnapshotInput{
+		Situation:  claim.Situation,
+		Deliveries: []situation.Delivery{delivery("delivery-1", now)},
+		Incidents: []situation.IncidentState{{ID: "inc-1", GroupKey: "group-facts-attach", Status: "ready",
+			FirstAlertAt: now, LastAlertAt: now, ReadyAt: now, AlertCount: 1}},
+		Now: now,
+	}
+	if err := st.AppendSituationFacts(context.Background(), claim, situation.DeriveStoreFacts(in)); err != nil {
+		t.Fatalf("first reconcile's facts: %v", err)
+	}
+
+	in.Deliveries = append(in.Deliveries, delivery("delivery-2", now.Add(time.Second)))
+	in.Now = now.Add(time.Minute)
+	if err := st.AppendSituationFacts(context.Background(), claim, situation.DeriveStoreFacts(in)); err != nil {
+		t.Fatalf("second reconcile of input_version %d with one more attached delivery: %v", in.Situation.InputVersion, err)
+	}
+}
+
 // TestAppendSituationFactsLaterObservedAtSameContentSucceeds is the Task 10
 // replay finding's own regression test: DeriveStoreFacts (internal/situation/
 // facts.go) sets every fact's ObservedAt fresh to "now" on EVERY call — so a
