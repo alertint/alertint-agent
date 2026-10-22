@@ -208,11 +208,13 @@ func (s *Server) handleLive(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleReady bounds storage checks independently of the caller's timeout.
-// Storage congestion removes readiness; it must never trigger a process restart.
+// It probes on the store's own probe connection, so a long store call does
+// not remove readiness: with one replica that only stopped webhook intake and
+// never relieved the store (issue #99). Unreadable storage still does.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 	defer cancel()
-	if err := s.store.DB().PingContext(ctx); err != nil {
+	if err := s.store.Probe(ctx); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		if _, writeErr := io.WriteString(w, `{"status":"degraded"}`); writeErr != nil {
@@ -223,20 +225,32 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	s.handleLive(w, r)
 }
 
+// storageHealth is /health's view of contention on the store connection
+// since start: wait_seconds that keeps growing means store calls are
+// queueing behind each other.
+type storageHealth struct {
+	ConnectionInUse bool    `json:"connection_in_use"`
+	Waits           int64   `json:"waits"`
+	WaitSeconds     float64 `json:"wait_seconds"`
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	status := "ok"
 	code := http.StatusOK
-	if err := s.store.DB().PingContext(r.Context()); err != nil {
+	if err := s.store.Probe(r.Context()); err != nil {
 		status = "degraded"
 		code = http.StatusServiceUnavailable
 	}
+	wait := s.store.ConnectionWait()
 	body := struct {
 		Status       string              `json:"status"`
+		Storage      storageHealth       `json:"storage"`
 		Integrations []health.Status     `json:"integrations,omitempty"`
 		LLM          *llmhealth.Snapshot `json:"llm,omitempty"`
 	}{
 		Status:       status,
+		Storage:      storageHealth{ConnectionInUse: wait.InUse, Waits: wait.Waits, WaitSeconds: wait.Waited.Seconds()},
 		Integrations: s.health.Run(r.Context()),
 	}
 	if s.llmHealth != nil {

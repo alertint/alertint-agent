@@ -6,10 +6,14 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/health"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 func TestLivenessDoesNotWaitForStorageOrIntegrations(t *testing.T) {
@@ -63,18 +67,40 @@ func TestReadinessDoesNotProbeExternalSources(t *testing.T) {
 	}
 }
 
-func TestReadinessBoundsStorageWait(t *testing.T) {
-	h := newHarness(t)
-	tx, err := h.store.DB().BeginTx(context.Background(), nil)
+// TestReadinessDoesNotWaitForBusyStoreConnection is issue #99: a long store
+// call holds the store's only connection, and readiness must not queue
+// behind it. /health reports the contention instead of failing.
+func TestReadinessDoesNotWaitForBusyStoreConnection(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "busy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	host, err := New(Options{Store: st, Auditor: audit.New(st.DB()), Receivers: []Receiver{NewAlertReceiver(st, testToken, nil, nil)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	response := httptest.NewRecorder()
-	h.host.Handler().ServeHTTP(response, httptest.NewRequestWithContext(ctx, http.MethodGet, "/ready", nil))
-	if response.Code != http.StatusServiceUnavailable || ctx.Err() != nil {
-		t.Fatalf("storage wait wasn't bounded independently: status=%d context=%v", response.Code, ctx.Err())
+	if _, err := tx.ExecContext(ctx, `UPDATE schema_migrations SET applied_at = applied_at`); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, route := range []string{"/ready", "/health"} {
+		reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		response := httptest.NewRecorder()
+		host.Handler().ServeHTTP(response, httptest.NewRequestWithContext(reqCtx, http.MethodGet, route, nil))
+		expired := reqCtx.Err()
+		cancel()
+		if response.Code != http.StatusOK || expired != nil {
+			t.Fatalf("busy store connection: %s status=%d context=%v body=%s", route, response.Code, expired, response.Body)
+		}
+		if route == "/health" && !strings.Contains(response.Body.String(), `"storage":{"connection_in_use":true,`) {
+			t.Fatalf("/health should report the held store connection: %s", response.Body)
+		}
 	}
 }

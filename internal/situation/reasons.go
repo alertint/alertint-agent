@@ -76,7 +76,7 @@ func EligibleReasons(in SnapshotInput, symptoms []Symptom, durationClass string)
 	if novelSymptomEligible(symptoms, in.PriorSituations) {
 		refs := make([]string, 0, len(symptoms))
 		for _, s := range symptoms {
-			refs = append(refs, factIdentity(factKindSourceSymptomState, situationID, inputVersion, s.Key))
+			refs = append(refs, sourceSymptomStateFactID(situationID, inputVersion, s))
 		}
 		out = append(out, newReasonCandidate(situationID, inputVersion, reasonCodeNovelSymptom,
 			"Local history proves confirmed absence of this symptom.", predicateVersionNovelSymptom, false, refs))

@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -834,16 +835,17 @@ func loadCommunicatedHistoryTx(ctx context.Context, tx *sql.Tx, situationID stri
 	return out, nil
 }
 
-// historyTransitionsTx loads, in Transition-sequence order, every
-// Transition referenced by one of situationID's notification intents in the
-// given effect-class and status families. classes and statuses are
-// constant SQL literal lists owned by this file, never caller input.
+// historyTransitionsTx loads, in Transition-sequence order, the history
+// facts (scanHistoryFacts) of every Transition referenced by one of
+// situationID's notification intents in the given effect-class and status
+// families. classes and statuses are constant SQL literal lists owned by
+// this file, never caller input.
 func historyTransitionsTx(ctx context.Context, tx *sql.Tx, situationID, classes, statuses string, beforeSequence int) ([]situationmodel.Transition, error) {
-	// #nosec G202 -- classes/statuses and transitionColumns are file-owned SQL constants; values are bound below.
+	// #nosec G202 -- classes/statuses and historyFactColumns are file-owned SQL constants; values are bound below.
 	query := `
-		SELECT ` + transitionColumns + `
-		FROM situation_transitions
-		WHERE situation_id = ? AND id IN (
+		SELECT ` + historyFactColumns + `
+		FROM situation_transition_history_facts
+		WHERE situation_id = ? AND transition_id IN (
 			SELECT transition_id FROM notification_intents
 			WHERE situation_id = ? AND effect_class IN (` + classes + `) AND status IN (` + statuses + `)
 		)`
@@ -862,7 +864,7 @@ func historyTransitionsTx(ctx context.Context, tx *sql.Tx, situationID, classes,
 
 	var out []situationmodel.Transition
 	for rows.Next() {
-		tr, err := scanTransition(rows)
+		tr, err := scanHistoryFacts(rows)
 		if err != nil {
 			return nil, fmt.Errorf("store: scan notification history transition: %w", err)
 		}
@@ -872,6 +874,29 @@ func historyTransitionsTx(ctx context.Context, tx *sql.Tx, situationID, classes,
 		return nil, fmt.Errorf("store: iterate notification history transitions: %w", err)
 	}
 	return out, nil
+}
+
+// historyFactColumns is the exact SELECT list scanHistoryFacts consumes.
+const historyFactColumns = `transition_id, situation_id, sequence, journal_kind, facts_json`
+
+// scanHistoryFacts reads one situation_transition_history_facts row
+// (migration 0047) as a Transition carrying only what the delivery-history
+// reads in this file use: identity, sequence, journal kind, and a projection
+// holding each candidate's kind, limitation and action plus the briefing's
+// execution_started flag. Every other field is zero. Decoding the full
+// projection_json instead is what made these reads scale with a Situation's
+// alert count (issue #99).
+func scanHistoryFacts(row scanner) (situationmodel.Transition, error) {
+	var t situationmodel.Transition
+	var journalKind, factsJSON string
+	if err := row.Scan(&t.ID, &t.SituationID, &t.Sequence, &journalKind, &factsJSON); err != nil {
+		return situationmodel.Transition{}, err
+	}
+	t.JournalKind = situationmodel.JournalKind(journalKind)
+	if err := json.Unmarshal([]byte(factsJSON), &t.Projection); err != nil {
+		return situationmodel.Transition{}, fmt.Errorf("store: unmarshal transition %s history facts: %w", t.ID, err)
+	}
+	return t, nil
 }
 
 // transitionConveysAssurance reports whether a reply rendered from tr told
@@ -930,9 +955,9 @@ func assuranceOvertakenBy(kind situationmodel.CandidateKind) (string, bool) {
 // of the past, so the present is what decides it.
 func assuranceOvertakenTx(ctx context.Context, tx *sql.Tx, situationID string, afterSequence int) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT `+transitionColumns+`
-		FROM situation_transitions
-		WHERE situation_id = ? AND sequence > ? AND id IN (
+		SELECT `+historyFactColumns+`
+		FROM situation_transition_history_facts
+		WHERE situation_id = ? AND sequence > ? AND transition_id IN (
 			SELECT transition_id FROM notification_intents
 			WHERE situation_id = ? AND effect_class IN (`+historyReplyClasses+`)
 			  AND status IN (`+historyStanding+`)
@@ -945,7 +970,7 @@ func assuranceOvertakenTx(ctx context.Context, tx *sql.Tx, situationID string, a
 
 	overtaken := false
 	for rows.Next() {
-		tr, err := scanTransition(rows)
+		tr, err := scanHistoryFacts(rows)
 		if err != nil {
 			return false, fmt.Errorf("store: scan overtaking transition: %w", err)
 		}
@@ -1036,9 +1061,9 @@ func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situatio
 	}
 	transient := map[string]bool{}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT `+transitionColumns+`
-		FROM situation_transitions
-		WHERE situation_id = ?`+bound+` AND id IN (
+		SELECT `+historyFactColumns+`
+		FROM situation_transition_history_facts
+		WHERE situation_id = ?`+bound+` AND transition_id IN (
 			SELECT transition_id FROM notification_intents
 			WHERE situation_id = ? AND effect_class = 'thread_append' AND status IN (`+historyLive+`)
 		)`, append(append([]any{situationID}, boundArgs...), situationID)...)
@@ -1047,7 +1072,7 @@ func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situatio
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
-		tr, err := scanTransition(rows)
+		tr, err := scanHistoryFacts(rows)
 		if err != nil {
 			return nil, fmt.Errorf("store: scan live assurance transition: %w", err)
 		}
