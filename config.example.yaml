@@ -123,6 +123,8 @@ telemetry:
     insecure: false          # plaintext transport for a bare host:port endpoint
     service_name: alertint-agent
     timeout_seconds: 10
+  pprof:
+    addr: ""                 # Go runtime profiles on their own listener, e.g. 127.0.0.1:6060; empty = off
 
 notify:
   stdout: true             # always emit one JSON line per finding to stdout

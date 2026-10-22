@@ -181,6 +181,12 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer stopTelemetry()
 
+	_, stopPprof, err := startPprof(ctx, cfg.Telemetry.PProf.Addr, logger)
+	if err != nil {
+		return err
+	}
+	defer stopPprof()
+
 	applyServeOverrides(cfg, *receiversAddr, *mcpAddr)
 
 	st, stagedInfo, err := openStoreWithStagedRestore(ctx, cfg.Storage.SQLitePath, logger)

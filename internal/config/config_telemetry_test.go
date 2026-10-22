@@ -17,6 +17,9 @@ func TestTelemetryDefaultsAreDisabledEgress(t *testing.T) {
 	if o.Protocol != "grpc" || o.ServiceName != "alertint-agent" || o.TimeoutSeconds != 10 || o.Endpoint != "" || o.Insecure {
 		t.Fatalf("telemetry.otlp defaults = %+v, want protocol=grpc service_name=alertint-agent timeout_seconds=10 endpoint='' insecure=false", o)
 	}
+	if addr := Defaults().Telemetry.PProf.Addr; addr != "" {
+		t.Fatalf("telemetry.pprof.addr defaults to %q — profiling must be opt-in", addr)
+	}
 }
 
 func TestTelemetryValidation(t *testing.T) {
@@ -34,6 +37,9 @@ func TestTelemetryValidation(t *testing.T) {
 		{"non-positive timeout", "telemetry:\n  otlp:\n    timeout_seconds: 0\n", "telemetry.otlp.timeout_seconds must be > 0"},
 		{"empty service name", "telemetry:\n  otlp:\n    enabled: true\n    endpoint: c:4317\n    service_name: \"\"\n", "telemetry.otlp.service_name"},
 		{"unknown key", "telemetry:\n  otlp:\n    exporter: jaeger\n", "field exporter not found"},
+		{"pprof on loopback", "telemetry:\n  pprof:\n    addr: 127.0.0.1:6060\n", ""},
+		{"pprof without port", "telemetry:\n  pprof:\n    addr: localhost\n", "telemetry.pprof.addr"},
+		{"pprof non-numeric port", "telemetry:\n  pprof:\n    addr: 127.0.0.1:pprof\n", "telemetry.pprof.addr"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -48,5 +54,22 @@ func TestTelemetryValidation(t *testing.T) {
 				t.Fatalf("error = %v, want it to mention %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestPprofBeyondLoopbackWarns(t *testing.T) {
+	base := situationsBaseYAML(t)
+	for addr, wantWarn := range map[string]bool{"127.0.0.1:6060": false, "localhost:6060": false, "[::1]:6060": false, ":6060": true, "0.0.0.0:6060": true} {
+		cfg, err := LoadFrom(strings.NewReader(base+"\ntelemetry:\n  pprof:\n    addr: \""+addr+"\"\n"), "test.yaml")
+		if err != nil {
+			t.Fatalf("%s: %v", addr, err)
+		}
+		warned := false
+		for _, w := range cfg.Warnings() {
+			warned = warned || strings.Contains(w, "telemetry.pprof.addr")
+		}
+		if warned != wantWarn {
+			t.Errorf("addr %s: warned = %v, want %v", addr, warned, wantWarn)
+		}
 	}
 }

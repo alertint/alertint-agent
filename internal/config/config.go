@@ -20,10 +20,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -69,7 +71,17 @@ type Config struct {
 // classes, and durations — never prompts, proposals, provider bodies, SQL
 // text, or secrets — so the boundary is about egress consent, not content.
 type TelemetryConfig struct {
-	OTLP OTLPConfig `yaml:"otlp"`
+	OTLP  OTLPConfig  `yaml:"otlp"`
+	PProf PProfConfig `yaml:"pprof"`
+}
+
+// PProfConfig serves Go's runtime profiles (net/http/pprof) on their own
+// listener, for diagnosing CPU and memory use. Off unless addr is set.
+// Profiles carry function names, stacks, timings and allocation sizes, never
+// alert content; the listener is still meant for loopback (reach it with
+// kubectl port-forward), and Warnings flags any other address.
+type PProfConfig struct {
+	Addr string `yaml:"addr"` // host:port, e.g. 127.0.0.1:6060; empty disables
 }
 
 // OTLPConfig configures the OTLP trace exporter.
@@ -1292,7 +1304,28 @@ func (c *Config) validateTelemetry() []string {
 			errs = append(errs, "telemetry.otlp.service_name must not be empty when telemetry.otlp.enabled is true")
 		}
 	}
+	if addr := c.Telemetry.PProf.Addr; addr != "" {
+		if _, port, err := net.SplitHostPort(addr); err != nil {
+			errs = append(errs, fmt.Sprintf("telemetry.pprof.addr %q must be host:port (e.g. 127.0.0.1:6060)", addr))
+		} else if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+			errs = append(errs, fmt.Sprintf("telemetry.pprof.addr %q: port must be a number from 0 to 65535", addr))
+		}
+	}
 	return errs
+}
+
+// pprofBeyondLoopback reports whether addr (already valid host:port) listens
+// on anything but loopback; an empty host means every interface.
+func pprofBeyondLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || !ip.IsLoopback()
 }
 
 // volatileGroupLabels are per-instance identity labels that churn on every pod
@@ -1316,6 +1349,11 @@ func (c *Config) Warnings() []string {
 				"correlator.group_labels: %q looks volatile (per-instance identity); recurrence collapse and recall will rarely match for these groups",
 				label))
 		}
+	}
+	if addr := c.Telemetry.PProf.Addr; addr != "" && pprofBeyondLoopback(addr) {
+		warns = append(warns, fmt.Sprintf(
+			"telemetry.pprof.addr %q listens beyond loopback; profiles expose stack traces and timings to anyone who can reach it",
+			addr))
 	}
 	return warns
 }
