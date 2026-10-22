@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `telemetry.pprof.addr` serves Go runtime profiles (`net/http/pprof`) on a
+  listener of its own, for diagnosing CPU and memory use. Off by default; an
+  address beyond loopback is logged as a warning. See Configuration:
+  Profiling.
+
 ### Fixed
 
 - Read Situation delivery history from a small per-Transition summary instead of

@@ -341,6 +341,7 @@ text, or secret — so what leaves is correlation keys, not content.
 | `otlp.insecure` | bool | `false` | Plaintext transport for a bare `host:port` endpoint (a lab or in-cluster collector without TLS). |
 | `otlp.service_name` | string | `alertint-agent` | The resource `service.name` your backend groups spans under. `OTEL_RESOURCE_ATTRIBUTES` in the environment is merged in as well, so `service.namespace` / `deployment.environment.name` need no config key. |
 | `otlp.timeout_seconds` | int | `10` | Per export batch. Also bounds the final flush at shutdown. |
+| `pprof.addr` | string | — | Off when empty. Serve Go runtime profiles on this `host:port`, on their own listener. Keep it on loopback, e.g. `127.0.0.1:6060`. See [Profiling](#profiling). |
 
 Spans are exported in batches from a background goroutine; ending a span
 never blocks the controller, and no export ever runs inside a database
@@ -359,6 +360,38 @@ telemetry:
     protocol: grpc
     insecure: true
 ```
+
+### Profiling
+
+When the agent uses more CPU or memory than you expect, a profile shows where.
+It is off by default. Set `telemetry.pprof.addr` and the agent serves Go's
+runtime profiles (`net/http/pprof`) on that address, on a listener of its own,
+never on the receivers or MCP port.
+
+```yaml
+telemetry:
+  pprof:
+    addr: 127.0.0.1:6060
+```
+
+- **Off until set.** With `pprof.addr` empty nothing listens. Serving costs
+  nothing until someone captures a profile, and then a few percent of CPU.
+- **Keep it on loopback.** Any other address is logged as a warning at startup.
+  In Kubernetes, reach it with `kubectl port-forward`. In Docker Compose,
+  publish the port on `127.0.0.1` only.
+- **What a profile holds:** function names, source lines, timings and allocation
+  sizes. It holds no alert content, labels, Slack text, prompts, tokens or
+  database rows. `/debug/pprof/cmdline` is not served.
+
+Capture a 30-second CPU profile and a heap profile:
+
+```bash
+kubectl port-forward deploy/my-alertint-alertint-agent 6060:6060   # the Kubernetes guide's release name
+go tool pprof -top http://127.0.0.1:6060/debug/pprof/profile?seconds=30
+curl -o heap.pb.gz http://127.0.0.1:6060/debug/pprof/heap
+```
+
+To report a performance problem, attach the saved profile files to the issue.
 
 ## `health`
 
