@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Build with Go 1.26.10 to address the Go `crypto/x509` security advisory
+  GO-2026-6809.
+
 ## [0.15.4] - 2026-10-19
 
 ### Fixed
