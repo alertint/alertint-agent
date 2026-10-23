@@ -680,9 +680,14 @@ been observed:
 `storage` reports contention on the agent's single store connection since
 start: whether a store call holds it now, how many calls had to wait for it,
 and their total wait. A `wait_seconds` that keeps growing means store calls
-are queueing; the agent also logs `store: connection congested` for any
-minute in which calls waited 10 s or more in total. Like `llm`, it never
-changes the HTTP status:
+are queueing. The agent also logs two warnings:
+
+- `store: connection congested`: in the last minute, store calls waited 10 s or
+  more in total and 1 s or more on average.
+- `store: connection held`: one store call held the connection for 5 s or more.
+  `holder` names the call, innermost first.
+
+Like `llm`, it never changes the HTTP status:
 
 ```json
 {"status":"ok","storage":{"connection_in_use":false,"waits":12,"wait_seconds":0.4}}
