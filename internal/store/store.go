@@ -31,7 +31,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // registers driver name "sqlite"
+	"modernc.org/sqlite" // also registers driver name "sqlite"
 
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -46,6 +46,8 @@ type Store struct {
 	// database for readiness and health checks (see Probe). db keeps one
 	// connection, so a probe queued on it waited out every long store call.
 	probe *sql.DB
+	// holds times each hold of db's connection (see holdConnector).
+	holds *holdWatch
 
 	// semanticProfileMaxAttempts is Plan 4 Task 7's own injected config
 	// value — see SetSemanticProfileMaxAttempts.
@@ -56,12 +58,12 @@ type Store struct {
 // pending migrations. Pass ":memory:" for an in-memory store useful in
 // tests.
 func Open(ctx context.Context, dbPath string) (*Store, error) {
-	dsn := buildDSN(dbPath)
-
-	db, err := sql.Open("sqlite", dsn)
+	connector, err := sqlite.NewConnector(buildDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", dbPath, err)
 	}
+	holds := &holdWatch{}
+	db := sql.OpenDB(holdConnector{Connector: connector, watch: holds})
 	// modernc.org/sqlite is safe for concurrent use, but a single
 	// connection avoids "database is locked" with WAL on file-backed DBs
 	// when the agent is the only writer. v1 has one writer process.
@@ -72,7 +74,7 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("store: ping %s: %w", dbPath, err)
 	}
 
-	s := &Store{db: db}
+	s := &Store{db: db, holds: holds}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err

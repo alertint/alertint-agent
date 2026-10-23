@@ -13,6 +13,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
+	"github.com/alertint/alertint-agent/internal/situation"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -624,6 +625,41 @@ func TestConcurrentExpectedBehaviorReplacementAllowsOneWriter(t *testing.T) {
 	}
 	if success != 1 || conflict != 1 {
 		t.Fatalf("success=%d conflict=%d", success, conflict)
+	}
+}
+
+// The assessment phase skips its expected-behavior recheck when the cycle's
+// input has no heads (cmd/alertint productionPreparer.Prepare, issue #99).
+// That is safe only while an input without heads never carries an
+// evaluation to act on.
+func TestLoadReconciliationInputEvaluatesExpectedBehaviorOnlyWithHeads(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	fixture := newExpectedBehaviorFixture(t, st)
+	load := func(now time.Time) situation.SnapshotInput {
+		t.Helper()
+		sit, err := st.GetSituation(ctx, fixture.situationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		in, err := st.LoadReconciliationInput(ctx, situation.Claim{Situation: sit}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in
+	}
+
+	if in := load(fixture.now); len(in.ExpectedBehaviorHeads) != 0 || in.ExpectedBehavior != nil {
+		t.Fatalf("without an envelope: heads = %+v, evaluation = %+v, want neither", in.ExpectedBehaviorHeads, in.ExpectedBehavior)
+	}
+
+	created, err := st.WriteExpectedBehavior(ctx, audit.New(st.DB()), fixture.confirmRequest(t, st, "expected-heads-confirm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := load(fixture.now.Add(time.Second))
+	if len(in.ExpectedBehaviorHeads) != 1 || in.ExpectedBehaviorHeads[0].EnvelopeID != created.Revision.EnvelopeID || in.ExpectedBehavior == nil {
+		t.Fatalf("with an envelope: heads = %+v, evaluation = %+v, want the envelope and its evaluation", in.ExpectedBehaviorHeads, in.ExpectedBehavior)
 	}
 }
 
