@@ -196,7 +196,12 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 			return situation.PreparedState{}, fmt.Errorf("cmd/alertint: complete expected behavior validation: %w", err)
 		}
 	}
-	if req.Phase == model.PhaseAssessment {
+	// The invalidation check reloads the whole Situation input to see this
+	// phase's fresh source definitions. Without expected behaviors for the
+	// group there is nothing to invalidate, and at issue #99's size that
+	// reload is a long hold on the store connection; a head created during
+	// this cycle is seen by the next one.
+	if req.Phase == model.PhaseAssessment && len(req.Input.ExpectedBehaviorHeads) > 0 {
 		invalidated, err := p.invalidateChangedExpectedBehaviors(ctx, req.Claim, req.Now)
 		if err != nil {
 			return situation.PreparedState{}, err
