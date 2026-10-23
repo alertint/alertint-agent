@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on average, not just 10s in total, within a minute. A busy agent's many short
   waits no longer log it every minute (#99).
 
+### Fixed
+
+- Skip reloading a Situation's whole input after each assessment when its group
+  has no expected behaviors. On a large Situation that reload took about a sixth
+  of each reconcile's time (#99).
+
 ## [0.15.5] - 2026-10-22
 
 ### Added
