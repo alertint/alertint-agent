@@ -806,16 +806,9 @@ func newPreparationRuntime(
 		newPreparationSweep("semantic_profile_backfill", sweepInterval, func(ctx context.Context, now time.Time) (int, error) {
 			return st.BackfillActiveSemanticMappings(ctx, now, 100)
 		}, now, logger),
-		newPreparationSweep("observation_detail_cleanup", time.Hour, func(ctx context.Context, now time.Time) (int, error) {
-			n, err := st.PruneUnusedObservationDetails(ctx, now, 100)
-			if err != nil || n > 0 {
-				return n, err
-			}
-			// Each cycle deletes several runs and their child records. Keep
-			// these batches smaller so readiness can use the single connection
-			// between transactions while a large backlog is being removed.
-			return st.PruneUnusedObservationMetadata(ctx, now, 25)
-		}, now, logger),
+		// One pass walks the old history once, in short transactions, so
+		// other store calls get the connection between them.
+		newPreparationSweep("observation_detail_cleanup", time.Hour, st.PruneObservationRetention, now, logger),
 	}
 
 	rt := &preparationRuntime{st: st, workers: workers, sweeps: sweeps, logger: logger}
