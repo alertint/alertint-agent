@@ -31,9 +31,12 @@ overwritten without `--force`.
 > **In containers:** the working directory is usually not writable — pass
 > an explicit target on a writable volume, as in the example above.
 
-Scheduling is deliberately left to tools you already run (cron, systemd
-timers, Kubernetes CronJobs): AlertINT adds no scheduler, retention, or
-pruning of its own.
+Scheduling backups is deliberately left to tools you already run (cron,
+systemd timers, Kubernetes CronJobs). Inside the database, the agent bounds
+its own size: the working record and the audit log expire by age or by
+volume size, while memory is kept
+([storage retention](configuration.md#retention)). A backup keeps what the
+database held when it was taken, so keep backups to retain more.
 
 ## Restore (offline)
 

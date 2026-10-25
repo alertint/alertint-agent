@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Storage retention. Memory (every Situation, its journal, its current state
+  and its final record) is kept forever. The working record (full briefings of
+  past changes, superseded facts, raw evidence only past decisions cited) and
+  the audit log expire by age or when the database passes its size limit,
+  whichever comes first; past the size limit the oldest data goes first,
+  whatever its kind. New `storage` settings: `retention_days` (90),
+  `retention_size_percent` (80% of the filesystem holding the database) or
+  `retention_size`, and `audit_retention_days` (365); `0` turns a limit off.
+  It runs a minute after start and hourly, in short transactions. See
+  Configuration: Retention (#99).
+- The audit chain stays verifiable after retention: an anchor entry records the
+  last removed entry, and `alertint verify-audit` and `alertint_verify_audit`
+  verify from it.
+- `/health` reports the database's size, its limit, the volume holding it, and
+  how far back the working record and audit log reach. The agent warns once a
+  day when the size limit shortens history, with the volume that would keep
+  `retention_days`, and when the volume has less than 10% free.
+- `alertint_list_situation_transitions` reports `detail_state: "expired"` for a
+  Transition past retention.
+
+### Changed
+
+- Store much less per change (#99). A Transition's briefing is stored apart and
+  compressed, about 7x smaller. A fact is written only when its content changes,
+  instead of again on every input version. Coverage is kept only for each
+  Situation's current assessment, the only one ever read. After upgrading, the
+  first maintenance passes move existing briefings into compressed storage and
+  delete repeated facts, in the background. The database file does not shrink;
+  the freed space is reused.
+
 ## [0.15.7] - 2026-10-25
 
 ### Fixed
