@@ -119,12 +119,12 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 47 {
-		t.Fatalf("MaxSchemaVersion = %d, want 47", got)
+	if got != 48 {
+		t.Fatalf("MaxSchemaVersion = %d, want 48", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 47 {
-		t.Fatalf("applied schema version = %d (err=%v), want 47", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 48 {
+		t.Fatalf("applied schema version = %d (err=%v), want 48", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {

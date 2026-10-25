@@ -60,8 +60,6 @@ func claimSituation(t *testing.T, st *Store, situationID, owner string, now time
 
 // factFixture builds one valid, minimal situationmodel.Fact for situationID
 // at inputVersion, keyed by id.
-//
-//nolint:unparam // id is a general fixture parameter; every current test happens to use "fact-1".
 func factFixture(id, situationID string, inputVersion int, observedAt time.Time) situationmodel.Fact {
 	return situationmodel.Fact{
 		ID:           id,

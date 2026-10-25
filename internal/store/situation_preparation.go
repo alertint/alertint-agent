@@ -1519,20 +1519,20 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	return s.pruneObservationDetails(ctx, now, limit)
+	return s.pruneObservationDetails(ctx, now, now.Add(-observationDetailRetention), limit)
 }
 
-// pruneObservationDetails expires unused details page by page from the
-// oldest pending run until upTo runs are expired (0: no limit) or no
-// pending run past the cutoff is left.
-func (s *Store) pruneObservationDetails(ctx context.Context, now time.Time, upTo int) (int, error) {
+// pruneObservationDetails expires, at now, unused details completed before
+// cutoff page by page from the oldest pending run until upTo runs are expired
+// (0: no limit) or no pending run past the cutoff is left.
+func (s *Store) pruneObservationDetails(ctx context.Context, now, cutoff time.Time, upTo int) (int, error) {
 	total, cursor := 0, observationDetailCursor{}
 	for {
 		limit := observationDetailPageExpiries
 		if upTo > 0 && upTo-total < limit {
 			limit = upTo - total
 		}
-		n, next, done, err := s.pruneObservationDetailsPage(ctx, now, cursor, limit)
+		n, next, done, err := s.pruneObservationDetailsPage(ctx, now, cutoff, cursor, limit)
 		total += n
 		if err != nil || done || (upTo > 0 && total >= upTo) {
 			return total, err
@@ -1570,14 +1570,14 @@ const observationDetailPage = `
 // pruneObservationDetailsPage reads one page of pending runs after `after`
 // and expires up to limit unused ones in the same transaction. done reports
 // that the page reached the last pending run past the cutoff.
-func (s *Store) pruneObservationDetailsPage(ctx context.Context, now time.Time, after observationDetailCursor, limit int) (int, observationDetailCursor, bool, error) {
+func (s *Store) pruneObservationDetailsPage(ctx context.Context, now, cutoff time.Time, after observationDetailCursor, limit int) (int, observationDetailCursor, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, after, false, fmt.Errorf("store: begin prune observation details: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	runIDs, next, done, err := readObservationDetailPage(ctx, tx, now, after, limit)
+	runIDs, next, done, err := readObservationDetailPage(ctx, tx, cutoff, after, limit)
 	if err != nil {
 		return 0, after, false, err
 	}
@@ -1607,8 +1607,8 @@ func (s *Store) pruneObservationDetailsPage(ctx context.Context, now time.Time, 
 // readObservationDetailPage reads one details page: the unused runs among at
 // most observationRetentionPageRows pending runs after `after`, stopping early
 // at limit unused runs or after observationRetentionPageTime.
-func readObservationDetailPage(ctx context.Context, tx *sql.Tx, now time.Time, after observationDetailCursor, limit int) ([]string, observationDetailCursor, bool, error) {
-	upperBound, cutoff := observationRetentionCutoff(now)
+func readObservationDetailPage(ctx context.Context, tx *sql.Tx, at time.Time, after observationDetailCursor, limit int) ([]string, observationDetailCursor, bool, error) {
+	upperBound, cutoff := observationRetentionCutoff(at)
 	started := time.Now()
 	rows, err := tx.QueryContext(ctx, observationDetailPage, cutoff, upperBound,
 		after.completedAt, after.completedAt, after.runID, observationRetentionPageRows)

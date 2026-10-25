@@ -731,8 +731,8 @@ func buildPreparationRuntime(
 // situation and cannot do that wiring itself), the semantic-profile
 // inference workers (cfg.SemanticProfiles.Workers of them, sharing ONE
 // llm.InferenceLimiter with the Situation controller's own L2 dispatch),
-// and the three bounded sweeps (profile-change fan-out, active-mapping
-// backfill, ten-day detail cleanup). owner must be the SAME non-empty,
+// and the two bounded sweeps (profile-change fan-out, active-mapping
+// backfill). owner must be the SAME non-empty,
 // per-process identity foundationRuntime/controllerRuntime derive their own
 // lease-owner suffixes from.
 func newPreparationRuntime(
@@ -806,9 +806,8 @@ func newPreparationRuntime(
 		newPreparationSweep("semantic_profile_backfill", sweepInterval, func(ctx context.Context, now time.Time) (int, error) {
 			return st.BackfillActiveSemanticMappings(ctx, now, 100)
 		}, now, logger),
-		// One pass walks the old history once, in short transactions, so
-		// other store calls get the connection between them.
-		newPreparationSweep("observation_detail_cleanup", time.Hour, st.PruneObservationRetention, now, logger),
+		// Observation detail cleanup runs in the storage maintenance pass
+		// (storage_retention.go), which also moves its cutoff under the size limit.
 	}
 
 	rt := &preparationRuntime{st: st, workers: workers, sweeps: sweeps, logger: logger}
@@ -848,8 +847,7 @@ func llmProviderName(cfg *config.Config) string {
 // ----------------------------------------------------------------------
 // preparationRuntime: bundles the preparer's dependent Runner/executors,
 // the semantic-profile inference workers, and the bounded sweep loops
-// (profile-change fan-out, active-mapping backfill, ten-day detail
-// cleanup) — mirroring controllerRuntime's own construction/Recover/Start/
+// (profile-change fan-out, active-mapping backfill) — mirroring controllerRuntime's own construction/Recover/Start/
 // Drain/Stop shape.
 // ----------------------------------------------------------------------
 
@@ -950,9 +948,9 @@ func joinErrors(errs []error) error {
 }
 
 // preparationSweep runs a bounded, idempotent store primitive (profile-
-// change fan-out, active-mapping backfill, ten-day detail cleanup) on its
-// own schedule — the generic shape every one of Task 9's "bounded sweeps"
-// shares, factored out once rather than duplicated three times.
+// change fan-out, active-mapping backfill) on its own schedule — the generic
+// shape every one of Task 9's "bounded sweeps" shares, factored out once
+// rather than duplicated.
 type preparationSweep struct {
 	name     string
 	interval time.Duration

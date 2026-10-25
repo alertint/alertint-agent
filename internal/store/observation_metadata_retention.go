@@ -31,11 +31,18 @@ const (
 // unused detail past the ten-day cutoff, then removes every sealed cycle left
 // with nothing to keep. Returns the expired runs plus the removed cycles.
 func (s *Store) PruneObservationRetention(ctx context.Context, now time.Time) (int, error) {
-	runs, err := s.pruneObservationDetails(ctx, now, 0)
+	return s.PruneObservationRetentionBefore(ctx, now, now.Add(-observationDetailRetention))
+}
+
+// PruneObservationRetentionBefore is PruneObservationRetention with an
+// explicit cutoff: storage retention moves it later than ten days ago when
+// the database outgrows its size limit.
+func (s *Store) PruneObservationRetentionBefore(ctx context.Context, now, cutoff time.Time) (int, error) {
+	runs, err := s.pruneObservationDetails(ctx, now, cutoff, 0)
 	if err != nil {
 		return runs, err
 	}
-	cycles, err := s.pruneObservationMetadata(ctx, now, 0)
+	cycles, err := s.pruneObservationMetadata(ctx, cutoff, 0)
 	return runs + cycles, err
 }
 
@@ -49,21 +56,21 @@ func (s *Store) PruneUnusedObservationMetadata(ctx context.Context, now time.Tim
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	return s.pruneObservationMetadata(ctx, now, limit)
+	return s.pruneObservationMetadata(ctx, now.Add(-observationDetailRetention), limit)
 }
 
-// pruneObservationMetadata removes unused cycles page by page from the newest
-// sealed cycle past the cutoff until upTo are removed (0: no limit) or none
+// pruneObservationMetadata removes unused cycles sealed before cutoff page by
+// page from the newest such cycle until upTo are removed (0: no limit) or none
 // is left. Newest first: a cycle that reuses an older one's run is removed
 // before the walk reaches the older cycle it was protecting.
-func (s *Store) pruneObservationMetadata(ctx context.Context, now time.Time, upTo int) (int, error) {
+func (s *Store) pruneObservationMetadata(ctx context.Context, cutoff time.Time, upTo int) (int, error) {
 	total, cursor := 0, observationCycleCursor{}
 	for {
 		limit := observationCyclePagePrunes
 		if upTo > 0 && upTo-total < limit {
 			limit = upTo - total
 		}
-		n, next, done, err := s.pruneObservationMetadataPage(ctx, now, cursor, limit)
+		n, next, done, err := s.pruneObservationMetadataPage(ctx, cutoff, cursor, limit)
 		total += n
 		if err != nil || done || (upTo > 0 && total >= upTo) {
 			return total, err
@@ -111,9 +118,9 @@ const observationCyclePage = `
 // pruneObservationMetadataPage reads one page of sealed cycles before `after`
 // and removes up to limit unused ones in the same transaction. done reports
 // that the page reached the oldest sealed cycle.
-func (s *Store) pruneObservationMetadataPage(ctx context.Context, now time.Time, after observationCycleCursor, limit int) (int, observationCycleCursor, bool, error) {
+func (s *Store) pruneObservationMetadataPage(ctx context.Context, cutoff time.Time, after observationCycleCursor, limit int) (int, observationCycleCursor, bool, error) {
 	if after.sealedAt == "" {
-		upperBound, _ := observationRetentionCutoff(now)
+		upperBound, _ := observationRetentionCutoff(cutoff)
 		after = observationCycleCursor{sealedAt: upperBound, rowID: math.MaxInt64}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -122,7 +129,7 @@ func (s *Store) pruneObservationMetadataPage(ctx context.Context, now time.Time,
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	cycleIDs, next, done, err := readObservationCyclePage(ctx, tx, now, after, limit)
+	cycleIDs, next, done, err := readObservationCyclePage(ctx, tx, cutoff, after, limit)
 	if err != nil {
 		return 0, after, false, err
 	}
@@ -141,8 +148,8 @@ func (s *Store) pruneObservationMetadataPage(ctx context.Context, now time.Time,
 // readObservationCyclePage reads one cycles page: the unused cycles among at
 // most observationRetentionPageRows sealed cycles before `after`, stopping
 // early at limit unused cycles or after observationRetentionPageTime.
-func readObservationCyclePage(ctx context.Context, tx *sql.Tx, now time.Time, after observationCycleCursor, limit int) ([]string, observationCycleCursor, bool, error) {
-	upperBound, cutoff := observationRetentionCutoff(now)
+func readObservationCyclePage(ctx context.Context, tx *sql.Tx, at time.Time, after observationCycleCursor, limit int) ([]string, observationCycleCursor, bool, error) {
+	upperBound, cutoff := observationRetentionCutoff(at)
 	started := time.Now()
 	rows, err := tx.QueryContext(ctx, observationCyclePage, cutoff, upperBound,
 		after.sealedAt, after.sealedAt, after.rowID, observationRetentionPageRows)
@@ -203,8 +210,8 @@ func pruneObservationCycleTx(ctx context.Context, tx *sql.Tx, cycleID string) er
 // differs from time order within a second. Retention queries use an indexed
 // next-second upper bound, then compare zero-padded fractions for exact expiry.
 // Existing rows keep their original representation; no migration is needed.
-func observationRetentionCutoff(now time.Time) (upperBound, cutoff string) {
-	at := now.UTC().Add(-observationDetailRetention)
+func observationRetentionCutoff(at time.Time) (upperBound, cutoff string) {
+	at = at.UTC()
 	const layout = "2006-01-02T15:04:05.000000000Z"
 	return at.Truncate(time.Second).Add(time.Second).Format(layout), at.Format(layout)
 }

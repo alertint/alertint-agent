@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -1019,5 +1020,18 @@ func TestSituationMCPArtifactsAfterClosureIsEmptyWhenNoneExist(t *testing.T) {
 	}
 	if !strings.Contains(resultText(t, res), `"artifacts_recorded_after_closure":[]`) {
 		t.Errorf("payload = %s, want an empty artifacts_recorded_after_closure array", resultText(t, res))
+	}
+}
+
+// TestSituationTransitionRowMarksExpiredDetail: a Transition past storage
+// retention says so instead of looking like one that never had evidence.
+func TestSituationTransitionRowMarksExpiredDetail(t *testing.T) {
+	full := situationTransitionRowFrom(model.Transition{ID: "tr-1", EvidenceRefs: []string{"fact:1"}})
+	if full.DetailState != "full" || len(full.EvidenceRefs) != 1 {
+		t.Fatalf("full row = %+v", full)
+	}
+	expired := situationTransitionRowFrom(model.Transition{ID: "tr-2", DetailExpired: true})
+	if expired.DetailState != "expired" || expired.EvidenceRefs == nil || len(expired.EvidenceRefs) != 0 {
+		t.Fatalf("expired row = %+v", expired)
 	}
 }
