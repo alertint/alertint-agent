@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.7] - 2026-10-25
+
 ### Fixed
 
 - The hourly cleanup of observation history older than 10 days no longer holds
@@ -1202,7 +1204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.15.6...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.15.7...HEAD
+[0.15.7]: https://github.com/alertint/alertint-agent/compare/v0.15.6...v0.15.7
 [0.15.6]: https://github.com/alertint/alertint-agent/compare/v0.15.5...v0.15.6
 [0.15.5]: https://github.com/alertint/alertint-agent/compare/v0.15.4...v0.15.5
 [0.15.4]: https://github.com/alertint/alertint-agent/compare/v0.15.3...v0.15.4
