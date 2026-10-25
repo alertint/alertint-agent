@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The hourly cleanup of observation history older than 10 days no longer holds
+  the store connection for seconds at a time. It walks old history once per
+  pass, in transactions of about 100ms, so other store calls run in between.
+  What it removes is unchanged (#99).
+
 ## [0.15.6] - 2026-10-23
 
 ### Added

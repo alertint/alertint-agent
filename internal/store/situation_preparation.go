@@ -1508,44 +1508,78 @@ func scopeDigest(scope observationmodel.Scope) (string, error) {
 }
 
 // PruneUnusedObservationDetails deletes unused (unreferenced) fact-value
-// payloads whose owning run completed at least ten days ago, in batches of
-// at most 100 runs per transaction, and records an immutable expiration
-// marker atomically with each deletion. It is safe to call repeatedly
-// (idempotent: an already-expired run is simply skipped) and safe to
-// interrupt (each batch commits independently). Returns the number of runs
+// payloads whose owning run completed at least ten days ago, at most limit
+// runs (at most 100) per call, and records an immutable expiration marker
+// atomically with each deletion. It walks the pending runs oldest first in
+// short pages (see observationRetentionPageRows). It is safe to call
+// repeatedly (idempotent: an already-expired run is simply skipped) and safe
+// to interrupt (each page commits independently). Returns the number of runs
 // whose detail was newly expired this call.
 func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time, limit int) (int, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	upperBound, cutoff := observationRetentionCutoff(now)
+	return s.pruneObservationDetails(ctx, now, limit)
+}
 
+// pruneObservationDetails expires unused details page by page from the
+// oldest pending run until upTo runs are expired (0: no limit) or no
+// pending run past the cutoff is left.
+func (s *Store) pruneObservationDetails(ctx context.Context, now time.Time, upTo int) (int, error) {
+	total, cursor := 0, observationDetailCursor{}
+	for {
+		limit := observationDetailPageExpiries
+		if upTo > 0 && upTo-total < limit {
+			limit = upTo - total
+		}
+		n, next, done, err := s.pruneObservationDetailsPage(ctx, now, cursor, limit)
+		total += n
+		if err != nil || done || (upTo > 0 && total >= upTo) {
+			return total, err
+		}
+		cursor = next
+	}
+}
+
+// observationDetailCursor is the last pending run a details page examined.
+type observationDetailCursor struct {
+	completedAt, runID string
+}
+
+// observationDetailPage examines pending runs after a cursor in index order,
+// so a run something still protects is read once per pass, not once per
+// page. Eligibility is a column, not a filter: SQLite computes it row by row
+// as the page is read, and the page can stop at any row.
+const observationDetailPage = `
+	SELECT h.completed_at, h.run_id,
+	  (substr(h.completed_at, 1, 19) || '.' ||
+	   substr(substr(rtrim(h.completed_at, 'Z'), 21) || '000000000', 1, 9) || 'Z') <= ?
+	  AND EXISTS (SELECT 1 FROM situation_observation_runs r WHERE r.id = h.run_id)
+	  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = h.run_id)
+	  AND NOT EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = h.run_id AND ref.superseded = 0 AND ref.metadata_only = 0)
+	  AND NOT EXISTS (
+	      SELECT 1 FROM situation_observation_runs p
+	      JOIN situation_observation_references pref ON pref.run_id = p.id AND pref.superseded = 0 AND pref.metadata_only = 0
+	      WHERE p.reused_from_run_id = h.run_id)
+	FROM situation_observation_query_runs h
+	WHERE h.detail_expired = 0 AND h.completed_at < ?
+	  AND h.completed_at >= ? AND (h.completed_at > ? OR h.run_id > ?)
+	ORDER BY h.completed_at ASC, h.run_id ASC
+	LIMIT ?`
+
+// pruneObservationDetailsPage reads one page of pending runs after `after`
+// and expires up to limit unused ones in the same transaction. done reports
+// that the page reached the last pending run past the cutoff.
+func (s *Store) pruneObservationDetailsPage(ctx context.Context, now time.Time, after observationDetailCursor, limit int) (int, observationDetailCursor, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("store: begin prune observation details: %w", err)
+		return 0, after, false, fmt.Errorf("store: begin prune observation details: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `
-		SELECT r.id FROM situation_observation_query_runs h
-		CROSS JOIN situation_observation_runs r ON r.id = h.run_id
-		WHERE h.detail_expired = 0 AND h.completed_at < ?
-		  AND (substr(h.completed_at, 1, 19) || '.' ||
-		       substr(substr(rtrim(h.completed_at, 'Z'), 21) || '000000000', 1, 9) || 'Z') <= ?
-		  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
-		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND ref.superseded = 0 AND ref.metadata_only = 0)
-		  AND NOT EXISTS (
-		      SELECT 1 FROM situation_observation_runs p
-		      JOIN situation_observation_references pref ON pref.run_id = p.id AND pref.superseded = 0 AND pref.metadata_only = 0
-		      WHERE p.reused_from_run_id = r.id)
-		ORDER BY h.completed_at ASC, h.run_id ASC
-		LIMIT ?`, upperBound, cutoff, limit)
+	runIDs, next, done, err := readObservationDetailPage(ctx, tx, now, after, limit)
 	if err != nil {
-		return 0, fmt.Errorf("store: query prunable observation runs: %w", err)
-	}
-	runIDs, err := scanStringRows(rows)
-	if err != nil {
-		return 0, fmt.Errorf("store: read prunable observation run ids: %w", err)
+		return 0, after, false, err
 	}
 
 	expiredAt := canonicalTime(now)
@@ -1555,19 +1589,52 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 		// record exists and no live reference protects it.
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO situation_observation_detail_expirations (run_id, expired_at) VALUES (?, ?)`, runID, expiredAt); err != nil {
-			return 0, fmt.Errorf("store: record detail expiration for run %s: %w", runID, err)
+			return 0, after, false, fmt.Errorf("store: record detail expiration for run %s: %w", runID, err)
 		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM situation_observation_fact_payloads
 			WHERE fact_id IN (SELECT id FROM situation_observation_facts WHERE run_id = ?)`, runID); err != nil {
-			return 0, fmt.Errorf("store: delete expired fact payloads for run %s: %w", runID, err)
+			return 0, after, false, fmt.Errorf("store: delete expired fact payloads for run %s: %w", runID, err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("store: commit prune observation details: %w", err)
+		return 0, after, false, fmt.Errorf("store: commit prune observation details: %w", err)
 	}
-	return len(runIDs), nil
+	return len(runIDs), next, done, nil
+}
+
+// readObservationDetailPage reads one details page: the unused runs among at
+// most observationRetentionPageRows pending runs after `after`, stopping early
+// at limit unused runs or after observationRetentionPageTime.
+func readObservationDetailPage(ctx context.Context, tx *sql.Tx, now time.Time, after observationDetailCursor, limit int) ([]string, observationDetailCursor, bool, error) {
+	upperBound, cutoff := observationRetentionCutoff(now)
+	started := time.Now()
+	rows, err := tx.QueryContext(ctx, observationDetailPage, cutoff, upperBound,
+		after.completedAt, after.completedAt, after.runID, observationRetentionPageRows)
+	if err != nil {
+		return nil, after, false, fmt.Errorf("store: query prunable observation runs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	next, read := after, 0
+	var runIDs []string
+	for rows.Next() {
+		var prunable bool
+		if err := rows.Scan(&next.completedAt, &next.runID, &prunable); err != nil {
+			return nil, after, false, fmt.Errorf("store: read prunable observation run: %w", err)
+		}
+		read++
+		if prunable {
+			runIDs = append(runIDs, next.runID)
+		}
+		if len(runIDs) == limit || time.Since(started) >= observationRetentionPageTime {
+			return runIDs, next, false, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, after, false, fmt.Errorf("store: read prunable observation runs: %w", err)
+	}
+	return runIDs, next, read < observationRetentionPageRows, nil
 }
 
 // AccrueInvestigationCredit adds up to cycleCap integer credit units to
