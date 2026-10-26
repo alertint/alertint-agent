@@ -36,8 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of again on every input version. Coverage is kept only for each
   Situation's current assessment, the only one ever read. After upgrading, the
   first maintenance passes move existing briefings into compressed storage and
-  delete repeated facts, in the background. The database file does not shrink;
-  the freed space is reused.
+  delete repeated facts, in the background. On a 2 GB database the upgrade's
+  migration adds about 15-20 s before the agent is ready, and the first pass
+  takes about 5 minutes, during which Situation updates take about twice as
+  long; both grow with the database. The database file does not shrink; the
+  freed space is reused.
 
 ## [0.15.7] - 2026-10-25
 
