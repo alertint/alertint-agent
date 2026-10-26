@@ -174,12 +174,7 @@ func retentionStateTx(ctx context.Context, tx *sql.Tx, key string) (int64, error
 }
 
 func setRetentionStateTx(ctx context.Context, tx *sql.Tx, key string, value int64) error {
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO storage_retention_state (key, value) VALUES (?, ?)
-		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, strconv.FormatInt(value, 10)); err != nil {
-		return fmt.Errorf("write retention state %s: %w", key, err)
-	}
-	return nil
+	return setRetentionStateTextTx(ctx, tx, key, strconv.FormatInt(value, 10))
 }
 
 func (s *Store) retentionState(ctx context.Context, key string) (int64, error) {
@@ -193,8 +188,9 @@ func (s *Store) retentionState(ctx context.Context, key string) (int64, error) {
 
 // cutoffText is cutoff as a stored timestamp prefix for SQL range filters. A
 // stored RFC3339Nano value within cutoff's second sorts before it, so such a
-// filter can include a row up to a second early; the Go-side checks compare
-// exact instants.
+// filter can include a row up to a second early. The paged walks compare
+// exact instants in Go; the lifecycle-decision and ended-Situation filters
+// accept the second, which is nothing against a retention of days.
 func cutoffText(cutoff time.Time) string {
 	return cutoff.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
 }

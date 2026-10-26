@@ -135,6 +135,32 @@ func TestAppendSituationFactsConflictingContentFailsClosed(t *testing.T) {
 	}
 }
 
+// A replay whose content equals the current head is not a repeat when a row
+// with its ID already holds other content: it still fails closed.
+func TestAppendSituationFactsConflictingReplayEqualToHeadFailsClosed(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-facts-conflict-head", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	first := factFixture("fact-v1", sitID, 1, now)
+	head := factFixture("fact-v2", sitID, 2, now.Add(time.Minute))
+	head.Digest = first.Digest
+	head.Value = json.RawMessage(`{"class":"long"}`)
+	for _, f := range []situationmodel.Fact{first, head} {
+		if err := st.AppendSituationFacts(context.Background(), claim, []situationmodel.Fact{f}); err != nil {
+			t.Fatalf("append %s: %v", f.ID, err)
+		}
+	}
+
+	replay := first
+	replay.Value = head.Value
+	err := st.AppendSituationFacts(context.Background(), claim, []situationmodel.Fact{replay})
+	if !errors.Is(err, ErrImmutableConflict) {
+		t.Fatalf("replay of fact-v1 with the head's content = %v, want ErrImmutableConflict", err)
+	}
+}
+
 // TestAppendDerivedFactsAfterADeliveryAttachesAtSameInputVersion is #99's
 // fact conflict: a delivery attached to an Incident before its Situation
 // input is applied is visible to a second reconcile of the same

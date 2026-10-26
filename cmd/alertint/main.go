@@ -204,7 +204,17 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	auditor := audit.New(st.DB())
 	maintenance := &storageMaintenance{st: st, auditLog: auditor, policy: storagePolicy(cfg), logger: logger,
 		now: func() time.Time { return time.Now().UTC() }}
-	go maintenance.run(ctx)
+	// A pass in flight ends before the store closes, on every return path.
+	maintenanceCtx, stopMaintenance := context.WithCancel(ctx)
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		maintenance.run(maintenanceCtx)
+	}()
+	defer func() {
+		stopMaintenance()
+		<-maintenanceDone
+	}()
 
 	// Load the rule engine. The embedded baseline pack needs zero
 	// configuration; an optional local pack dir overrides it, and future

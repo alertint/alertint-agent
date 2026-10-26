@@ -868,7 +868,9 @@ func appendFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) error {
 		return fmt.Errorf("store: read situation fact head for %s: %w", p.f.ID, err)
 	}
 	if hasHead && headHash == p.contentHash {
-		return nil
+		// A repeat of the head, unless a row with this ID already holds
+		// other content.
+		return matchStoredFactTx(ctx, tx, p)
 	}
 	inserted, err := insertFactTx(ctx, tx, p)
 	if err != nil || !inserted {
@@ -910,15 +912,24 @@ func insertFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) (bool, error)
 	if n == 1 {
 		return true, nil
 	}
+	return false, matchStoredFactTx(ctx, tx, p)
+}
 
+// matchStoredFactTx compares p with the stored row of the same id, if there
+// is one: an exact match is an idempotent replay, any mismatch is
+// ErrImmutableConflict.
+func matchStoredFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) error {
 	var situationID, kind, subject, digest, valueJSON, resultStatus, evidenceRefsJSON string
 	var inputVersion, material int
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT situation_id, input_version, kind, subject, digest, value_json, result_status, evidence_refs_json, material
 		FROM situation_facts WHERE id = ?`, p.f.ID).Scan(
 		&situationID, &inputVersion, &kind, &subject, &digest, &valueJSON, &resultStatus, &evidenceRefsJSON, &material)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
-		return false, fmt.Errorf("store: read existing situation fact %s: %w", p.f.ID, err)
+		return fmt.Errorf("store: read existing situation fact %s: %w", p.f.ID, err)
 	}
 	// observed_at is deliberately excluded from this equality check (Task 10
 	// replay finding): every DeriveStoreFacts call (facts.go) sets it fresh
@@ -939,9 +950,9 @@ func insertFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) (bool, error)
 	if situationID != p.f.SituationID || inputVersion != p.f.InputVersion || kind != p.f.Kind || subject != p.f.Subject ||
 		digest != p.f.Digest || valueJSON != p.valueJSON || resultStatus != string(p.f.ResultStatus) ||
 		evidenceRefsJSON != p.evidenceRefsJSON || material != p.material {
-		return false, fmt.Errorf("store: situation fact %s: %w", p.f.ID, ErrImmutableConflict)
+		return fmt.Errorf("store: situation fact %s: %w", p.f.ID, ErrImmutableConflict)
 	}
-	return false, nil
+	return nil
 }
 
 // ----------------------------------------------------------------------

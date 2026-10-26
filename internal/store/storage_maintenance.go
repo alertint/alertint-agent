@@ -165,8 +165,14 @@ func (s *Store) shrinkToLimit(ctx context.Context, now time.Time, limit int64, u
 		}
 		cutoffs.work, cutoffs.audit = later(cutoffs.work, sizeCutoff), later(cutoffs.audit, sizeCutoff)
 		cutoffs.observation = later(cutoffs.observation, sizeCutoff)
+		before := removed.Total()
 		if err := s.expireBefore(ctx, now, cutoffs.work, cutoffs.audit, cutoffs.observation, auditLog, removed); err != nil {
 			return usage, err
+		}
+		if removed.Total() == before {
+			// The oldest record outlived its cutoff: further steps would
+			// repeat the same walk.
+			return s.measureStorage(ctx)
 		}
 		if usage, err = s.measureStorage(ctx); err != nil {
 			return usage, err

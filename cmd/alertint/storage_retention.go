@@ -65,12 +65,14 @@ func (m *storageMaintenance) run(ctx context.Context) {
 
 func (m *storageMaintenance) pass(ctx context.Context) {
 	now := m.now().UTC()
+	// A failed step still returns what the other steps did and what was
+	// measured, so the removal line and the warnings below still apply.
 	report, err := m.st.RunStorageMaintenance(ctx, now, m.policy, m.auditLog)
 	if err != nil {
-		if ctx.Err() == nil {
-			m.logger.Warn("store: storage maintenance failed; next pass in an hour", slog.String("err", err.Error()))
+		if ctx.Err() != nil {
+			return
 		}
-		return
+		m.logger.Warn("store: storage maintenance failed; next pass in an hour", slog.String("err", err.Error()))
 	}
 	if r := report.Removed; r.Total() > 0 {
 		m.logger.Info("store: storage maintenance",

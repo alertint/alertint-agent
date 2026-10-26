@@ -91,6 +91,21 @@ func TestStorageMaintenanceQuietWhenNothingHappened(t *testing.T) {
 	}
 }
 
+// One step that fails every pass must not hide the warnings: the pass still
+// measured the volume and returned its report.
+func TestStorageMaintenanceWarnsWhenAStepFailed(t *testing.T) {
+	f := &fakeMaintainer{report: store.StorageReport{UsedBytes: 9 << 30, VolumeBytes: 10 << 30, VolumeFreeBytes: 512 << 20},
+		err: errors.New("store: compact legacy briefing: boom")}
+	var logs bytes.Buffer
+	m := &storageMaintenance{st: f, logger: slog.New(slog.NewTextHandler(&logs, nil)), now: time.Now}
+	m.pass(context.Background())
+	for _, want := range []string{"storage maintenance failed", "less than 10% free"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("log lacks %q:\n%s", want, logs.String())
+		}
+	}
+}
+
 func TestStorageMaintenanceRunsAtStartThenEveryInterval(t *testing.T) {
 	start, interval := storageMaintenanceStart, storageMaintenanceInterval
 	t.Cleanup(func() { storageMaintenanceStart, storageMaintenanceInterval = start, interval })
