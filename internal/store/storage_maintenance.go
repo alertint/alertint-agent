@@ -81,22 +81,21 @@ const (
 func (s *Store) RunStorageMaintenance(ctx context.Context, now time.Time, policy StoragePolicy, auditLog AuditRetention) (StorageReport, error) {
 	started := time.Now()
 	report := StorageReport{RetentionDays: policy.RetentionDays, AuditRetentionDays: policy.AuditRetentionDays}
+	// A step that fails on one row fails on it every pass, so no step holds
+	// back the others; the pass reports every failure.
+	var errs []error
 	removed, err := s.CompactStorageBacklog(ctx)
 	report.Removed = report.Removed.plus(removed)
-	if err != nil {
-		return report, err
-	}
+	errs = append(errs, err)
 
 	workCutoff := retentionCutoff(now, policy.RetentionDays)
 	auditCutoff := retentionCutoff(now, policy.AuditRetentionDays)
 	observationCutoff := now.Add(-observationDetailRetention)
-	if err := s.expireBefore(ctx, now, workCutoff, auditCutoff, observationCutoff, auditLog, &report.Removed); err != nil {
-		return report, err
-	}
+	errs = append(errs, s.expireBefore(ctx, now, workCutoff, auditCutoff, observationCutoff, auditLog, &report.Removed))
 
 	usage, err := s.measureStorage(ctx)
 	if err != nil {
-		return report, err
+		return report, errors.Join(append(errs, err)...)
 	}
 	limit := policy.SizeBytes
 	if limit <= 0 && policy.SizePercent > 0 && usage.volume > 0 {
@@ -105,8 +104,11 @@ func (s *Store) RunStorageMaintenance(ctx context.Context, now time.Time, policy
 	if limit > 0 && usage.used > limit {
 		report.ShortenedBySizeLimit = true
 		cutoffs := sizeCutoffs{work: workCutoff, audit: auditCutoff, observation: observationCutoff}
-		if usage, err = s.shrinkToLimit(ctx, now, limit, usage, cutoffs, auditLog, &report.Removed); err != nil {
-			return report, err
+		var shrunk storageUsage
+		if shrunk, err = s.shrinkToLimit(ctx, now, limit, usage, cutoffs, auditLog, &report.Removed); err != nil {
+			errs = append(errs, err)
+		} else {
+			usage = shrunk
 		}
 	}
 
@@ -115,7 +117,7 @@ func (s *Store) RunStorageMaintenance(ctx context.Context, now time.Time, policy
 	report.VolumeBytes, report.VolumeFreeBytes = usage.volume, usage.free
 	kept, err := s.oldestWorkingRecord(ctx)
 	if err != nil {
-		return report, err
+		return report, errors.Join(append(errs, err)...)
 	}
 	if !kept.IsZero() {
 		report.KeptSince = &kept
@@ -123,7 +125,7 @@ func (s *Store) RunStorageMaintenance(ctx context.Context, now time.Time, policy
 	if auditLog != nil {
 		at, ok, err := auditLog.OldestEntry(ctx)
 		if err != nil {
-			return report, err
+			return report, errors.Join(append(errs, err)...)
 		}
 		if ok {
 			report.AuditKeptSince = &at
@@ -134,7 +136,7 @@ func (s *Store) RunStorageMaintenance(ctx context.Context, now time.Time, policy
 	}
 	report.PassSeconds = time.Since(started).Seconds()
 	s.storageReport.Store(&report)
-	return report, nil
+	return report, errors.Join(errs...)
 }
 
 // sizeCutoffs are the cutoffs one size-limit step applies.
@@ -185,15 +187,12 @@ func (s *Store) StorageReport() (StorageReport, bool) {
 func (s *Store) expireBefore(ctx context.Context, now, workCutoff, auditCutoff, observationCutoff time.Time, auditLog AuditRetention, removed *StorageRemoved) error {
 	r, err := s.ExpireWorkingRecord(ctx, now, workCutoff, observationCutoff)
 	*removed = removed.plus(r)
-	if err != nil {
+	if auditLog == nil || auditCutoff.IsZero() {
 		return err
 	}
-	if auditLog == nil || auditCutoff.IsZero() {
-		return nil
-	}
-	n, err := auditLog.PruneBefore(ctx, auditCutoff)
+	n, auditErr := auditLog.PruneBefore(ctx, auditCutoff)
 	removed.Audit += n
-	return err
+	return errors.Join(err, auditErr)
 }
 
 func retentionCutoff(now time.Time, days int) time.Time {

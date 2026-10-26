@@ -188,6 +188,10 @@ ALTER TABLE situation_assessment_attempts ADD COLUMN evidence_released_at TEXT
     CHECK (evidence_released_at IS NULL OR evidence_released_at <> '');
 CREATE INDEX situation_assessment_attempts_unreleased_idx ON situation_assessment_attempts(evidence_released_at)
     WHERE evidence_released_at IS NULL;
+-- Open preparation cycles nothing can resume (a later input or generation
+-- overtook them) are removed by age; there are few open ones at any time.
+CREATE INDEX situation_preparation_cycles_open_age_idx ON situation_preparation_cycles(created_at)
+    WHERE sealed = 0;
 -- A call pins its evidence under its own ID at dispatch (draft and
 -- verification alike); retention finds a call's attempt by work attempt.
 CREATE INDEX situation_assessment_attempts_work_idx

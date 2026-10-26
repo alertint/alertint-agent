@@ -29,9 +29,10 @@ const (
 
 // PruneObservationRetention runs one retention pass at now: it expires every
 // unused detail past the ten-day cutoff, drops the refresh cursors that read
-// as no cursor, trims old cycles to the runs something needs, then removes
-// every sealed cycle left with nothing to keep. Returns the expired runs,
-// dropped cursors, trimmed plans and removed cycles.
+// as no cursor, removes open cycles nothing can resume, trims old cycles to
+// the runs something needs, then removes every sealed cycle left with
+// nothing to keep. Returns the expired runs, dropped cursors, removed or
+// trimmed abandoned cycles and plans, trimmed plans and removed cycles.
 func (s *Store) PruneObservationRetention(ctx context.Context, now time.Time) (int, error) {
 	return s.PruneObservationRetentionBefore(ctx, now, now.Add(-observationDetailRetention))
 }
@@ -48,12 +49,95 @@ func (s *Store) PruneObservationRetentionBefore(ctx context.Context, now, cutoff
 	if err != nil {
 		return runs + cursors, err
 	}
+	abandoned, err := s.pruneAbandonedCycles(ctx, cutoff)
+	if err != nil {
+		return runs + cursors + abandoned, err
+	}
 	trimmed, err := s.trimObservationCycles(ctx, cutoff)
 	if err != nil {
-		return runs + cursors + trimmed, err
+		return runs + cursors + abandoned + trimmed, err
 	}
 	cycles, err := s.pruneObservationMetadata(ctx, cutoff, 0)
-	return runs + cursors + trimmed + cycles, err
+	return runs + cursors + abandoned + trimmed + cycles, err
+}
+
+// pruneAbandonedCycles removes open cycles nothing can resume, created
+// before cutoff: BeginPreparation resumes only the cycle of the Situation's
+// current input at its next generation, so a cycle a later input or a newer
+// generation overtook (or whose Situation ended) never seals. The other
+// walks read only sealed cycles, so these stayed forever, and their reuse
+// plans kept their sources' cycles too. Each is trimmed like a sealed one,
+// then removed whole once no plan is left and no cursor names it.
+func (s *Store) pruneAbandonedCycles(ctx context.Context, cutoff time.Time) (int, error) {
+	before := cutoffText(cutoff)
+	after := observationCycleCursor{sealedAt: before, rowID: math.MaxInt64}
+	return s.retentionPages(ctx, "prune abandoned observation cycles", func(tx *sql.Tx, deadline time.Time) (int, bool, error) {
+		heads, err := currentHeadRunsTx(ctx, tx)
+		if err != nil {
+			return 0, false, err
+		}
+		page, err := readAbandonedCyclePageTx(ctx, tx, before, after)
+		if err != nil {
+			return 0, false, err
+		}
+		removed := 0
+		for i, c := range page {
+			if i > 0 && time.Now().After(deadline) {
+				return removed, false, nil
+			}
+			n, err := trimObservationCycleTx(ctx, tx, c.id, heads)
+			if err != nil {
+				return removed, false, err
+			}
+			removed += n
+			var empty bool
+			if err := tx.QueryRowContext(ctx, `
+				SELECT NOT EXISTS (SELECT 1 FROM situation_observation_plans WHERE cycle_id = ?)
+				  AND NOT EXISTS (SELECT 1 FROM situation_observation_refresh WHERE admitted_cycle_id = ?)`,
+				c.id, c.id).Scan(&empty); err != nil {
+				return removed, false, fmt.Errorf("check abandoned cycle %s: %w", c.id, err)
+			}
+			if empty {
+				if err := pruneObservationCycleTx(ctx, tx, c.id); err != nil {
+					return removed, false, err
+				}
+				removed++
+			}
+			after = c.cursor
+		}
+		return removed, len(page) < observationRetentionPageRows, nil
+	})
+}
+
+// readAbandonedCyclePageTx reads, newest first after the cursor (created_at,
+// rowid), the open cycles created before `before` that nothing can resume.
+func readAbandonedCyclePageTx(ctx context.Context, tx *sql.Tx, before string, after observationCycleCursor) ([]trimCycle, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT c.created_at, c.rowid, c.id FROM situation_preparation_cycles c INDEXED BY situation_preparation_cycles_open_age_idx
+		JOIN situations s ON s.id = c.situation_id
+		WHERE c.sealed = 0 AND c.created_at < ?
+		  AND c.created_at <= ? AND (c.created_at < ? OR c.rowid < ?)
+		  AND s.current_preparation_cycle_id IS NOT c.id
+		  AND (s.input_version > c.input_version OR s.terminal_at IS NOT NULL
+		       OR (s.input_version = c.input_version AND c.generation <= s.preparation_generation))
+		ORDER BY c.created_at DESC, c.rowid DESC
+		LIMIT ?`, before, after.sealedAt, after.sealedAt, after.rowID, observationRetentionPageRows)
+	if err != nil {
+		return nil, fmt.Errorf("select abandoned cycles: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var page []trimCycle
+	for rows.Next() {
+		var c trimCycle
+		if err := rows.Scan(&c.cursor.sealedAt, &c.cursor.rowID, &c.id); err != nil {
+			return nil, fmt.Errorf("scan abandoned cycle: %w", err)
+		}
+		page = append(page, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read abandoned cycles: %w", err)
+	}
+	return page, nil
 }
 
 // pruneStaleRefreshCursors deletes the refresh cursors due since before
@@ -183,10 +267,8 @@ func currentHeadRunsTx(ctx context.Context, tx *sql.Tx) (map[string]bool, error)
 }
 
 // trimObservationCycleTx removes the plans of one cycle that nothing needs,
-// with their runs, requests and what hangs off them. A run is needed when it
-// still has detail, is decision evidence or current, is a reuse source, is a
-// live cursor's last run, is a query head, or is source provenance: the
-// same test the cycle prune applies to every run of a cycle.
+// with their runs, requests and what hangs off them: plans that never ran,
+// and plans whose run is neither observationRunNeeded nor a query head.
 func trimObservationCycleTx(ctx context.Context, tx *sql.Tx, cycleID string, heads map[string]bool) (int, error) {
 	unneeded, err := unneededPlansTx(ctx, tx, cycleID, heads)
 	if err != nil || len(unneeded) == 0 {
@@ -228,13 +310,7 @@ func unneededPlansTx(ctx context.Context, tx *sql.Tx, cycleID string, heads map[
 	rows, err := tx.QueryContext(ctx, `
 		SELECT p.id, COALESCE(r.id, '') FROM situation_observation_plans p
 		LEFT JOIN situation_observation_runs r ON r.plan_id = p.id
-		WHERE p.cycle_id = ? AND (r.id IS NULL OR (
-		  EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
-		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references x WHERE x.run_id = r.id AND (x.permanent = 1 OR x.superseded = 0))
-		  AND NOT EXISTS (SELECT 1 FROM situation_observation_runs u WHERE u.reused_from_run_id = r.id)
-		  AND NOT EXISTS (SELECT 1 FROM situation_observation_plans u WHERE u.reuse_run_id = r.id)
-		  AND NOT EXISTS (SELECT 1 FROM situation_observation_refresh f WHERE f.last_run_id = r.id)
-		  AND NOT EXISTS (SELECT 1 FROM zabbix_source_observations z WHERE z.run_id = r.id)))`, cycleID)
+		WHERE p.cycle_id = ? AND (r.id IS NULL OR NOT `+observationRunNeeded+`)`, cycleID)
 	if err != nil {
 		return nil, fmt.Errorf("select plans to trim in %s: %w", cycleID, err)
 	}
@@ -288,6 +364,19 @@ func (s *Store) pruneObservationMetadata(ctx context.Context, cutoff time.Time, 
 	}
 }
 
+// observationRunNeeded holds for a run r that retention keeps: its detail
+// has not expired, it is decision evidence or a live pointer's, it is a reuse
+// source, a live cursor's last run, or source provenance. The cycle prune
+// keeps a cycle with any such run; the trim keeps exactly these runs.
+const observationRunNeeded = `(
+	      NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
+	      OR EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND (ref.permanent = 1 OR ref.superseded = 0))
+	      OR EXISTS (SELECT 1 FROM situation_observation_runs p WHERE p.reused_from_run_id = r.id)
+	      OR EXISTS (SELECT 1 FROM situation_observation_plans p WHERE p.reuse_run_id = r.id)
+	      OR EXISTS (SELECT 1 FROM situation_observation_refresh f WHERE f.last_run_id = r.id)
+	      OR EXISTS (SELECT 1 FROM zabbix_source_observations z WHERE z.run_id = r.id)
+	    )`
+
 // observationCycleCursor is the last sealed cycle a metadata page examined.
 // rowid breaks ties in sealed_at the way the retention index orders them.
 type observationCycleCursor struct {
@@ -309,14 +398,7 @@ const observationCyclePage = `
 	  AND c.id NOT IN (SELECT cycle_id FROM protected_heads)
 	  AND NOT EXISTS (SELECT 1 FROM situation_observation_refresh f WHERE f.admitted_cycle_id = c.id)
 	  AND NOT EXISTS (
-	    SELECT 1 FROM situation_observation_runs r WHERE r.cycle_id = c.id AND (
-	      NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
-	      OR EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND (ref.permanent = 1 OR ref.superseded = 0))
-	      OR EXISTS (SELECT 1 FROM situation_observation_runs p WHERE p.reused_from_run_id = r.id)
-	      OR EXISTS (SELECT 1 FROM situation_observation_plans p WHERE p.reuse_run_id = r.id)
-	      OR EXISTS (SELECT 1 FROM situation_observation_refresh f WHERE f.last_run_id = r.id)
-	      OR EXISTS (SELECT 1 FROM zabbix_source_observations z WHERE z.run_id = r.id)
-	    )
+	    SELECT 1 FROM situation_observation_runs r WHERE r.cycle_id = c.id AND ` + observationRunNeeded + `
 	  )
 	FROM situation_preparation_cycles c
 	WHERE c.sealed = 1 AND c.sealed_at < ?

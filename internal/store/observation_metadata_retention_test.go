@@ -391,6 +391,92 @@ func TestObservationRetentionTrimsReuseChains(t *testing.T) {
 	}
 }
 
+// TestObservationRetentionRemovesAbandonedCycles: a preparation a new input
+// superseded before it sealed leaves an open cycle nothing can resume. Both
+// walks only looked at sealed cycles, so it stayed, and its reuse plan kept
+// its source's cycle too. Retention now removes it once its Situation has
+// moved to a later input.
+func TestObservationRetentionRemovesAbandonedCycles(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 6, 1, 8, 0, 0, 0, time.UTC)
+	id := newSituationForGroup(t, st, "service=retention", base)
+	claim := claimSituation(t, st, id, "abandoned", base)
+	fence := observationmodel.Fence{SituationID: id, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+	seal := func(cycleID string, at time.Time) {
+		t.Helper()
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := sealPreparationCycleTx(ctx, tx, id, cycleID, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	begin := func(at time.Time, plans ...observationmodel.Plan) observationmodel.Cycle {
+		t.Helper()
+		cycle, err := st.BeginPreparation(ctx, fence, observationmodel.CycleDraft{Anchor: at, ConfigDigest: "retention-config", Plans: plans}, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cycle
+	}
+	commit := func(run observationmodel.Run, at time.Time) {
+		t.Helper()
+		if err := st.CommitObservationRun(ctx, fence, run, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sourced := begin(base, testPlan(base))
+	source := consolidationRun("abandoned-source", sourced, base)
+	commit(source, base)
+	seal(sourced.ID, base)
+
+	at := base.Add(time.Second)
+	reuse := testPlan(at)
+	reuse.Tier, reuse.ReuseRunID = observationmodel.TierReuse, source.ID
+	abandoned := begin(at, reuse)
+	reused := consolidationRun("abandoned-reuse", abandoned, at)
+	reused.Facts, reused.ReusedFromRunID = nil, &source.ID
+	commit(reused, at)
+
+	// A new input arrives before the cycle seals; the next cycle is the new
+	// input's.
+	if _, err := st.db.ExecContext(ctx, `UPDATE situations SET input_version = input_version + 1 WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	fence.InputVersion++
+	next := base.Add(2 * time.Second)
+	nextPlan := testPlan(next)
+	nextPlan.Scope.SubjectID = "signal-next"
+	current := begin(next, nextPlan)
+	commit(consolidationRun("abandoned-next", current, next), next)
+	seal(current.ID, next)
+
+	if _, err := st.PruneObservationRetention(ctx, base.Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.db.QueryContext(ctx, `SELECT id FROM situation_preparation_cycles`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := scanStrings(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != 1 || kept[0] != current.ID {
+		t.Fatalf("cycles kept = %v, want only the current %s", kept, current.ID)
+	}
+	if n, err := dbForeignKeyCheck(st); err != nil || n != 0 {
+		t.Fatalf("foreign keys: %d, %v", n, err)
+	}
+}
+
 // TestObservationRetentionDropsStaleRefreshCursors: a subject served once and
 // never again keeps a refresh cursor that is long due and whose last run's
 // detail has expired; it reads like no cursor at all, so retention deletes it

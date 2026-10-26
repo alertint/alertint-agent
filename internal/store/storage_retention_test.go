@@ -686,6 +686,43 @@ func TestStorageMaintenanceWithinLimitsRemovesNothing(t *testing.T) {
 	}
 }
 
+// TestStorageMaintenanceStepsFailIndependently: a step that fails on one row
+// would fail on it every hour, so it must not hold back the others: with the
+// backlog failing, the working record still expires and the audit log is
+// still pruned, and the pass reports the failure.
+func TestStorageMaintenanceStepsFailIndependently(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "service=independent", base)
+	old := retentionTransition(sitID, 1, base, retentionBriefing(5, false))
+	insertRetentionTransitions(t, st, false, old)
+	insertRetentionTransitions(t, st, true, retentionTransition(sitID, 2, base.Add(time.Hour), retentionBriefing(5, true)))
+	auditor := audit.New(st.db)
+	if err := auditor.Append(ctx, "test", "test.old", map[string]int{"n": 1}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { retentionFailpoint = nil })
+	retentionFailpoint = func(step string) error {
+		if step == "backlog" {
+			return errors.New("backlog refused a row")
+		}
+		return nil
+	}
+
+	now := time.Now().UTC().Add(400 * 24 * time.Hour)
+	report, err := st.RunStorageMaintenance(ctx, now, StoragePolicy{RetentionDays: 90, AuditRetentionDays: 365}, auditor)
+	if err == nil || !strings.Contains(err.Error(), "backlog refused a row") {
+		t.Fatalf("err = %v, want the backlog failure reported", err)
+	}
+	if report.Removed.TransitionDetails != 1 || report.Removed.Audit == 0 {
+		t.Fatalf("removed %+v: expiry and the audit prune must still run", report.Removed)
+	}
+	if stored, ok := st.StorageReport(); !ok || stored.CheckedAt.IsZero() {
+		t.Fatalf("StorageReport = %+v, %v; a partly failed pass still reports", stored, ok)
+	}
+}
+
 // TestControllerKeepsWorkingAfterRetention: a maintenance pass with every
 // record past its cutoff leaves the current state the controller reads, so
 // the next reconcile commits as usual and reads its prior Transition whole.

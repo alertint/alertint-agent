@@ -76,16 +76,20 @@ func (r StorageRemoved) Total() int {
 // finished step costs one read.
 func (s *Store) CompactStorageBacklog(ctx context.Context) (StorageRemoved, error) {
 	var out StorageRemoved
-	var err error
-	if out.Coverage, err = s.pruneSupersededCoverage(ctx); err != nil {
-		return out, err
+	if retentionFailpoint != nil {
+		if err := retentionFailpoint("backlog"); err != nil {
+			return out, err
+		}
 	}
-	if out.CompactedBriefings, err = s.compactLegacyBriefings(ctx); err != nil {
-		return out, err
-	}
-	out.RepeatedFacts, err = s.pruneLegacyFactRepeats(ctx)
-	return out, err
+	var errs [3]error
+	out.Coverage, errs[0] = s.pruneSupersededCoverage(ctx)
+	out.CompactedBriefings, errs[1] = s.compactLegacyBriefings(ctx)
+	out.RepeatedFacts, errs[2] = s.pruneLegacyFactRepeats(ctx)
+	return out, errors.Join(errs[:]...)
 }
+
+// retentionFailpoint, set only by tests, fails the named maintenance step.
+var retentionFailpoint func(step string) error
 
 // ExpireWorkingRecord removes the working record older than cutoff, at now:
 // the detail of Transitions nothing current uses, the evidence of old
@@ -94,23 +98,15 @@ func (s *Store) CompactStorageBacklog(ctx context.Context) (StorageRemoved, erro
 // observationCutoff.
 func (s *Store) ExpireWorkingRecord(ctx context.Context, now, cutoff, observationCutoff time.Time) (StorageRemoved, error) {
 	var out StorageRemoved
-	var err error
+	var errs [5]error
 	if !cutoff.IsZero() {
-		if out.TransitionDetails, err = s.expireTransitionDetails(ctx, now, cutoff); err != nil {
-			return out, err
-		}
-		if out.AttemptEvidence, err = s.releaseAttemptEvidence(ctx, now, cutoff); err != nil {
-			return out, err
-		}
-		if out.LifecycleEvidence, err = s.releaseLifecycleEvidence(ctx, cutoff); err != nil {
-			return out, err
-		}
-		if out.Facts, err = s.expireFacts(ctx, cutoff); err != nil {
-			return out, err
-		}
+		out.TransitionDetails, errs[0] = s.expireTransitionDetails(ctx, now, cutoff)
+		out.AttemptEvidence, errs[1] = s.releaseAttemptEvidence(ctx, now, cutoff)
+		out.LifecycleEvidence, errs[2] = s.releaseLifecycleEvidence(ctx, cutoff)
+		out.Facts, errs[3] = s.expireFacts(ctx, cutoff)
 	}
-	out.Observation, err = s.PruneObservationRetentionBefore(ctx, now, observationCutoff)
-	return out, err
+	out.Observation, errs[4] = s.PruneObservationRetentionBefore(ctx, now, observationCutoff)
+	return out, errors.Join(errs[:]...)
 }
 
 // retentionPages runs page until it reports done, one transaction per page,
