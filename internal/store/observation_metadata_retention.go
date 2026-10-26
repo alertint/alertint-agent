@@ -28,8 +28,9 @@ const (
 )
 
 // PruneObservationRetention runs one retention pass at now: it expires every
-// unused detail past the ten-day cutoff, then removes every sealed cycle left
-// with nothing to keep. Returns the expired runs plus the removed cycles.
+// unused detail past the ten-day cutoff, drops the refresh cursors that read
+// as no cursor, then removes every sealed cycle left with nothing to keep.
+// Returns the expired runs, dropped cursors and removed cycles.
 func (s *Store) PruneObservationRetention(ctx context.Context, now time.Time) (int, error) {
 	return s.PruneObservationRetentionBefore(ctx, now, now.Add(-observationDetailRetention))
 }
@@ -42,8 +43,49 @@ func (s *Store) PruneObservationRetentionBefore(ctx context.Context, now, cutoff
 	if err != nil {
 		return runs, err
 	}
+	cursors, err := s.pruneStaleRefreshCursors(ctx, cutoff)
+	if err != nil {
+		return runs + cursors, err
+	}
 	cycles, err := s.pruneObservationMetadata(ctx, cutoff, 0)
-	return runs + cycles, err
+	return runs + cursors + cycles, err
+}
+
+// pruneStaleRefreshCursors deletes the refresh cursors due since before
+// cutoff whose last run's detail has expired. Such a cursor reads exactly
+// like no cursor (due, nothing to reuse: LoadObservationRefreshCursors), but
+// it pins its last run's cycle, so a subject never served again (a pod that
+// went away) kept that cycle forever. Migration 0027 calls cursors never
+// deleted; that holds for every cursor that still changes what the preparer
+// does. A subject served again starts a new cursor.
+func (s *Store) pruneStaleRefreshCursors(ctx context.Context, cutoff time.Time) (int, error) {
+	var after int64
+	before := cutoffText(cutoff)
+	return s.retentionPages(ctx, "prune stale refresh cursors", func(tx *sql.Tx, deadline time.Time) (int, bool, error) {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT rowid FROM situation_observation_refresh
+			WHERE rowid > ? AND next_refresh_at < ?
+			  AND (last_run_id IS NULL OR EXISTS (
+			    SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = last_run_id))
+			ORDER BY rowid LIMIT ?`, after, before, retentionPageRows)
+		if err != nil {
+			return 0, false, fmt.Errorf("select stale refresh cursors: %w", err)
+		}
+		rowIDs, err := scanRowIDs(rows)
+		if err != nil {
+			return 0, false, err
+		}
+		for i, rowID := range rowIDs {
+			if i > 0 && time.Now().After(deadline) {
+				return i, false, nil
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM situation_observation_refresh WHERE rowid = ?`, rowID); err != nil {
+				return i, false, fmt.Errorf("delete stale refresh cursor: %w", err)
+			}
+			after = rowID
+		}
+		return len(rowIDs), len(rowIDs) < retentionPageRows, nil
+	})
 }
 
 // PruneUnusedObservationMetadata removes sealed cycles older than ten days

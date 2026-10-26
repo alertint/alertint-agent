@@ -254,6 +254,46 @@ func TestObservationMetadataPruningPreservesOlderQuerySlotHead(t *testing.T) {
 	}
 }
 
+// TestObservationRetentionDropsStaleRefreshCursors: a subject served once and
+// never again keeps a refresh cursor that is long due and whose last run's
+// detail has expired; it reads like no cursor at all, so retention deletes it
+// and, once the input has moved on (query-slot heads are the current input's),
+// the cycle it pinned goes. A live subject's cursor stays.
+func TestObservationRetentionDropsStaleRefreshCursors(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 6, 1, 8, 0, 0, 0, time.UTC)
+	stale := testPlan(base)
+	stale.Scope.SubjectID = "signal-gone"
+	sitID, cycles := metadataRetentionCyclesAt(t, st, 4, false, false, time.Second, base, stale)
+	if _, err := st.db.ExecContext(ctx, `UPDATE situations SET input_version = input_version + 1 WHERE id = ?`, sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.PruneObservationRetention(ctx, base.Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for i, kept := range []bool{false, false, false, true} {
+		var n int
+		if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_preparation_cycles WHERE id = ?`, cycles[i].ID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if (n == 1) != kept {
+			t.Errorf("cycle %d kept = %v, want %v", i, n == 1, kept)
+		}
+	}
+	cursors, err := st.LoadObservationRefreshCursors(ctx, sitID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cursors) != 1 || cursors[0].Subject != "signal-a" {
+		t.Fatalf("cursors = %+v, want only the live subject's", cursors)
+	}
+	if n, err := dbForeignKeyCheck(st); err != nil || n != 0 {
+		t.Fatalf("foreign keys: %d, %v", n, err)
+	}
+}
+
 func TestObservationMetadataPruningRollsBackWholeBatch(t *testing.T) {
 	st := newTestStore(t)
 	_, cycles := metadataRetentionCycles(t, st, 3, false, false)

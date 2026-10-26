@@ -39,8 +39,8 @@ type StorageRemoved struct {
 	Coverage int `json:"coverage"`
 	// TransitionDetails counts Transitions whose detail expired.
 	TransitionDetails int `json:"transition_details"`
-	// AttemptEvidence counts assessment attempts and calls that released
-	// their evidence.
+	// AttemptEvidence counts assessment attempts that released their
+	// evidence (their calls' with it), and calls that never got an attempt.
 	AttemptEvidence int `json:"attempt_evidence"`
 	// LifecycleEvidence counts old lifecycle decisions that released theirs.
 	LifecycleEvidence int `json:"lifecycle_evidence"`
@@ -909,6 +909,22 @@ func (s *Store) expireLegacyFacts(ctx context.Context, cutoff time.Time) (int, e
 		}
 		return removed, reached, setRetentionStateTx(ctx, tx, "facts_legacy_age_cursor", cursor)
 	})
+}
+
+func scanRowIDs(rows *sql.Rows) ([]int64, error) {
+	defer func() { _ = rows.Close() }()
+	var out []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read rows: %w", err)
+	}
+	return out, nil
 }
 
 func scanStrings(rows *sql.Rows) ([]string, error) {
