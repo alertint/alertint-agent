@@ -716,26 +716,34 @@ func (s *Server) handleVerifyAudit(ctx context.Context, _ mcplib.CallToolRequest
 		OK           bool   `json:"ok"`
 		RowsChecked  int    `json:"rows_checked"`
 		FirstErrorAt *int64 `json:"first_error_seq,omitempty"`
-		Message      string `json:"message"`
+		// PrunedThroughSeq is set when storage retention removed the oldest
+		// entries: the chain is verified from the anchor that records them.
+		PrunedThroughSeq *int64 `json:"pruned_through_seq,omitempty"`
+		Message          string `json:"message"`
 	}
 
 	resp := response{}
-	if err != nil {
-		resp.OK = false
-		if report != nil {
-			seq := report.FailedSeq
-			resp.FirstErrorAt = &seq
-			resp.RowsChecked = report.RowsChecked
-			resp.Message = fmt.Sprintf("chain broken at seq %d: %s", report.FailedSeq, report.Reason)
-		} else {
-			resp.Message = "verification failed: " + err.Error()
-		}
-	} else {
+	switch {
+	case err != nil && report != nil:
+		seq := report.FailedSeq
+		resp.FirstErrorAt = &seq
+		resp.RowsChecked = report.RowsChecked
+		resp.Message = fmt.Sprintf("chain broken at seq %d: %s", report.FailedSeq, report.Reason)
+	case err != nil:
+		resp.Message = "verification failed: " + err.Error()
+	case report == nil:
 		resp.OK = true
-		if report != nil {
-			resp.RowsChecked = report.RowsChecked
-		}
+		resp.Message = "audit chain intact: 0 row(s) verified"
+	default:
+		resp.OK = true
+		resp.RowsChecked = report.RowsChecked
 		resp.Message = fmt.Sprintf("audit chain intact: %d row(s) verified", resp.RowsChecked)
+		if report.PrunedThroughSeq > 0 {
+			through := report.PrunedThroughSeq
+			resp.PrunedThroughSeq = &through
+			resp.Message += fmt.Sprintf(" from seq %d; entries through seq %d were removed by storage retention (anchor at seq %d)",
+				report.FirstSeq, through, report.AnchorSeq)
+		}
 	}
 
 	result, err := mcplib.NewToolResultJSON(resp)

@@ -202,6 +202,19 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	pruneChangesAtStartup(ctx, cfg, st, logger)
 
 	auditor := audit.New(st.DB())
+	maintenance := &storageMaintenance{st: st, auditLog: auditor, policy: storagePolicy(cfg), logger: logger,
+		now: func() time.Time { return time.Now().UTC() }}
+	// A pass in flight ends before the store closes, on every return path.
+	maintenanceCtx, stopMaintenance := context.WithCancel(ctx)
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		maintenance.run(maintenanceCtx)
+	}()
+	defer func() {
+		stopMaintenance()
+		<-maintenanceDone
+	}()
 
 	// Load the rule engine. The embedded baseline pack needs zero
 	// configuration; an optional local pack dir overrides it, and future
@@ -947,6 +960,10 @@ func runVerifyAudit(args []string, stdout, stderr io.Writer) error {
 		return verr
 	}
 	_, _ = fmt.Fprintf(stdout, "audit verification OK: %d row(s) checked\n", report.RowsChecked)
+	if report.PrunedThroughSeq > 0 {
+		_, _ = fmt.Fprintf(stdout, "chain verified from seq %d; entries through seq %d were removed by storage retention (anchor at seq %d)\n",
+			report.FirstSeq, report.PrunedThroughSeq, report.AnchorSeq)
+	}
 	return nil
 }
 

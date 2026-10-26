@@ -423,6 +423,11 @@ type Transition struct {
 	Actor                   TransitionActor       `json:"actor"`
 	Drill                   bool                  `json:"drill,omitempty"`
 	CreatedAt               time.Time             `json:"created_at"`
+	// DetailExpired is set on a Transition read back after storage retention
+	// dropped its detail: Projection.Briefing, the operator delta's
+	// candidates and EvidenceRefs are then empty because they expired, not
+	// because the Transition never had them. Never set on a new Transition.
+	DetailExpired bool `json:"detail_expired,omitempty"`
 }
 
 // MarshalJSON canonicalizes EvidenceRefs to [] before marshaling: a

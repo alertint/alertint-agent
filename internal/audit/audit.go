@@ -125,12 +125,48 @@ type VerifyReport struct {
 	FailedSeq int64
 	// Reason describes the failure (empty when OK).
 	Reason string
+	// FirstSeq is the first entry kept. When storage retention removed the
+	// entries before it, PrunedThroughSeq is the last one removed and
+	// AnchorSeq the KindAuditPruned entry recording it; both are 0 otherwise.
+	FirstSeq         int64
+	PrunedThroughSeq int64
+	AnchorSeq        int64
 }
 
 // Verify walks the audit log in seq order and recomputes each row's
 // hash. It returns a non-nil error if the chain is broken, with the
-// report pointing at the first failing row.
+// report pointing at the first failing row. A log whose oldest entries
+// storage retention removed starts with a row whose prev_hash is not NULL;
+// it verifies only when a KindAuditPruned anchor in the chain recorded that
+// hash as the last one removed.
 func (a *Auditor) Verify(ctx context.Context) (*VerifyReport, error) {
+	report := &VerifyReport{OK: true}
+	var lastHash string
+	var first int64
+	var firstPrev sql.NullString
+	err := a.db.QueryRowContext(ctx, `SELECT seq, prev_hash FROM audit_log ORDER BY seq LIMIT 1`).Scan(&first, &firstPrev)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return report, nil
+	case err != nil:
+		return nil, fmt.Errorf("audit: read first row: %w", err)
+	}
+	report.FirstSeq = first
+	if firstPrev.Valid {
+		anchor, through, found, err := a.pruneAnchorFor(ctx, first, firstPrev.String)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			report.OK = false
+			report.FailedSeq = first
+			report.Reason = "chain starts after entries no pruning anchor accounts for"
+			return report, fmt.Errorf("audit: chain broken at seq %d: %s", first, report.Reason)
+		}
+		report.AnchorSeq, report.PrunedThroughSeq = anchor, through
+		lastHash = firstPrev.String
+	}
+
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT seq, ts, actor, kind, payload_json, prev_hash, hash
 		FROM audit_log
@@ -140,9 +176,6 @@ func (a *Auditor) Verify(ctx context.Context) (*VerifyReport, error) {
 		return nil, fmt.Errorf("audit: query log: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-
-	report := &VerifyReport{OK: true}
-	var lastHash string
 
 	for rows.Next() {
 		var (
@@ -156,7 +189,8 @@ func (a *Auditor) Verify(ctx context.Context) (*VerifyReport, error) {
 		}
 
 		// Chain link: stored prev_hash must equal the previous row's hash.
-		// First row must have NULL prev_hash.
+		// The first row has a NULL prev_hash, or the anchored hash of the
+		// last entry retention removed.
 		actualPrev := ""
 		if storedPrev.Valid {
 			actualPrev = storedPrev.String

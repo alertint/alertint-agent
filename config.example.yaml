@@ -17,6 +17,15 @@ alertmanager:
 
 storage:
   sqlite_path: ./alertint-agent.db
+  # Memory (every Situation, its journal, its current state) is kept forever.
+  # The working record (full briefings of past changes, superseded facts, raw
+  # evidence only past decisions cited) and the audit log expire by age or
+  # when the database passes its size limit, whichever comes first; then the
+  # oldest data goes first, whatever its kind. 0 turns a limit off.
+  retention_days: 90                          # working record
+  retention_size_percent: 80                  # of the filesystem holding the database
+  # retention_size: 8GiB                      # absolute limit instead of the percent
+  audit_retention_days: 365
 
 llm:
   provider: anthropic

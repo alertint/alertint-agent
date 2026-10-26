@@ -225,9 +225,25 @@ func insertTransitionTx(ctx context.Context, tx *sql.Tx, t situationmodel.Transi
 	if err != nil {
 		return fmt.Errorf("store: marshal transition journal: %w", err)
 	}
-	projectionJSON, err := json.Marshal(t.Projection)
+	// The briefing is stored apart, compressed (migration 0048);
+	// projection_json keeps every other field for the SQL that reads it.
+	projection := t.Projection
+	briefing := projection.Briefing
+	projection.Briefing = nil
+	projectionJSON, err := json.Marshal(projection)
 	if err != nil {
 		return fmt.Errorf("store: marshal transition projection: %w", err)
+	}
+	var briefingJSON, briefingBlob []byte
+	var executionStarted any
+	if briefing != nil {
+		if briefingJSON, err = json.Marshal(briefing); err != nil {
+			return fmt.Errorf("store: marshal transition briefing: %w", err)
+		}
+		if briefingBlob, err = compressBriefing(briefingJSON); err != nil {
+			return err
+		}
+		executionStarted = boolToInt(briefing.Work.ExecutionStarted)
 	}
 	refs := t.EvidenceRefs
 	if refs == nil {
@@ -246,36 +262,58 @@ func insertTransitionTx(ctx context.Context, tx *sql.Tx, t situationmodel.Transi
 			id, situation_id, sequence, input_version, material_fact_hash, assessment_id,
 			lifecycle, attention, action_contract_json, sufficient_reason_id, interruption_priority,
 			reason, journal_kind, journal_json, projection_json, operator_artifact_input_id,
-			evidence_refs_json, actor, drill, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			evidence_refs_json, actor, drill, created_at, briefing_execution_started
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.SituationID, t.Sequence, t.InputVersion, t.MaterialFactHash, nullableString(t.AssessmentID),
 		string(t.Lifecycle), string(t.Attention), string(contractJSON), nullableString(t.SufficientReasonID), priority,
 		string(t.Reason), string(t.JournalKind), string(journalJSON), string(projectionJSON),
 		nullableString(t.OperatorArtifactInputID),
-		string(refsJSON), string(t.Actor), boolToInt(t.Drill), canonicalTime(t.CreatedAt)); err != nil {
+		string(refsJSON), string(t.Actor), boolToInt(t.Drill), canonicalTime(t.CreatedAt), executionStarted); err != nil {
 		return fmt.Errorf("store: insert situation transition %s: %w", t.ID, err)
+	}
+	if briefing != nil {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO situation_transition_briefings (transition_id, encoding, raw_bytes, briefing) VALUES (?, ?, ?, ?)`,
+			t.ID, briefingEncoding, len(briefingJSON), briefingBlob); err != nil {
+			return fmt.Errorf("store: insert situation transition %s briefing: %w", t.ID, err)
+		}
 	}
 	return nil
 }
 
-// transitionColumns is the exact SELECT list scanTransition consumes.
-const transitionColumns = `id, situation_id, sequence, input_version, material_fact_hash, assessment_id,
+// transitionColumnList is the Transition row's own columns, in the order
+// scanTransition consumes them; transitionColumns adds the stored briefing
+// (migration 0048) and is the exact SELECT list for an unaliased
+// situation_transitions read.
+const transitionColumnList = `id, situation_id, sequence, input_version, material_fact_hash, assessment_id,
 	lifecycle, attention, action_contract_json, sufficient_reason_id, interruption_priority,
 	reason, journal_kind, journal_json, projection_json, operator_artifact_input_id,
-	evidence_refs_json, actor, drill, created_at`
+	evidence_refs_json, actor, drill, created_at, detail_expired_at`
+
+var transitionColumns = transitionSelectList("situation_transitions")
+
+// transitionSelectList qualifies the row's columns with table (a name or an
+// alias) and appends the stored briefing beside them.
+func transitionSelectList(table string) string {
+	return qualifyColumns(transitionColumnList, table) +
+		`, (SELECT b.briefing FROM situation_transition_briefings b WHERE b.transition_id = ` + table + `.id)`
+}
 
 func scanTransition(row scanner) (situationmodel.Transition, error) {
 	var t situationmodel.Transition
 	var assessmentID, reasonID, priority, artifactInputID sql.NullString
 	var lifecycle, attention, reason, journalKind, actor string
 	var contractJSON, journalJSON, projectionJSON, refsJSON, createdAt string
+	var detailExpiredAt sql.NullString
+	var briefing []byte
 	var drill int
 	if err := row.Scan(&t.ID, &t.SituationID, &t.Sequence, &t.InputVersion, &t.MaterialFactHash, &assessmentID,
 		&lifecycle, &attention, &contractJSON, &reasonID, &priority,
 		&reason, &journalKind, &journalJSON, &projectionJSON, &artifactInputID,
-		&refsJSON, &actor, &drill, &createdAt); err != nil {
+		&refsJSON, &actor, &drill, &createdAt, &detailExpiredAt, &briefing); err != nil {
 		return situationmodel.Transition{}, err
 	}
+	t.DetailExpired = detailExpiredAt.Valid
 	t.Lifecycle = situationmodel.Lifecycle(lifecycle)
 	t.Attention = situationmodel.Attention(attention)
 	t.Reason = situationmodel.TransitionReason(reason)
@@ -303,6 +341,17 @@ func scanTransition(row scanner) (situationmodel.Transition, error) {
 	}
 	if err := json.Unmarshal([]byte(projectionJSON), &t.Projection); err != nil {
 		return situationmodel.Transition{}, fmt.Errorf("store: unmarshal transition %s projection: %w", t.ID, err)
+	}
+	if briefing != nil {
+		raw, err := decompressBriefing(briefing)
+		if err != nil {
+			return situationmodel.Transition{}, fmt.Errorf("store: transition %s: %w", t.ID, err)
+		}
+		var b situationmodel.OperatorBriefing
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return situationmodel.Transition{}, fmt.Errorf("store: unmarshal transition %s briefing: %w", t.ID, err)
+		}
+		t.Projection.Briefing = &b
 	}
 	if err := json.Unmarshal([]byte(refsJSON), &t.EvidenceRefs); err != nil {
 		return situationmodel.Transition{}, fmt.Errorf("store: unmarshal transition %s evidence refs: %w", t.ID, err)
@@ -700,9 +749,9 @@ func nullableInt(v *int) any {
 
 // prefixedTransitionColumns is transitionColumns qualified with the `t`
 // table alias, for the joined reads that also select another table's
-// columns. Derived from transitionColumns itself so the two can never
+// columns. Built by the same transitionSelectList so the two can never
 // drift apart.
-var prefixedTransitionColumns = qualifyColumns(transitionColumns, "t")
+var prefixedTransitionColumns = transitionSelectList("t")
 
 func qualifyColumns(list, alias string) string {
 	parts := strings.Split(list, ",")

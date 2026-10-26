@@ -104,3 +104,35 @@ func TestReadinessDoesNotWaitForBusyStoreConnection(t *testing.T) {
 		}
 	}
 }
+
+// TestHealthReportsStorageSize: once a storage maintenance pass ran, /health
+// carries what the database uses, its limit and how far back it reaches.
+func TestHealthReportsStorageSize(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "size.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	host, err := New(Options{Store: st, Auditor: audit.New(st.DB()), Receivers: []Receiver{NewAlertReceiver(st, testToken, nil, nil)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func() string {
+		response := httptest.NewRecorder()
+		host.Handler().ServeHTTP(response, httptest.NewRequestWithContext(ctx, http.MethodGet, "/health", nil))
+		return response.Body.String()
+	}
+	if body := get(); strings.Contains(body, "used_bytes") {
+		t.Fatalf("/health reported a size before any maintenance pass: %s", body)
+	}
+	if _, err := st.RunStorageMaintenance(ctx, time.Now().UTC(), store.StoragePolicy{RetentionDays: 90, AuditRetentionDays: 365, SizePercent: 80}, audit.New(st.DB())); err != nil {
+		t.Fatal(err)
+	}
+	body := get()
+	for _, want := range []string{`"used_bytes":`, `"limit_bytes":`, `"volume_bytes":`, `"retention_days":90`, `"audit_retention_days":365`, `"checked_at":`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/health lacks %s: %s", want, body)
+		}
+	}
+}

@@ -69,7 +69,11 @@ func TestConsolidationPreservesPopulatedOperatorDatabase(t *testing.T) {
 			starts_at,ends_at,source_started_at,source_resolved_at,started_at_basis,resolved_at_basis,
 			receiver_grouping_identity,payload_digest,source_signal_id,source_signal_version,generator_url,
 			acquisition_mode,poll_interval_seconds,received_at FROM alert_deliveries ORDER BY id`,
-		`SELECT * FROM situation_transitions ORDER BY id`,
+		// The columns this fixture's release wrote; 0048 adds two that read NULL.
+		`SELECT id, situation_id, sequence, input_version, material_fact_hash, assessment_id, lifecycle, attention,
+			action_contract_json, sufficient_reason_id, interruption_priority, reason, journal_kind, journal_json,
+			projection_json, operator_artifact_input_id, evidence_refs_json, actor, drill, created_at
+			FROM situation_transitions ORDER BY id`,
 		`SELECT * FROM notification_intents ORDER BY id`,
 		`SELECT id,lifecycle,slack_channel,slack_root_ts FROM situations ORDER BY id`,
 		`SELECT * FROM llm_health ORDER BY id`,

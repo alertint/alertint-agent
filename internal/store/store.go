@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"modernc.org/sqlite" // also registers driver name "sqlite"
@@ -48,6 +49,10 @@ type Store struct {
 	probe *sql.DB
 	// holds times each hold of db's connection (see holdConnector).
 	holds *holdWatch
+	// path is the database file; empty for an in-memory database.
+	path string
+	// storageReport is the latest storage maintenance pass's outcome.
+	storageReport atomic.Pointer[StorageReport]
 
 	// semanticProfileMaxAttempts is Plan 4 Task 7's own injected config
 	// value — see SetSemanticProfileMaxAttempts.
@@ -75,6 +80,9 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 	}
 
 	s := &Store{db: db, holds: holds}
+	if dbPath != ":memory:" {
+		s.path = dbPath
+	}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err

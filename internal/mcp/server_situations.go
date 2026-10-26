@@ -430,7 +430,8 @@ func (s *Server) toolListSituationTransitions() (mcplib.Tool, mcpserver.ToolHand
 			"journal kind and bounded journal entry, evidence references, actor, and drill marker. History is never "+
 			"reconstructed from current state — a Situation with no Transition yet returns an empty array. Page with "+
 			"the returned next_cursor; it is stable across concurrent commits because it names a (sequence, id) "+
-			"position, not an offset."),
+			"position, not an offset. detail_state=\"expired\" marks a Transition past storage retention: its journal "+
+			"entry stays, its evidence references were dropped — never a reconstructed replacement."),
 		mcplib.WithString("id", mcplib.Description("Situation ID. Exactly one of id/handle is required.")),
 		mcplib.WithString("handle", mcplib.Description("Situation public handle. Exactly one of id/handle is required.")),
 		mcplib.WithInteger("limit", mcplib.Description("Maximum transitions to return (1-100, default 50).")),
@@ -471,6 +472,9 @@ type situationTransitionRow struct {
 	Actor                string                        `json:"actor"`
 	Drill                bool                          `json:"drill"`
 	CreatedAt            time.Time                     `json:"created_at"`
+	// DetailState is "full", or "expired" once storage retention dropped the
+	// Transition's detail (its evidence references among it).
+	DetailState string `json:"detail_state"`
 }
 
 func situationTransitionRowFrom(t situationmodel.Transition) situationTransitionRow {
@@ -481,6 +485,10 @@ func situationTransitionRowFrom(t situationmodel.Transition) situationTransition
 		ActionContract: t.ActionContract, MaterialFactHash: t.MaterialFactHash,
 		AssessmentID: t.AssessmentID, SufficientReasonID: t.SufficientReasonID,
 		EvidenceRefs: t.EvidenceRefs, Actor: string(t.Actor), Drill: t.Drill, CreatedAt: t.CreatedAt,
+		DetailState: "full",
+	}
+	if t.DetailExpired {
+		row.DetailState = "expired"
 	}
 	if row.EvidenceRefs == nil {
 		row.EvidenceRefs = []string{}

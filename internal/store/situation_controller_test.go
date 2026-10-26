@@ -60,8 +60,6 @@ func claimSituation(t *testing.T, st *Store, situationID, owner string, now time
 
 // factFixture builds one valid, minimal situationmodel.Fact for situationID
 // at inputVersion, keyed by id.
-//
-//nolint:unparam // id is a general fixture parameter; every current test happens to use "fact-1".
 func factFixture(id, situationID string, inputVersion int, observedAt time.Time) situationmodel.Fact {
 	return situationmodel.Fact{
 		ID:           id,
@@ -134,6 +132,32 @@ func TestAppendSituationFactsConflictingContentFailsClosed(t *testing.T) {
 	err := st.AppendSituationFacts(context.Background(), claim, []situationmodel.Fact{conflicting})
 	if !errors.Is(err, ErrImmutableConflict) {
 		t.Fatalf("conflicting append = %v, want ErrImmutableConflict", err)
+	}
+}
+
+// A replay whose content equals the current head is not a repeat when a row
+// with its ID already holds other content: it still fails closed.
+func TestAppendSituationFactsConflictingReplayEqualToHeadFailsClosed(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-facts-conflict-head", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	first := factFixture("fact-v1", sitID, 1, now)
+	head := factFixture("fact-v2", sitID, 2, now.Add(time.Minute))
+	head.Digest = first.Digest
+	head.Value = json.RawMessage(`{"class":"long"}`)
+	for _, f := range []situationmodel.Fact{first, head} {
+		if err := st.AppendSituationFacts(context.Background(), claim, []situationmodel.Fact{f}); err != nil {
+			t.Fatalf("append %s: %v", f.ID, err)
+		}
+	}
+
+	replay := first
+	replay.Value = head.Value
+	err := st.AppendSituationFacts(context.Background(), claim, []situationmodel.Fact{replay})
+	if !errors.Is(err, ErrImmutableConflict) {
+		t.Fatalf("replay of fact-v1 with the head's content = %v, want ErrImmutableConflict", err)
 	}
 }
 

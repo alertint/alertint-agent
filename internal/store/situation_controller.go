@@ -4,7 +4,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -731,13 +733,17 @@ func loadAssessmentCoverageTx(ctx context.Context, tx *sql.Tx, attemptID string)
 // ----------------------------------------------------------------------
 
 // AppendSituationFacts idempotently appends facts to situation_facts, fenced
-// on claim's current lease. Each fact is inserted with ON CONFLICT(id) DO
-// NOTHING; when a row with that id already exists, its content is compared
-// field-for-field against the incoming fact — an exact match is a
-// successful no-op (idempotent replay), any mismatch fails closed with
-// ErrImmutableConflict (situation_facts rows are immutable — UPDATE is
-// trigger-rejected, so there is no way to "correct" a wrong row after the
-// fact). An empty facts slice is a successful no-op.
+// on claim's current lease. A fact whose content equals the current head of
+// its (Situation, kind, subject) is not written again (migration 0048,
+// issue #99: 99% of facts repeated the previous input version); the head
+// keeps naming the row that first recorded that content, which is the row
+// a cited fact ID resolves to. A changed fact is inserted with ON
+// CONFLICT(id) DO NOTHING; when a row with that id already exists, its
+// content is compared field-for-field against the incoming fact — an exact
+// match is a successful no-op (idempotent replay), any mismatch fails
+// closed with ErrImmutableConflict (situation_facts rows are immutable —
+// UPDATE is trigger-rejected, so there is no way to "correct" a wrong row
+// after the fact). An empty facts slice is a successful no-op.
 func (s *Store) AppendSituationFacts(ctx context.Context, claim situation.Claim, facts []situationmodel.Fact) error {
 	if strings.TrimSpace(claim.Situation.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
 		return errors.New("store: append situation facts requires a complete claim")
@@ -780,6 +786,9 @@ type preparedFact struct {
 	evidenceRefsJSON string
 	observedAt       string
 	material         int
+	// contentHash covers every field appendFactTx compares, so a fact equal
+	// to its head is recognized without reading the head's row.
+	contentHash string
 }
 
 func prepareFact(f situationmodel.Fact) (preparedFact, error) {
@@ -824,16 +833,69 @@ func prepareFact(f situationmodel.Fact) (preparedFact, error) {
 	if f.Material {
 		material = 1
 	}
-	return preparedFact{
+	p := preparedFact{
 		f:                f,
 		valueJSON:        string(f.Value),
 		evidenceRefsJSON: string(refsJSON),
 		observedAt:       canonicalTime(f.ObservedAt),
 		material:         material,
-	}, nil
+	}
+	p.contentHash = factContentHash(p)
+	return p, nil
+}
+
+// factContentHash digests a fact's content: everything appendFactTx compares
+// except the identity fields the head is keyed by and the input version,
+// which a repeated fact does not share with the row it repeats.
+func factContentHash(p preparedFact) string {
+	h := sha256.New()
+	for _, field := range []string{p.f.Kind, p.f.Subject, p.f.Digest, p.valueJSON, string(p.f.ResultStatus),
+		p.evidenceRefsJSON, strconv.Itoa(p.material)} {
+		h.Write([]byte(strconv.Itoa(len(field))))
+		h.Write([]byte{':'})
+		h.Write([]byte(field))
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
 func appendFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) error {
+	var headID, headHash string
+	err := tx.QueryRowContext(ctx, `
+		SELECT fact_id, content_hash FROM situation_fact_heads WHERE situation_id = ? AND kind = ? AND subject = ?`,
+		p.f.SituationID, p.f.Kind, p.f.Subject).Scan(&headID, &headHash)
+	hasHead := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: read situation fact head for %s: %w", p.f.ID, err)
+	}
+	if hasHead && headHash == p.contentHash {
+		// A repeat of the head, unless a row with this ID already holds
+		// other content.
+		return matchStoredFactTx(ctx, tx, p)
+	}
+	inserted, err := insertFactTx(ctx, tx, p)
+	if err != nil || !inserted {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO situation_fact_heads (situation_id, kind, subject, fact_id, content_hash) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (situation_id, kind, subject) DO UPDATE SET fact_id = excluded.fact_id, content_hash = excluded.content_hash`,
+		p.f.SituationID, p.f.Kind, p.f.Subject, p.f.ID, p.contentHash); err != nil {
+		return fmt.Errorf("store: advance situation fact head for %s: %w", p.f.ID, err)
+	}
+	if hasHead {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO situation_fact_supersessions (fact_id, superseded_at) VALUES (?, ?) ON CONFLICT (fact_id) DO NOTHING`,
+			headID, p.observedAt); err != nil {
+			return fmt.Errorf("store: record superseded situation fact %s: %w", headID, err)
+		}
+	}
+	return nil
+}
+
+// insertFactTx inserts one changed fact, reporting whether it wrote a row. An
+// existing row with the same id is an idempotent replay when its content
+// matches and ErrImmutableConflict when it does not.
+func insertFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO situation_facts (id, situation_id, input_version, kind, subject, digest, value_json, result_status, evidence_refs_json, material, observed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -841,22 +903,31 @@ func appendFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) error {
 		p.f.ID, p.f.SituationID, p.f.InputVersion, p.f.Kind, p.f.Subject, p.f.Digest,
 		p.valueJSON, string(p.f.ResultStatus), p.evidenceRefsJSON, p.material, p.observedAt)
 	if err != nil {
-		return fmt.Errorf("store: insert situation fact %s: %w", p.f.ID, err)
+		return false, fmt.Errorf("store: insert situation fact %s: %w", p.f.ID, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("store: count inserted situation fact %s: %w", p.f.ID, err)
+		return false, fmt.Errorf("store: count inserted situation fact %s: %w", p.f.ID, err)
 	}
 	if n == 1 {
-		return nil
+		return true, nil
 	}
+	return false, matchStoredFactTx(ctx, tx, p)
+}
 
+// matchStoredFactTx compares p with the stored row of the same id, if there
+// is one: an exact match is an idempotent replay, any mismatch is
+// ErrImmutableConflict.
+func matchStoredFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) error {
 	var situationID, kind, subject, digest, valueJSON, resultStatus, evidenceRefsJSON string
 	var inputVersion, material int
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT situation_id, input_version, kind, subject, digest, value_json, result_status, evidence_refs_json, material
 		FROM situation_facts WHERE id = ?`, p.f.ID).Scan(
 		&situationID, &inputVersion, &kind, &subject, &digest, &valueJSON, &resultStatus, &evidenceRefsJSON, &material)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("store: read existing situation fact %s: %w", p.f.ID, err)
 	}

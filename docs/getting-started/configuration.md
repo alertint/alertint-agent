@@ -125,6 +125,48 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `sqlite_path` | string | `./alertint-agent.db` | Path to the SQLite database file. The directory must be writable. |
+| `retention_days` | int | `90` | Keep the working record this many days (see [Retention](#retention)). `0` keeps it forever. |
+| `retention_size_percent` | int | `80` | Limit the database to this share of the filesystem it is on, `0`–`95`. `0` turns the size limit off. |
+| `retention_size` | string | — | Absolute size limit such as `8GiB` or `500MB`, at least `64MiB`. When set, used instead of `retention_size_percent`. |
+| `audit_retention_days` | int | `365` | Keep audit entries this many days. `0` keeps them forever. |
+
+### Retention
+
+AlertINT keeps two kinds of data, and only one of them expires:
+
+| | Kept | Examples |
+|---|---|---|
+| **Memory** | Forever, whatever its age | Every Situation, its journal (one line per change), its current state and evidence, its final briefing and assessment, verdicts, annotations, incidents and alerts |
+| **Working record** | `retention_days`, or less under the size limit | The full briefing of each past change, the raw evidence only past decisions cited, superseded facts |
+| **Audit log** | `audit_retention_days`, or less under the size limit | One hash-chained entry per action |
+
+- **Whichever limit is hit first applies.** On a quiet install that is the
+  time limit. On a busy one the size limit decides, and the oldest data goes
+  first, whatever its kind, the audit log included. Memory never does.
+- **Ages are per record.** A Situation open for months keeps its whole
+  journal, its current briefing and everything its current state uses; only
+  its old full briefings and the evidence only they cited expire.
+- **Expired detail is marked, never invented.** `alertint_list_situation_transitions`
+  reports `detail_state: "expired"`; the journal entry stays.
+- **The file does not shrink.** Freed space is reused by later writes, so a
+  full-size database stops growing instead of shrinking on disk.
+- **The audit chain stays verifiable.** Before removing entries the agent
+  appends an anchor naming the last removed entry; `alertint verify-audit`
+  verifies from it.
+- **When it runs:** a minute after start, then hourly, in short transactions.
+  After an upgrade from 0.15.x, the first passes also move existing data into
+  its smaller form.
+
+When the size limit shortens history, the agent warns once a day with how far
+back it now keeps and the volume that would keep the full `retention_days`:
+
+```text
+WARN store: storage limit is shortening history; the oldest records went first, memory is kept used=11.6GiB limit=11.8GiB retention_days=90 audit_retention_days=365 kept_days=40 audit_kept_days=40 volume_needed=50.0GiB
+```
+
+It also warns once a day when the volume holding the database has less than
+10% free, whatever filled it. `/health` reports the same numbers under
+`storage` ([Integration health](#integration-health)).
 
 ### Schema upgrades and rollback
 
@@ -687,8 +729,17 @@ are queueing. The agent also logs two warnings:
 - `store: connection held`: one store call held the connection for 5 s or more.
   `holder` names the call, innermost first.
 
+After the first storage maintenance pass, `storage` also reports the
+database's size and retention: `used_bytes` (pages in use), `file_bytes`,
+`limit_bytes` (the size limit in force), `volume_bytes` and
+`volume_free_bytes` (the filesystem holding the database), `retention_days`,
+`audit_retention_days`, `kept_since` and `audit_kept_since` (the oldest full
+record and audit entry kept), `shortened_by_size_limit`,
+`volume_needed_bytes` (an estimate of the volume that keeps the full
+`retention_days`) and `checked_at` (see [Retention](#retention)).
+
 Like `llm`, it never changes the HTTP status:
 
 ```json
-{"status":"ok","storage":{"connection_in_use":false,"waits":12,"wait_seconds":0.4}}
+{"status":"ok","storage":{"connection_in_use":false,"waits":12,"wait_seconds":0.4,"used_bytes":712000000,"file_bytes":940000000,"limit_bytes":12636223488,"volume_bytes":15795279360,"volume_free_bytes":14100000000,"retention_days":90,"audit_retention_days":365,"kept_since":"2026-10-21T20:09:51Z","audit_kept_since":"2026-10-21T20:09:51Z","checked_at":"2026-10-25T12:00:00Z"}}
 ```

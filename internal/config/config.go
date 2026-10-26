@@ -460,6 +460,75 @@ type ChangesEnrichmentConfig struct {
 // StorageConfig configures the SQLite store.
 type StorageConfig struct {
 	SQLitePath string `yaml:"sqlite_path"`
+	// RetentionDays keeps the working record this many days: the full
+	// briefing of each past change, superseded facts, and the raw evidence
+	// only past decisions cited. Memory is kept whatever its age: every
+	// Situation, its journal, its current state and its final record. 0 keeps
+	// the working record forever. Default 90.
+	RetentionDays int `yaml:"retention_days"`
+	// RetentionSizePercent limits the database to this share of the
+	// filesystem it is on. Past it the oldest data goes first, whatever its
+	// kind, audit included; memory never does. 0 turns the size limit off.
+	// Default 80.
+	RetentionSizePercent int `yaml:"retention_size_percent"`
+	// RetentionSize is an absolute size limit such as "8GiB"; when set it is
+	// used instead of retention_size_percent.
+	RetentionSize string `yaml:"retention_size"`
+	// AuditRetentionDays keeps audit entries this many days; 0 keeps them
+	// forever. The chain stays verifiable from the oldest entry kept.
+	// Default 365.
+	AuditRetentionDays int `yaml:"audit_retention_days"`
+}
+
+// maxRetentionSizePercent leaves room for the WAL and for a database file that
+// never shrinks: freed pages are reused, not returned to the filesystem.
+const maxRetentionSizePercent = 95
+
+// minRetentionSize keeps an absolute size limit above what a fresh
+// installation's memory alone can need.
+const minRetentionSize = 64 << 20
+
+// RetentionSizeBytes is storage.retention_size in bytes, 0 when unset. Load
+// has validated it.
+func (s StorageConfig) RetentionSizeBytes() int64 {
+	n, err := parseByteSize(s.RetentionSize)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// byteSizeUnits are the suffixes parseByteSize accepts, longest first.
+var byteSizeUnits = []struct {
+	suffix string
+	factor int64
+}{
+	{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10},
+	{"TB", 1e12}, {"GB", 1e9}, {"MB", 1e6}, {"KB", 1e3}, {"B", 1},
+}
+
+// parseByteSize parses a whole number of bytes with an optional unit suffix
+// (KiB, MiB, GiB, TiB, or KB, MB, GB, TB). Empty means unset: 0.
+func parseByteSize(v string) (int64, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, nil
+	}
+	factor := int64(1)
+	for _, u := range byteSizeUnits {
+		if strings.HasSuffix(v, u.suffix) {
+			v, factor = strings.TrimSpace(strings.TrimSuffix(v, u.suffix)), u.factor
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, errors.New("must be a positive whole number with an optional unit such as MiB or GiB")
+	}
+	if n > (1<<62)/factor {
+		return 0, errors.New("is too large")
+	}
+	return n * factor, nil
 }
 
 // LLMConfig configures the LLM provider used by skills.
@@ -609,7 +678,10 @@ func Defaults() Config {
 			RetentionDays: 30,
 		},
 		Storage: StorageConfig{
-			SQLitePath: "./alertint-agent.db",
+			SQLitePath:           "./alertint-agent.db",
+			RetentionDays:        90,
+			RetentionSizePercent: 80,
+			AuditRetentionDays:   365,
 		},
 		LLM: LLMConfig{
 			Provider: "anthropic",
@@ -953,16 +1025,31 @@ func (c *Config) validateChanges() []string {
 }
 
 func (c *Config) validateStorage(offline bool) []string {
+	var errs []string
+	if c.Storage.RetentionDays < 0 {
+		errs = append(errs, "storage.retention_days must be >= 0 (0 keeps the working record forever)")
+	}
+	if c.Storage.AuditRetentionDays < 0 {
+		errs = append(errs, "storage.audit_retention_days must be >= 0 (0 keeps the audit log forever)")
+	}
+	if c.Storage.RetentionSizePercent < 0 || c.Storage.RetentionSizePercent > maxRetentionSizePercent {
+		errs = append(errs, fmt.Sprintf("storage.retention_size_percent must be between 0 and %d (0 turns the size limit off)", maxRetentionSizePercent))
+	}
+	if n, err := parseByteSize(c.Storage.RetentionSize); err != nil {
+		errs = append(errs, fmt.Sprintf("storage.retention_size %q %v", c.Storage.RetentionSize, err))
+	} else if n > 0 && n < minRetentionSize {
+		errs = append(errs, "storage.retention_size must be at least 64MiB")
+	}
 	if strings.TrimSpace(c.Storage.SQLitePath) == "" {
-		return []string{"storage.sqlite_path is required"}
+		return append(errs, "storage.sqlite_path is required")
 	}
 	if offline {
-		return nil
+		return errs
 	}
 	if err := checkSQLitePathWritable(c.Storage.SQLitePath); err != nil {
-		return []string{fmt.Sprintf("storage.sqlite_path: %v", err)}
+		errs = append(errs, fmt.Sprintf("storage.sqlite_path: %v", err))
 	}
-	return nil
+	return errs
 }
 
 func (c *Config) validateLLM() []string {
@@ -1349,6 +1436,10 @@ func (c *Config) Warnings() []string {
 				"correlator.group_labels: %q looks volatile (per-instance identity); recurrence collapse and recall will rarely match for these groups",
 				label))
 		}
+	}
+	if c.Storage.RetentionSizePercent == 0 && strings.TrimSpace(c.Storage.RetentionSize) == "" {
+		warns = append(warns,
+			"storage: no size limit (retention_size_percent: 0); a full volume stops every write, alert intake included")
 	}
 	if addr := c.Telemetry.PProf.Addr; addr != "" && pprofBeyondLoopback(addr) {
 		warns = append(warns, fmt.Sprintf(

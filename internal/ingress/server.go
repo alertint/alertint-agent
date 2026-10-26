@@ -227,11 +227,40 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 // storageHealth is /health's view of contention on the store connection
 // since start: wait_seconds that keeps growing means store calls are
-// queueing behind each other.
+// queueing behind each other. The size fields come from the latest storage
+// maintenance pass (absent before the first one): what the database uses,
+// its limit, and how far back the working record and audit log reach.
 type storageHealth struct {
 	ConnectionInUse bool    `json:"connection_in_use"`
 	Waits           int64   `json:"waits"`
 	WaitSeconds     float64 `json:"wait_seconds"`
+
+	UsedBytes            int64      `json:"used_bytes,omitempty"`
+	FileBytes            int64      `json:"file_bytes,omitempty"`
+	LimitBytes           int64      `json:"limit_bytes,omitempty"`
+	VolumeBytes          int64      `json:"volume_bytes,omitempty"`
+	VolumeFreeBytes      int64      `json:"volume_free_bytes,omitempty"`
+	RetentionDays        *int       `json:"retention_days,omitempty"`
+	AuditRetentionDays   *int       `json:"audit_retention_days,omitempty"`
+	KeptSince            *time.Time `json:"kept_since,omitempty"`
+	AuditKeptSince       *time.Time `json:"audit_kept_since,omitempty"`
+	ShortenedBySizeLimit bool       `json:"shortened_by_size_limit,omitempty"`
+	VolumeNeededBytes    int64      `json:"volume_needed_bytes,omitempty"`
+	CheckedAt            *time.Time `json:"checked_at,omitempty"`
+}
+
+func newStorageHealth(wait store.ConnectionWait, report store.StorageReport, ok bool) storageHealth {
+	h := storageHealth{ConnectionInUse: wait.InUse, Waits: wait.Waits, WaitSeconds: wait.Waited.Seconds()}
+	if !ok {
+		return h
+	}
+	h.UsedBytes, h.FileBytes, h.LimitBytes = report.UsedBytes, report.FileBytes, report.LimitBytes
+	h.VolumeBytes, h.VolumeFreeBytes = report.VolumeBytes, report.VolumeFreeBytes
+	h.RetentionDays, h.AuditRetentionDays = &report.RetentionDays, &report.AuditRetentionDays
+	h.KeptSince, h.AuditKeptSince = report.KeptSince, report.AuditKeptSince
+	h.ShortenedBySizeLimit, h.VolumeNeededBytes = report.ShortenedBySizeLimit, report.VolumeNeededBytes
+	h.CheckedAt = &report.CheckedAt
+	return h
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +272,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		code = http.StatusServiceUnavailable
 	}
 	wait := s.store.ConnectionWait()
+	report, reported := s.store.StorageReport()
 	body := struct {
 		Status       string              `json:"status"`
 		Storage      storageHealth       `json:"storage"`
@@ -250,7 +280,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		LLM          *llmhealth.Snapshot `json:"llm,omitempty"`
 	}{
 		Status:       status,
-		Storage:      storageHealth{ConnectionInUse: wait.InUse, Waits: wait.Waits, WaitSeconds: wait.Waited.Seconds()},
+		Storage:      newStorageHealth(wait, report, reported),
 		Integrations: s.health.Run(r.Context()),
 	}
 	if s.llmHealth != nil {
