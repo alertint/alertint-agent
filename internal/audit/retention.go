@@ -37,11 +37,20 @@ type prunedAnchor struct {
 // PruneBefore removes the oldest audit entries recorded before cutoff, in
 // steps, each anchored in the chain first. It stops at the first entry at or
 // after cutoff, so an entry appended late with an older time is kept until
-// the entries before it go. Returns the entries removed.
+// the entries before it go. It considers only the entries there when it
+// starts, so the anchors it writes are left for a later pass whatever the
+// auditor's clock says. Returns the entries removed.
 func (a *Auditor) PruneBefore(ctx context.Context, cutoff time.Time) (int, error) {
+	var last sql.NullInt64
+	if err := a.db.QueryRowContext(ctx, `SELECT max(seq) FROM audit_log`).Scan(&last); err != nil {
+		return 0, fmt.Errorf("audit: read last entry: %w", err)
+	}
+	if !last.Valid {
+		return 0, nil
+	}
 	total := 0
 	for {
-		n, err := a.pruneStep(ctx, cutoff)
+		n, err := a.pruneStep(ctx, cutoff, last.Int64)
 		total += n
 		if err != nil || n == 0 {
 			return total, err
@@ -54,14 +63,14 @@ func (a *Auditor) PruneBefore(ctx context.Context, cutoff time.Time) (int, error
 	}
 }
 
-func (a *Auditor) pruneStep(ctx context.Context, cutoff time.Time) (int, error) {
+func (a *Auditor) pruneStep(ctx context.Context, cutoff time.Time, lastSeq int64) (int, error) {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("audit: begin prune: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	through, err := readPrunablePrefix(ctx, tx, cutoff)
+	through, err := readPrunablePrefix(ctx, tx, cutoff, lastSeq)
 	if err != nil {
 		return 0, err
 	}
@@ -81,11 +90,12 @@ func (a *Auditor) pruneStep(ctx context.Context, cutoff time.Time) (int, error) 
 	return through.Pruned, nil
 }
 
-// readPrunablePrefix reads, among the oldest auditPruneStep entries, the run
-// recorded before cutoff, and returns the anchor that would account for it.
-func readPrunablePrefix(ctx context.Context, tx *sql.Tx, cutoff time.Time) (prunedAnchor, error) {
+// readPrunablePrefix reads, among the oldest auditPruneStep entries up to
+// lastSeq, the run recorded before cutoff, and returns the anchor that would
+// account for it.
+func readPrunablePrefix(ctx context.Context, tx *sql.Tx, cutoff time.Time, lastSeq int64) (prunedAnchor, error) {
 	var through prunedAnchor
-	rows, err := tx.QueryContext(ctx, `SELECT seq, ts, hash FROM audit_log ORDER BY seq LIMIT ?`, auditPruneStep)
+	rows, err := tx.QueryContext(ctx, `SELECT seq, ts, hash FROM audit_log WHERE seq <= ? ORDER BY seq LIMIT ?`, lastSeq, auditPruneStep)
 	if err != nil {
 		return through, fmt.Errorf("audit: read oldest entries: %w", err)
 	}

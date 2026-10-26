@@ -39,8 +39,8 @@ func TestPruneBeforeAnchorsTheChain(t *testing.T) {
 		t.Fatalf("report = %+v, want first 6, pruned through 5, anchor 11, 6 rows", report)
 	}
 
-	// A second prune removes the first anchor with the rest; the new anchor
-	// accounts for the new start.
+	// A second prune stops at the first anchor, recorded after the cutoff;
+	// the new anchor accounts for the new start.
 	appendHours(t, a, ctx, 10, 12)
 	if n, err := a.PruneBefore(ctx, retentionBase.Add(11*time.Hour)); err != nil || n != 5 {
 		t.Fatalf("second prune %d, %v; want 5 (seq 6-10)", n, err)
@@ -77,6 +77,35 @@ func TestPruneBeforeStepsStayBounded(t *testing.T) {
 	}
 	if report, err := a.Verify(ctx); err != nil || report.PrunedThroughSeq != 8 {
 		t.Fatalf("verify: %+v, %v", report, err)
+	}
+}
+
+// A pass never removes the anchors it writes, even when the auditor's clock
+// is behind the cutoff: otherwise each step would remove the previous step's
+// anchor and append a new one, and the pass would never end.
+func TestPruneBeforeKeepsItsOwnAnchors(t *testing.T) {
+	a, _, ctx := newAuditor(t)
+	appendHours(t, a, ctx, 0, 10)
+	defer func(step int, pause time.Duration) { auditPruneStep, auditPrunePause = step, pause }(auditPruneStep, auditPrunePause)
+	auditPruneStep, auditPrunePause = 3, 0
+	a = a.withClock(func() time.Time { return retentionBase.Add(50 * time.Hour) })
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if n, err := a.PruneBefore(ctx, retentionBase.Add(100*time.Hour)); err != nil || n != 10 {
+		t.Fatalf("pruned %d, %v; want the 10 entries before the cutoff", n, err)
+	}
+	report, err := a.Verify(ctx)
+	if err != nil || report.RowsChecked != 4 || report.PrunedThroughSeq != 10 {
+		t.Fatalf("verify: %+v, %v; want the 4 anchors this pass wrote", report, err)
+	}
+
+	// The next pass removes them with whatever else is old by then.
+	appendHours(t, a, ctx, 10, 12)
+	if n, err := a.PruneBefore(ctx, retentionBase.Add(100*time.Hour)); err != nil || n != 6 {
+		t.Fatalf("second prune %d, %v; want the 4 earlier anchors and 2 entries", n, err)
+	}
+	if report, err := a.Verify(ctx); err != nil || report.RowsChecked != 2 {
+		t.Fatalf("verify after second prune: %+v, %v", report, err)
 	}
 }
 
