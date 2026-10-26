@@ -188,6 +188,10 @@ ALTER TABLE situation_assessment_attempts ADD COLUMN evidence_released_at TEXT
     CHECK (evidence_released_at IS NULL OR evidence_released_at <> '');
 CREATE INDEX situation_assessment_attempts_unreleased_idx ON situation_assessment_attempts(evidence_released_at)
     WHERE evidence_released_at IS NULL;
+-- A call pins its evidence under its own ID at dispatch (draft and
+-- verification alike); retention finds a call's attempt by work attempt.
+CREATE INDEX situation_assessment_attempts_work_idx
+    ON situation_assessment_attempts(situation_id, input_version, retry_epoch, work_attempt);
 DROP TRIGGER situation_assessment_attempts_no_update;
 CREATE TRIGGER situation_assessment_attempts_no_update BEFORE UPDATE ON situation_assessment_attempts
 WHEN NOT (

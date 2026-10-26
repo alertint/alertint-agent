@@ -514,6 +514,97 @@ func TestExpireWorkingRecordKeepsMemoryAndCurrentState(t *testing.T) {
 	}
 }
 
+// TestExpireWorkingRecordReleasesCallEvidence: a dispatched call pins its
+// evidence under the call's ID, apart from the attempt's own pins. Releasing
+// an old attempt releases its call's too; a call that never got an attempt is
+// released once its Situation has moved past that input; the current
+// assessment and its call keep theirs.
+func TestExpireWorkingRecordReleasesCallEvidence(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 6, 1, 8, 0, 0, 0, time.UTC)
+	sitID, cycles := metadataRetentionCyclesAt(t, st, 4, false, false, 0, base)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := st.db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	call := func(id string, inputVersion, workAttempt int, callNumber ...int) {
+		number := 1
+		if len(callNumber) > 0 {
+			number = callNumber[0]
+		}
+		exec(`INSERT INTO situation_assessment_calls (id, situation_id, input_version, work_attempt, call_number, material_fact_hash, dispatched_at)
+			VALUES (?, ?, ?, ?, ?, 'sha256:material', ?)`, id, sitID, inputVersion, workAttempt, number, canonicalTime(base))
+	}
+	attempt := func(id, callID string, sequence, workAttempt int) {
+		exec(`INSERT INTO situation_assessment_attempts (
+			id, situation_id, sequence, input_version, work_attempt, call_id, status, derivation, provider_request_started,
+			material_fact_hash, assessment_json, created_at, completed_at
+		) VALUES (?, ?, ?, 1, ?, ?, 'authoritative', 'model_validated', 'true', 'sha256:material', '{}', ?, ?)`,
+			id, sitID, sequence, workAttempt, callID, canonicalTime(base), canonicalTime(base))
+	}
+	pin := func(cycleID, owner string) {
+		t.Helper()
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := insertPermanentObservationReferencesTx(ctx, tx, cycleID, ObservationReferenceAssessmentAttempt, owner, base); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each work attempt dispatches a draft and a verification call; the
+	// attempt names the last.
+	call("call-old-draft", 1, 1)
+	call("call-old", 1, 1, 2)
+	attempt("att-old", "call-old", 1, 1)
+	pin(cycles[0].ID, "call-old-draft")
+	pin(cycles[0].ID, "call-old")
+	pin(cycles[0].ID, "att-old")
+	call("call-orphan-past", 1, 2)
+	pin(cycles[1].ID, "call-orphan-past")
+	call("call-current-draft", 1, 3)
+	call("call-current", 1, 3, 2)
+	attempt("att-current", "call-current", 2, 3)
+	pin(cycles[2].ID, "call-current-draft")
+	pin(cycles[2].ID, "call-current")
+	pin(cycles[2].ID, "att-current")
+	call("call-orphan-now", 2, 1)
+	pin(cycles[3].ID, "call-orphan-now")
+	exec(`UPDATE situations SET current_assessment_id = 'att-current', input_version = 2 WHERE id = ?`, sitID)
+
+	now := base.Add(200 * 24 * time.Hour)
+	if _, err := st.ExpireWorkingRecord(ctx, now, now.Add(-90*24*time.Hour), now.Add(-observationDetailRetention)); err != nil {
+		t.Fatal(err)
+	}
+	refs := func(owner string) int {
+		return retentionCount(t, st, `SELECT COUNT(*) FROM situation_observation_references WHERE owner_id = ?`, owner)
+	}
+	for owner, kept := range map[string]bool{
+		"call-old-draft": false, "call-old": false, "att-old": false, "call-orphan-past": false,
+		"call-current-draft": true, "call-current": true, "att-current": true, "call-orphan-now": true,
+	} {
+		if got := refs(owner) > 0; got != kept {
+			t.Errorf("%s: references kept = %v, want %v", owner, got, kept)
+		}
+	}
+	for i, kept := range []bool{false, false, true, true} {
+		got := retentionCount(t, st, `SELECT COUNT(*) FROM situation_preparation_cycles WHERE id = ?`, cycles[i].ID) == 1
+		if got != kept {
+			t.Errorf("cycle %d kept = %v, want %v", i, got, kept)
+		}
+	}
+	if n, err := dbForeignKeyCheck(st); err != nil || n != 0 {
+		t.Fatalf("foreign keys: %d, %v", n, err)
+	}
+}
+
 // TestStorageSizeLimitRemovesOldestFirst: over the size limit, the oldest
 // data goes first whatever its kind, the audit log included, down to an
 // hour back; the chain still verifies from its anchor.

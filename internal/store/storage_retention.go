@@ -39,7 +39,8 @@ type StorageRemoved struct {
 	Coverage int `json:"coverage"`
 	// TransitionDetails counts Transitions whose detail expired.
 	TransitionDetails int `json:"transition_details"`
-	// AttemptEvidence counts assessment attempts that released their evidence.
+	// AttemptEvidence counts assessment attempts and calls that released
+	// their evidence.
 	AttemptEvidence int `json:"attempt_evidence"`
 	// LifecycleEvidence counts old lifecycle decisions that released theirs.
 	LifecycleEvidence int `json:"lifecycle_evidence"`
@@ -588,12 +589,13 @@ func expireTransitionDetailTx(ctx context.Context, tx *sql.Tx, id, expiredAt str
 }
 
 // releaseAttemptEvidence deletes the observation references owned by every
-// assessment attempt completed before cutoff that nothing current uses. The
-// attempt row stays; evidence_released_at records the release.
+// assessment attempt completed before cutoff that nothing current uses, and
+// by its calls. The attempt row stays; evidence_released_at records the
+// release. Then it releases calls that never got an attempt.
 func (s *Store) releaseAttemptEvidence(ctx context.Context, now, cutoff time.Time) (int, error) {
 	var after int64
 	releasedAt := canonicalTime(now)
-	return s.retentionPages(ctx, "release attempt evidence", func(tx *sql.Tx, deadline time.Time) (int, bool, error) {
+	released, err := s.retentionPages(ctx, "release attempt evidence", func(tx *sql.Tx, deadline time.Time) (int, bool, error) {
 		rows, err := tx.QueryContext(ctx, `
 			SELECT a.rowid, a.id, a.completed_at, a.id IN (SELECT attempt_id FROM storage_protected_attempts)
 			FROM situation_assessment_attempts a INDEXED BY situation_assessment_attempts_unreleased_idx
@@ -615,8 +617,94 @@ func (s *Store) releaseAttemptEvidence(ctx context.Context, now, cutoff time.Tim
 				WHERE owner_id = ? AND reference_kind = 'assessment_attempt' AND permanent = 1`, id); err != nil {
 				return fmt.Errorf("release evidence of attempt %s: %w", id, err)
 			}
+			if err := releaseAttemptCallsTx(ctx, tx, id); err != nil {
+				return err
+			}
 			return endRetentionTx(ctx, tx, "assessment_attempt", id)
 		})
+	})
+	if err != nil {
+		return released, err
+	}
+	orphans, err := s.releaseOrphanCallEvidence(ctx, cutoff)
+	return released + orphans, err
+}
+
+// releaseAttemptCallsTx releases the evidence each call of an attempt's work
+// attempt pinned at dispatch, under the call's ID: the draft and the
+// verification call alike. A work attempt that a protected attempt shares
+// keeps its calls' evidence.
+func releaseAttemptCallsTx(ctx context.Context, tx *sql.Tx, attemptID string) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT c.id FROM situation_assessment_attempts a
+		JOIN situation_assessment_calls c ON c.situation_id = a.situation_id AND c.input_version = a.input_version
+		  AND c.retry_epoch = a.retry_epoch AND c.work_attempt = a.work_attempt
+		WHERE a.id = ? AND NOT EXISTS (
+		  SELECT 1 FROM situation_assessment_attempts p INDEXED BY situation_assessment_attempts_work_idx
+		  WHERE p.situation_id = a.situation_id AND p.input_version = a.input_version
+		    AND p.retry_epoch = a.retry_epoch AND p.work_attempt = a.work_attempt
+		    AND p.id <> a.id AND p.id IN (SELECT attempt_id FROM storage_protected_attempts))`, attemptID)
+	if err != nil {
+		return fmt.Errorf("select calls of attempt %s: %w", attemptID, err)
+	}
+	callIDs, err := scanStrings(rows)
+	if err != nil {
+		return err
+	}
+	for _, callID := range callIDs {
+		if err := releaseCallEvidenceTx(ctx, tx, callID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func releaseCallEvidenceTx(ctx context.Context, tx *sql.Tx, callID string) error {
+	if err := authorizeRetentionTx(ctx, tx, "assessment_attempt", callID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM situation_observation_references
+		WHERE owner_id = ? AND reference_kind = 'assessment_attempt' AND permanent = 1`, callID); err != nil {
+		return fmt.Errorf("release evidence of call %s: %w", callID, err)
+	}
+	return endRetentionTx(ctx, tx, "assessment_attempt", callID)
+}
+
+// releaseOrphanCallEvidence releases the evidence of calls dispatched before
+// cutoff that never got an attempt (the agent stopped or lost its lease
+// between dispatch and commit), once their Situation has moved past that
+// input or ended: nothing records an attempt for them after that.
+func (s *Store) releaseOrphanCallEvidence(ctx context.Context, cutoff time.Time) (int, error) {
+	var after int64
+	return s.retentionPages(ctx, "release orphan call evidence", func(tx *sql.Tx, deadline time.Time) (int, bool, error) {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT c.rowid, c.id, c.dispatched_at FROM situation_assessment_calls c
+			JOIN situations s ON s.id = c.situation_id
+			WHERE c.rowid > ? AND (s.input_version > c.input_version OR s.terminal_at IS NOT NULL)
+			  AND NOT EXISTS (SELECT 1 FROM situation_assessment_attempts a INDEXED BY situation_assessment_attempts_work_idx
+			    WHERE a.situation_id = c.situation_id AND a.input_version = c.input_version
+			      AND a.retry_epoch = c.retry_epoch AND a.work_attempt = c.work_attempt)
+			  AND NOT EXISTS (SELECT 1 FROM situation_assessment_attempts a WHERE a.call_id = c.id)
+			  AND EXISTS (SELECT 1 FROM situation_observation_references r
+			    WHERE r.owner_id = c.id AND r.reference_kind = 'assessment_attempt' AND r.superseded = 0)
+			ORDER BY c.rowid LIMIT ?`, after, retentionPageRows)
+		if err != nil {
+			return 0, false, fmt.Errorf("select orphan calls past retention: %w", err)
+		}
+		candidates, reached, err := scanRetentionCandidatesUnprotected(rows, cutoff, &after)
+		if err != nil {
+			return 0, false, err
+		}
+		for i, c := range candidates {
+			if i > 0 && time.Now().After(deadline) {
+				return i, false, nil
+			}
+			if err := releaseCallEvidenceTx(ctx, tx, c.id); err != nil {
+				return i, false, err
+			}
+		}
+		return len(candidates), reached, nil
 	})
 }
 
