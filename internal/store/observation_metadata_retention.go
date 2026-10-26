@@ -29,8 +29,9 @@ const (
 
 // PruneObservationRetention runs one retention pass at now: it expires every
 // unused detail past the ten-day cutoff, drops the refresh cursors that read
-// as no cursor, then removes every sealed cycle left with nothing to keep.
-// Returns the expired runs, dropped cursors and removed cycles.
+// as no cursor, trims old cycles to the runs something needs, then removes
+// every sealed cycle left with nothing to keep. Returns the expired runs,
+// dropped cursors, trimmed plans and removed cycles.
 func (s *Store) PruneObservationRetention(ctx context.Context, now time.Time) (int, error) {
 	return s.PruneObservationRetentionBefore(ctx, now, now.Add(-observationDetailRetention))
 }
@@ -47,8 +48,12 @@ func (s *Store) PruneObservationRetentionBefore(ctx context.Context, now, cutoff
 	if err != nil {
 		return runs + cursors, err
 	}
+	trimmed, err := s.trimObservationCycles(ctx, cutoff)
+	if err != nil {
+		return runs + cursors + trimmed, err
+	}
 	cycles, err := s.pruneObservationMetadata(ctx, cutoff, 0)
-	return runs + cursors + cycles, err
+	return runs + cursors + trimmed + cycles, err
 }
 
 // pruneStaleRefreshCursors deletes the refresh cursors due since before
@@ -86,6 +91,168 @@ func (s *Store) pruneStaleRefreshCursors(ctx context.Context, cutoff time.Time) 
 		}
 		return len(rowIDs), len(rowIDs) < retentionPageRows, nil
 	})
+}
+
+// trimObservationCycles removes, from each cycle sealed before cutoff that
+// is not a Situation's current cycle, the plans whose run nothing needs and
+// the plans that never ran, newest cycle first. The prune keeps a cycle for
+// one run (a reuse source, a query head, a live cursor's last run, decision
+// evidence); kept whole, its other plans reused runs of the cycle before,
+// which kept that one too, back through the whole history. Trimmed, the
+// chain ends at the run that is needed: a reuse source is always a fresh
+// run whose plan reuses nothing. The cycle row stays until
+// pruneObservationMetadata finds nothing in it to keep.
+func (s *Store) trimObservationCycles(ctx context.Context, cutoff time.Time) (int, error) {
+	upperBound, exact := observationRetentionCutoff(cutoff)
+	after := observationCycleCursor{sealedAt: upperBound, rowID: math.MaxInt64}
+	return s.retentionPages(ctx, "trim observation cycles", func(tx *sql.Tx, deadline time.Time) (int, bool, error) {
+		heads, err := currentHeadRunsTx(ctx, tx)
+		if err != nil {
+			return 0, false, err
+		}
+		page, err := readTrimCyclePageTx(ctx, tx, upperBound, exact, after)
+		if err != nil {
+			return 0, false, err
+		}
+		trimmed := 0
+		for i, c := range page {
+			if i > 0 && time.Now().After(deadline) {
+				return trimmed, false, nil
+			}
+			n, err := trimObservationCycleTx(ctx, tx, c.id, heads)
+			if err != nil {
+				return trimmed, false, err
+			}
+			trimmed += n
+			after = c.cursor
+		}
+		return trimmed, len(page) < observationRetentionPageRows, nil
+	})
+}
+
+type trimCycle struct {
+	cursor observationCycleCursor
+	id     string
+}
+
+// readTrimCyclePageTx reads, newest first after the cursor, the cycles sealed
+// before the cutoff that are no Situation's current cycle.
+func readTrimCyclePageTx(ctx context.Context, tx *sql.Tx, upperBound, exact string, after observationCycleCursor) ([]trimCycle, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT c.sealed_at, c.rowid, c.id FROM situation_preparation_cycles c
+		WHERE c.sealed = 1 AND c.sealed_at < ?
+		  AND (substr(c.sealed_at, 1, 19) || '.' ||
+		       substr(substr(rtrim(c.sealed_at, 'Z'), 21) || '000000000', 1, 9) || 'Z') <= ?
+		  AND c.sealed_at <= ? AND (c.sealed_at < ? OR c.rowid < ?)
+		  AND NOT EXISTS (SELECT 1 FROM situations s WHERE s.current_preparation_cycle_id = c.id)
+		ORDER BY c.sealed_at DESC, c.rowid DESC
+		LIMIT ?`, upperBound, exact, after.sealedAt, after.sealedAt, after.rowID, observationRetentionPageRows)
+	if err != nil {
+		return nil, fmt.Errorf("select cycles to trim: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var page []trimCycle
+	for rows.Next() {
+		var c trimCycle
+		if err := rows.Scan(&c.cursor.sealedAt, &c.cursor.rowID, &c.id); err != nil {
+			return nil, fmt.Errorf("scan cycle to trim: %w", err)
+		}
+		page = append(page, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read cycles to trim: %w", err)
+	}
+	return page, nil
+}
+
+// currentHeadRunsTx reads every Situation's current query-slot heads.
+func currentHeadRunsTx(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM situation_observation_current_heads`)
+	if err != nil {
+		return nil, fmt.Errorf("select current query heads: %w", err)
+	}
+	ids, err := scanStrings(rows)
+	if err != nil {
+		return nil, err
+	}
+	heads := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		heads[id] = true
+	}
+	return heads, nil
+}
+
+// trimObservationCycleTx removes the plans of one cycle that nothing needs,
+// with their runs, requests and what hangs off them. A run is needed when it
+// still has detail, is decision evidence or current, is a reuse source, is a
+// live cursor's last run, is a query head, or is source provenance: the
+// same test the cycle prune applies to every run of a cycle.
+func trimObservationCycleTx(ctx context.Context, tx *sql.Tx, cycleID string, heads map[string]bool) (int, error) {
+	unneeded, err := unneededPlansTx(ctx, tx, cycleID, heads)
+	if err != nil || len(unneeded) == 0 {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO situation_preparation_pruning (cycle_id) VALUES (?)`, cycleID); err != nil {
+		return 0, fmt.Errorf("authorize trimming %s: %w", cycleID, err)
+	}
+	for _, pr := range unneeded {
+		statements := [][2]string{
+			{`DELETE FROM situation_observation_request_outcomes WHERE reservation_id IN (SELECT id FROM situation_observation_requests WHERE plan_id = ?)`, pr.plan},
+			{`DELETE FROM situation_observation_requests WHERE plan_id = ?`, pr.plan},
+		}
+		if pr.run != "" {
+			statements = append(statements,
+				[2]string{`DELETE FROM situation_observation_references WHERE run_id = ?`, pr.run},
+				[2]string{`DELETE FROM situation_observation_facts WHERE run_id = ?`, pr.run},
+				[2]string{`DELETE FROM situation_observation_detail_expirations WHERE run_id = ?`, pr.run},
+				[2]string{`DELETE FROM situation_observation_runs WHERE id = ?`, pr.run})
+		}
+		statements = append(statements, [2]string{`DELETE FROM situation_observation_plans WHERE id = ?`, pr.plan})
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement[0], statement[1]); err != nil {
+				return 0, fmt.Errorf("trim plan %s of %s: %w", pr.plan, cycleID, err)
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM situation_preparation_pruning WHERE cycle_id = ?`, cycleID); err != nil {
+		return 0, fmt.Errorf("end trimming %s: %w", cycleID, err)
+	}
+	return len(unneeded), nil
+}
+
+type planRun struct{ plan, run string }
+
+// unneededPlansTx reads a cycle's plans that never ran or whose run nothing
+// needs.
+func unneededPlansTx(ctx context.Context, tx *sql.Tx, cycleID string, heads map[string]bool) ([]planRun, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT p.id, COALESCE(r.id, '') FROM situation_observation_plans p
+		LEFT JOIN situation_observation_runs r ON r.plan_id = p.id
+		WHERE p.cycle_id = ? AND (r.id IS NULL OR (
+		  EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
+		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references x WHERE x.run_id = r.id AND (x.permanent = 1 OR x.superseded = 0))
+		  AND NOT EXISTS (SELECT 1 FROM situation_observation_runs u WHERE u.reused_from_run_id = r.id)
+		  AND NOT EXISTS (SELECT 1 FROM situation_observation_plans u WHERE u.reuse_run_id = r.id)
+		  AND NOT EXISTS (SELECT 1 FROM situation_observation_refresh f WHERE f.last_run_id = r.id)
+		  AND NOT EXISTS (SELECT 1 FROM zabbix_source_observations z WHERE z.run_id = r.id)))`, cycleID)
+	if err != nil {
+		return nil, fmt.Errorf("select plans to trim in %s: %w", cycleID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []planRun
+	for rows.Next() {
+		var pr planRun
+		if err := rows.Scan(&pr.plan, &pr.run); err != nil {
+			return nil, fmt.Errorf("scan plan to trim: %w", err)
+		}
+		if !heads[pr.run] {
+			out = append(out, pr)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read plans to trim in %s: %w", cycleID, err)
+	}
+	return out, nil
 }
 
 // PruneUnusedObservationMetadata removes sealed cycles older than ten days

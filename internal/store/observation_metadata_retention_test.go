@@ -148,6 +148,11 @@ func TestObservationMetadataPruningPreservesDecisionEvidence(t *testing.T) {
 	if err != nil || !found || rec.DetailState != observationmodel.DetailStateRetained || string(rec.Run.Facts[0].Value) != `{"up":1}` {
 		t.Fatalf("decision evidence damaged: record=%+v found=%v err=%v", rec, found, err)
 	}
+	fullObservationPass(t, st, at)
+	rec, found, err = st.LoadObservationRun(context.Background(), "run:consolidation:metadata-0")
+	if err != nil || !found || rec.DetailState != observationmodel.DetailStateRetained || string(rec.Run.Facts[0].Value) != `{"up":1}` {
+		t.Fatalf("a full pass damaged decision evidence: record=%+v found=%v err=%v", rec, found, err)
+	}
 }
 
 func TestObservationMetadataPruningPreservesExpiredDecisionBasis(t *testing.T) {
@@ -162,6 +167,11 @@ func TestObservationMetadataPruningPreservesExpiredDecisionBasis(t *testing.T) {
 	rec, found, err := st.LoadObservationRun(context.Background(), "run:consolidation:metadata-0")
 	if err != nil || !found || rec.DetailState != observationmodel.DetailStateExpired || len(rec.Run.Facts) != 1 || string(rec.Run.Facts[0].Value) != "null" {
 		t.Fatalf("expired basis lost or resurrected: record=%+v found=%v err=%v", rec, found, err)
+	}
+	fullObservationPass(t, st, at)
+	rec, found, err = st.LoadObservationRun(context.Background(), "run:consolidation:metadata-0")
+	if err != nil || !found || rec.DetailState != observationmodel.DetailStateExpired || len(rec.Run.Facts) != 1 {
+		t.Fatalf("a full pass lost the expired basis: record=%+v found=%v err=%v", rec, found, err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `INSERT INTO situation_observation_references
 		(id, run_id, reference_kind, owner_id, permanent, created_at)
@@ -182,6 +192,20 @@ func TestObservationMetadataPruningPreservesDecisionReuseProjection(t *testing.T
 	rec, found, err := st.LoadObservationRun(context.Background(), "run:consolidation:metadata-1")
 	if err != nil || !found || rec.Run.ReusedFromRunID == nil || *rec.Run.ReusedFromRunID != "run:consolidation:metadata-0" || len(rec.Run.Facts) != 1 {
 		t.Fatalf("decision projection lost: record=%+v found=%v err=%v", rec, found, err)
+	}
+	fullObservationPass(t, st, at)
+	rec, found, err = st.LoadObservationRun(context.Background(), "run:consolidation:metadata-1")
+	if err != nil || !found || rec.Run.ReusedFromRunID == nil || *rec.Run.ReusedFromRunID != "run:consolidation:metadata-0" || len(rec.Run.Facts) != 1 {
+		t.Fatalf("a full pass lost the decision projection: record=%+v found=%v err=%v", rec, found, err)
+	}
+}
+
+// fullObservationPass runs the whole observation retention pass at at,
+// trimming included, so a protection test proves the trim keeps it too.
+func fullObservationPass(t *testing.T, st *Store, at time.Time) {
+	t.Helper()
+	if _, err := st.PruneObservationRetention(context.Background(), at); err != nil {
+		t.Fatalf("full observation retention pass: %v", err)
 	}
 }
 
@@ -251,6 +275,119 @@ func TestObservationMetadataPruningPreservesOlderQuerySlotHead(t *testing.T) {
 		if before.Runs[i].ID != after.Runs[i].ID || before.Runs[i].Status != after.Runs[i].Status {
 			t.Error("retention changed the latest query-slot outcome")
 		}
+	}
+	fullObservationPass(t, st, at)
+	trimmed := load()
+	if len(trimmed.Runs) != len(before.Runs) {
+		t.Fatalf("a full pass changed current evidence: before=%+v after=%+v", before.Runs, trimmed.Runs)
+	}
+	for i := range before.Runs {
+		if before.Runs[i].ID != trimmed.Runs[i].ID || before.Runs[i].Status != trimmed.Runs[i].Status {
+			t.Error("a full pass changed the latest query-slot outcome")
+		}
+	}
+}
+
+// reuseChainCycles seals count cycles, each with a fresh read of its own
+// subject and, after the first, a reuse of the previous cycle's fresh run:
+// the shape steady traffic leaves, where every cycle reuses the one before.
+func reuseChainCycles(t *testing.T, st *Store, count int, base time.Time) (string, []observationmodel.Cycle) {
+	t.Helper()
+	ctx := context.Background()
+	id := newSituationForGroup(t, st, "service=retention", base)
+	claim := claimSituation(t, st, id, "reuse-chain", base)
+	fence := observationmodel.Fence{SituationID: id, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+	var cycles []observationmodel.Cycle
+	var previous string
+	for i := 0; i < count; i++ {
+		at := base.Add(time.Duration(i) * time.Second)
+		fresh := testPlan(at)
+		fresh.Scope.SubjectID = fmt.Sprintf("signal-%d", i)
+		plans := []observationmodel.Plan{fresh}
+		if previous != "" {
+			reuse := testPlan(at)
+			reuse.Scope.SubjectID = fmt.Sprintf("signal-%d", i-1)
+			reuse.Tier, reuse.ReuseRunID = observationmodel.TierReuse, previous
+			plans = append(plans, reuse)
+		}
+		cycle, err := st.BeginPreparation(ctx, fence, observationmodel.CycleDraft{Anchor: at, ConfigDigest: "retention-config", Plans: plans}, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run := consolidationRun(fmt.Sprintf("chain-%d", i), cycle, at)
+		if err := st.CommitObservationRun(ctx, fence, run, at); err != nil {
+			t.Fatal(err)
+		}
+		if previous != "" {
+			reused := consolidationRun(fmt.Sprintf("chain-reuse-%d", i), cycle, at)
+			reused.PlanID = cycle.Draft.Plans[1].ID
+			reused.Facts, reused.ReusedFromRunID = nil, &previous
+			if err := st.CommitObservationRun(ctx, fence, reused, at); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sealPreparationCycleTx(ctx, tx, id, cycle.ID, at); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		previous = run.ID
+		cycles = append(cycles, cycle)
+	}
+	return id, cycles
+}
+
+// TestObservationRetentionTrimsReuseChains: a kept cycle used to keep every
+// plan it had, and each cycle's reuse plan named a run of the cycle before,
+// so the current cycle kept the whole history. Retention now trims a kept
+// old cycle down to the runs something needs: the chain ends at the current
+// cycle's reuse source.
+func TestObservationRetentionTrimsReuseChains(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 6, 1, 8, 0, 0, 0, time.UTC)
+	sitID, cycles := reuseChainCycles(t, st, 6, base)
+	if _, err := st.db.ExecContext(ctx, `UPDATE situations SET input_version = input_version + 1 WHERE id = ?`, sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.PruneObservationRetention(ctx, base.Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	last, source := cycles[5].ID, cycles[4].ID
+	var kept []string
+	rows, err := st.db.QueryContext(ctx, `SELECT id FROM situation_preparation_cycles ORDER BY sealed_at`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err = scanStrings(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != 2 || kept[0] != source || kept[1] != last {
+		t.Fatalf("cycles kept = %v, want the source %s and the current %s", kept, source, last)
+	}
+	for cycleID, want := range map[string]int{last: 2, source: 1} {
+		var plans, runs int
+		if err := st.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM situation_observation_plans WHERE cycle_id = ?),
+			(SELECT COUNT(*) FROM situation_observation_runs WHERE cycle_id = ?)`, cycleID, cycleID).Scan(&plans, &runs); err != nil {
+			t.Fatal(err)
+		}
+		if plans != want || runs != want {
+			t.Errorf("cycle %s: %d plans, %d runs; want %d of each", cycleID, plans, runs, want)
+		}
+	}
+	if _, found, err := st.LoadObservationRun(ctx, "run:consolidation:chain-4"); err != nil || !found {
+		t.Fatalf("the current cycle's reuse source: found=%v err=%v", found, err)
+	}
+	if n, err := dbForeignKeyCheck(st); err != nil || n != 0 {
+		t.Fatalf("foreign keys: %d, %v", n, err)
 	}
 }
 
@@ -340,6 +477,10 @@ func TestObservationMetadataPruningPreservesSourceProvenance(t *testing.T) {
 	}
 	if n := metadataCount(t, st, "zabbix_source_observations"); n != 1 {
 		t.Fatalf("source provenance rows=%d, want 1", n)
+	}
+	fullObservationPass(t, st, at)
+	if _, found, err := st.LoadObservationRun(context.Background(), "run:consolidation:metadata-0"); err != nil || !found {
+		t.Fatalf("a full pass removed the provenance run: found=%v err=%v", found, err)
 	}
 }
 
