@@ -77,6 +77,14 @@ type Config struct {
 	// OutputCaps overrides the built-in per-call output caps (llm.output_caps).
 	// A per-call cap may only lower MaxTokens. Nil keeps every built-in cap.
 	OutputCaps llm.OutputCaps
+	// Reasoning, when set, is sent as the request's `reasoning` object (the
+	// gateway-level way to set thinking depth, e.g. OpenRouter's). It is sent
+	// as configured on every request and, unlike chat_template_kwargs, is not
+	// dropped if the endpoint rejects it: the operator opted in.
+	Reasoning *llm.Reasoning
+	// Routing, when set, is sent as the request's `provider` object (which
+	// hosting providers may serve it). Sent like Reasoning.
+	Routing *llm.Routing
 	// ResponseFormat is "json_object" (send response_format) or "off" (omit).
 	ResponseFormat string
 	// Thinking is the value sent as chat_template_kwargs.enable_thinking.
@@ -286,6 +294,8 @@ type chatRequest struct {
 	Messages           []chatMessage   `json:"messages"`
 	ResponseFormat     *responseFormat `json:"response_format,omitempty"`
 	ChatTemplateKwargs map[string]any  `json:"chat_template_kwargs,omitempty"`
+	Reasoning          *llm.Reasoning  `json:"reasoning,omitempty"`
+	Provider           *llm.Routing    `json:"provider,omitempty"`
 }
 
 type chatMessage struct {
@@ -390,6 +400,8 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 			body.ChatTemplateKwargs["reasoning_effort"] = c.cfg.ReasoningEffort
 		}
 	}
+	body.Reasoning = c.cfg.Reasoning
+	body.Provider = c.cfg.Routing
 	if c.cfg.ResponseFormat != "off" {
 		body.ResponseFormat = &responseFormat{Type: "json_object"}
 	}

@@ -553,7 +553,7 @@ type LLMConfig struct {
 	// its built-in cap; 0 turns it off, leaving llm.max_tokens as the only
 	// ceiling. A per-call cap can only lower llm.max_tokens, never raise it, so
 	// give a thinking model room by raising llm.max_tokens too.
-	OutputCaps llm.OutputCaps `yaml:"output_caps"`
+	OutputCaps llm.OutputCaps `yaml:"output_caps,omitempty"`
 	// BaseURL is the root URL of an OpenAI-compatible endpoint (SGLang, vLLM,
 	// Ollama, LM Studio). Required for provider "openai-compatible", rejected
 	// for "anthropic". A trailing /v1 is accepted and stripped at load — both
@@ -583,6 +583,19 @@ type LLMConfig struct {
 	// with enable_thinking=false sends a contradictory pin the model
 	// silently ignores rather than a config mistake surfaced at load.
 	ReasoningEffort string `yaml:"reasoning_effort"`
+	// Reasoning sets how much a model thinks through the gateway-level
+	// `reasoning` request object that OpenRouter and similar gateways accept
+	// (effort, a token budget, or on/off). It is the setting to use when the
+	// endpoint is a gateway: llm.thinking and llm.reasoning_effort travel as
+	// chat_template_kwargs, which a gateway ignores. Only for
+	// "openai-compatible"; nil sends nothing. Effort and max_tokens are
+	// mutually exclusive.
+	Reasoning *llm.Reasoning `yaml:"reasoning,omitempty"`
+	// Routing chooses which hosting providers may serve a request through the
+	// `provider` object that OpenRouter accepts, so a run is not spread over
+	// providers at different quantizations. Only for "openai-compatible"; nil
+	// sends nothing.
+	Routing *llm.Routing `yaml:"routing,omitempty"`
 	// TimeoutSeconds is the whole-request HTTP timeout for either provider.
 	// Default 120 (the previously hardcoded client default). Local endpoints
 	// under storm concurrency typically need ~300.
@@ -1089,6 +1102,12 @@ func (c *Config) validateLLM() []string {
 		if strings.TrimSpace(c.LLM.ReasoningEffort) != "" {
 			errs = append(errs, `llm.reasoning_effort is only valid for provider "openai-compatible" (the anthropic client has no chat-template mechanism)`)
 		}
+		if c.LLM.Reasoning != nil {
+			errs = append(errs, `llm.reasoning is only valid for provider "openai-compatible" (the anthropic client pins thinking itself)`)
+		}
+		if c.LLM.Routing != nil {
+			errs = append(errs, `llm.routing is only valid for provider "openai-compatible" (provider routing is a gateway feature)`)
+		}
 	case "openai-compatible":
 		errs = append(errs, c.validateLLMBaseURL()...)
 		switch c.LLM.ResponseFormat {
@@ -1100,6 +1119,8 @@ func (c *Config) validateLLM() []string {
 		if strings.TrimSpace(c.LLM.ReasoningEffort) != "" && !c.LLM.Thinking {
 			errs = append(errs, "llm.reasoning_effort requires llm.thinking: true (it sizes the thinking budget)")
 		}
+		errs = append(errs, c.validateLLMReasoning()...)
+		errs = append(errs, c.validateLLMRouting()...)
 	case "":
 		errs = append(errs, "llm.provider is required")
 	default:
@@ -1115,6 +1136,53 @@ func (c *Config) validateLLM() []string {
 		errs = append(errs, "llm.timeout_seconds must be > 0")
 	}
 	errs = append(errs, c.validateLLMOutputCaps()...)
+	return errs
+}
+
+// validateLLMReasoning checks llm.reasoning for the openai-compatible provider:
+// something must be set, and effort and max_tokens are mutually exclusive
+// because the gateway accepts one or the other.
+func (c *Config) validateLLMReasoning() []string {
+	r := c.LLM.Reasoning
+	if r == nil {
+		return nil
+	}
+	var errs []string
+	if r.IsZero() {
+		errs = append(errs, "llm.reasoning is empty (set enabled, effort, max_tokens or exclude)")
+	}
+	if strings.TrimSpace(r.Effort) != "" && r.MaxTokens != 0 {
+		errs = append(errs, "llm.reasoning.effort and llm.reasoning.max_tokens are mutually exclusive (the gateway accepts one or the other)")
+	}
+	if r.MaxTokens < 0 {
+		errs = append(errs, fmt.Sprintf("llm.reasoning.max_tokens (%d) must be >= 0", r.MaxTokens))
+	}
+	return errs
+}
+
+// validateLLMRouting checks llm.routing for the openai-compatible provider:
+// something must be set, and no listed provider or quantization may be blank.
+func (c *Config) validateLLMRouting() []string {
+	r := c.LLM.Routing
+	if r == nil {
+		return nil
+	}
+	var errs []string
+	if r.IsZero() {
+		errs = append(errs, "llm.routing is empty (set order, only, ignore, allow_fallbacks or quantizations)")
+	}
+	for _, list := range []struct {
+		name  string
+		items []string
+	}{
+		{"order", r.Order}, {"only", r.Only}, {"ignore", r.Ignore}, {"quantizations", r.Quantizations},
+	} {
+		for i, item := range list.items {
+			if strings.TrimSpace(item) == "" {
+				errs = append(errs, fmt.Sprintf("llm.routing.%s[%d] is empty", list.name, i))
+			}
+		}
+	}
 	return errs
 }
 

@@ -192,6 +192,8 @@ its behavior against it is undefined.
 | `response_format` | string | — | `openai-compatible` only: `json_object` (the default when unset) or `off` |
 | `thinking` | bool | `false` | `openai-compatible` only: opt a hybrid-reasoning model into thinking. Requires `max_tokens` 8000–16000 or triage fails with the truncation error; the three bounded calls under `output_caps` need their caps lifted too |
 | `reasoning_effort` | string | — | `openai-compatible` only, requires `thinking: true`: sent as `chat_template_kwargs.reasoning_effort` alongside `enable_thinking`. Model-specific values (e.g. Qwen3.8: `xhigh`/`medium`/`low`), passed through unvalidated; empty omits the field and leaves the model/server default in effect |
+| `reasoning` | map | — | `openai-compatible` only: the gateway-level `reasoning` request object — `effort` (for example `none`, `low`, `high`), `max_tokens`, `enabled`, `exclude` — for endpoints such as OpenRouter that ignore `chat_template_kwargs`. `effort` and `max_tokens` are mutually exclusive. Unset sends nothing. See below |
+| `routing` | map | — | `openai-compatible` only: the gateway's `provider` request object — `order`, `only`, `ignore`, `allow_fallbacks`, `quantizations` — to choose which hosting providers may serve a request on OpenRouter. Unset sends nothing |
 | `timeout_seconds` | int | `120` | Whole-request LLM timeout, either provider. Local endpoints under storm concurrency typically need ~300 |
 | `budget.calls_per_hour` | int | `0` | Shared ceiling on generation HTTP attempts in the preceding rolling 60 minutes, including retries; `0` is unlimited. Reservations commit before dispatch and survive restart in `connector_state` under `llm.budget.v1`. Metadata/health GETs are excluded. |
 | `budget.total_tokens` | int | `0` | Shared cumulative token ceiling with no time reset; `0` is unlimited. Each concurrent request reserves encoded request bytes + output cap + 1024, then settles to reported usage including cache tokens (without double-counting OpenAI detail fields). Unknown usage retains the charge and blocks further token-budgeted calls pending manual reconciliation; crashes retain unresolved allowances. Declined requests (4xx, 503, 529) settle to reported usage or zero and do not block. `llm.budget.v1` records the first unknown cause and time; older latches still need manual reconciliation. Accounting begins when either limit is enabled, without historical backfill. This conservative text allowance cannot guarantee an exact cap for arbitrary compatible servers; reported overruns return an error. See `config.example.yaml` for recovery and limit semantics. |
@@ -237,6 +239,29 @@ llm:
 ```
 
 An unknown call kind or a negative value is rejected at startup.
+
+`thinking` and `reasoning_effort` reach self-hosted runtimes through
+`chat_template_kwargs`, which a gateway such as OpenRouter ignores. Behind a
+gateway, set the depth with `reasoning` instead, and pin the hosting
+providers with `routing`:
+
+```yaml
+llm:
+  provider: openai-compatible
+  base_url: https://openrouter.ai/api
+  model: example-org/example-model
+  reasoning:
+    effort: low            # or max_tokens: 400 for a thinking budget, not both
+  routing:
+    only: [example-provider]
+    allow_fallbacks: false
+```
+
+Both are sent on every request exactly as configured. Unlike
+`chat_template_kwargs`, they are not dropped if the endpoint rejects them, so
+an endpoint that answers HTTP 400 means the option is not supported there;
+remove it. A thinking model that you give room to think also needs
+`max_tokens` and `output_caps` raised.
 
 ## `correlator`
 
