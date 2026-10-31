@@ -102,11 +102,16 @@ llm:
   the run to the providers (or quantizations) you choose.
 - Some models cannot switch thinking off and answer HTTP 400 to
   `effort: none` or `enabled: false`; use the lowest effort they accept.
+- `allow_fallbacks: false` with a single provider turns that provider's
+  upstream rate limit (HTTP 429) into errors, because the gateway cannot route
+  around it. Prefer `order` or `quantizations` and leave fallbacks on.
 - Both settings are sent on every request as configured. If an endpoint
   rejects them with HTTP 400, it does not support them: remove the setting.
 - Thinking spends output tokens before the JSON, so a model that thinks also
   needs `max_tokens` and, for the three small bounded calls,
-  [`output_caps`](../getting-started/configuration.md#llm) raised.
+  [`output_caps`](../getting-started/configuration.md#llm) raised, and
+  `timeout_seconds` raised to match. A model can also loop until it reaches the
+  limit, so raise the caps to a bounded value rather than turning them off.
 
 ## Honest quality note
 
