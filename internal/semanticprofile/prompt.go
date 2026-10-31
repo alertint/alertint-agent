@@ -126,5 +126,6 @@ func BuildInferencePrompt(frozenInputJSON json.RawMessage) (llm.Prompt, error) {
 		Prefix:          prefix,
 		CachePrefix:     true,
 		MaxOutputTokens: inferencePromptMaxOutputTokens,
+		Kind:            llm.CallSemanticProfile,
 	}, nil
 }

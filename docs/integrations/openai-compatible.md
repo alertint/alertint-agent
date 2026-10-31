@@ -41,6 +41,10 @@ llm:
   #                                    # chat_template_kwargs.reasoning_effort alongside enable_thinking;
   #                                    # passed through unvalidated, so use whatever vocabulary your
   #                                    # model's chat template accepts. Empty (default) omits the field.
+  # output_caps:                       # three small calls carry their own output cap (assessment 800,
+  #   assessment: 0                    # semantic_profile 600, verification_repair 512). A thinking model
+  #                                    # spends it on thinking and is cut off: 0 turns a cap off, leaving
+  #                                    # max_tokens as the only ceiling, so raise max_tokens as well.
 ```
 
 The memory shadow classifier (when enabled) follows the same endpoint and
@@ -102,6 +106,13 @@ reply was cut off before the JSON closed. Raise `llm.max_tokens`, or if
 `llm.thinking: true` is set, either raise it further (8000–16000) or disable
 thinking — reasoning output competes with the JSON reply for the same token
 budget.
+
+**`llm: response truncated at max_tokens=N (per-call max_output_tokens; raise or zero llm.output_caps.<kind>)`** —
+one of the three small calls hit its own fixed cap, not `llm.max_tokens`.
+A model that thinks before it answers spends that cap on thinking. Raise or
+zero `llm.output_caps.<kind>` (`assessment`, `semantic_profile` or
+`verification_repair`), and keep `llm.max_tokens` at least as high: a per-call
+cap can only lower it. Disabling thinking also avoids the truncation.
 
 **WARN `llm: endpoint rejected chat_template_kwargs; …` once after startup** —
 the endpoint does not accept `chat_template_kwargs`, the field self-hosted

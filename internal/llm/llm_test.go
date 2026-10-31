@@ -79,3 +79,54 @@ func TestPromptOutputTokenLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestPromptOutputLimit(t *testing.T) {
+	tests := []struct {
+		name        string
+		configured  int
+		builtin     int
+		kind        llm.CallKind
+		caps        llm.OutputCaps
+		want        int
+		wantPerCall bool
+	}{
+		{"no caps keeps the built-in cap", 4096, 800, llm.CallAssessment, nil, 800, true},
+		{"unset everything keeps configured", 4096, 0, "", nil, 4096, false},
+		{"override replaces the built-in cap", 4096, 800, llm.CallAssessment, llm.OutputCaps{llm.CallAssessment: 300}, 300, true},
+		{"zero turns the cap off", 4096, 800, llm.CallAssessment, llm.OutputCaps{llm.CallAssessment: 0}, 4096, false},
+		{"override cannot raise configured", 1024, 800, llm.CallAssessment, llm.OutputCaps{llm.CallAssessment: 9000}, 1024, false},
+		{"other kinds are untouched", 4096, 800, llm.CallAssessment, llm.OutputCaps{llm.CallSemanticProfile: 0}, 800, true},
+		{"a call without a kind ignores caps", 4096, 512, "", llm.OutputCaps{llm.CallAssessment: 0}, 512, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := llm.Prompt{MaxOutputTokens: tc.builtin, Kind: tc.kind}
+			got, perCall := p.OutputLimit(tc.configured, tc.caps)
+			if got != tc.want || perCall != tc.wantPerCall {
+				t.Fatalf("OutputLimit(%d) = (%d, %v), want (%d, %v)", tc.configured, got, perCall, tc.want, tc.wantPerCall)
+			}
+		})
+	}
+}
+
+func TestPromptTruncationHint(t *testing.T) {
+	tests := []struct {
+		name    string
+		prompt  llm.Prompt
+		perCall bool
+		want    string
+	}{
+		{"configured ceiling points at llm.max_tokens", llm.Prompt{}, false, "raise llm.max_tokens"},
+		{"a lifted per-call cap points at llm.max_tokens", llm.Prompt{Kind: llm.CallAssessment}, false, "raise llm.max_tokens"},
+		{"a fixed per-call cap names itself", llm.Prompt{MaxOutputTokens: 128}, true, "per-call max_output_tokens"},
+		{"a tunable per-call cap names its key", llm.Prompt{MaxOutputTokens: 800, Kind: llm.CallAssessment}, true,
+			"per-call max_output_tokens; raise or zero llm.output_caps.assessment"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.prompt.TruncationHint(tc.perCall); got != tc.want {
+				t.Fatalf("TruncationHint(%v) = %q, want %q", tc.perCall, got, tc.want)
+			}
+		})
+	}
+}

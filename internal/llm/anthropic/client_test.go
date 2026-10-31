@@ -608,6 +608,66 @@ func TestPerCallMaxOutputTokens(t *testing.T) {
 	}
 }
 
+// TestOutputCapsOverridePerCallCap verifies llm.output_caps replaces a call's
+// built-in cap for its Kind: a lower value lowers max_tokens, 0 turns the cap
+// off (the configured ceiling applies), and a value above the configured
+// ceiling cannot raise it.
+func TestOutputCapsOverridePerCallCap(t *testing.T) {
+	tests := []struct {
+		name string
+		caps llm.OutputCaps
+		want float64
+	}{
+		{"no override keeps the built-in cap", nil, 128},
+		{"lower override wins", llm.OutputCaps{llm.CallVerificationRepair: 64}, 64},
+		{"zero turns the cap off", llm.OutputCaps{llm.CallVerificationRepair: 0}, 256},
+		{"override cannot raise the configured ceiling", llm.OutputCaps{llm.CallVerificationRepair: 9000}, 256},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				_, _ = w.Write([]byte(responseBody(`{"queries":[]}`, 1, 1)))
+			}))
+			defer srv.Close()
+
+			cfg := anthropic.Config{APIKey: "test-key", Model: "claude-test", MaxTokens: 256, OutputCaps: tc.caps, BaseRetryDelay: 5 * time.Millisecond}
+			client := anthropic.NewWithHTTPClient(cfg, nil, nil, srv.URL)
+			_, err := client.Complete(context.Background(), "sys",
+				llm.Prompt{Prefix: "repair", MaxOutputTokens: 128, Kind: llm.CallVerificationRepair}, []string{"queries"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := body["max_tokens"]; got != tc.want {
+				t.Fatalf("max_tokens = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMaxTokensTruncationErrorOutputCapHint verifies a truncation at a tunable
+// per-call cap names llm.output_caps.<kind>.
+func TestMaxTokensTruncationErrorOutputCapHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, responseBodyStop(`{"queries":[{"query":"up{job=`, "max_tokens", 100, 128))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL, nil)
+	_, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "repair", MaxOutputTokens: 128, Kind: llm.CallVerificationRepair}, []string{"queries"})
+	if !errors.Is(err, llm.ErrResponseTruncated) {
+		t.Fatalf("want ErrResponseTruncated, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "llm.output_caps.verification_repair") {
+		t.Errorf("a tunable per-call cap must name its config key, got: %v", err)
+	}
+}
+
 // TestCacheUsageCaptured: the two cache usage fields reach Completion and the
 // llm.response audit payload.
 func TestCacheUsageCaptured(t *testing.T) {
