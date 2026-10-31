@@ -5,6 +5,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1138,7 +1139,7 @@ func TestValidateLLMOpenAICompatible(t *testing.T) {
 		if err := c.ValidateOffline(); err != nil {
 			t.Fatalf("un-normalized base_url must still validate: %v", err)
 		}
-		if c.LLM != before {
+		if !reflect.DeepEqual(c.LLM, before) {
 			t.Errorf("ValidateOffline mutated the config: before %+v, after %+v", before, c.LLM)
 		}
 	})

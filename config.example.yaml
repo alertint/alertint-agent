@@ -82,6 +82,12 @@ llm:
   # reasoning_effort: low                     # adaptive-reasoning models only (e.g. Qwen3.8: xhigh/medium/low);
   #                                           # empty (default) omits the field, leaving the model/server default.
   #                                           # Requires thinking: true — it sizes the thinking budget.
+  # output_caps:                              # per-call output caps; an absent kind keeps its built-in cap,
+  #   assessment: 0                           # 0 turns it off (llm.max_tokens still bounds the call).
+  #   semantic_profile: 0                     # built-in 600
+  #   verification_repair: 0                  # built-in 512
+  #                                           # A per-call cap can only lower max_tokens: raise max_tokens
+  #                                           # too when you lift a cap for a thinking model.
 
 correlator:
   window_seconds: 90       # group alerts arriving within this window

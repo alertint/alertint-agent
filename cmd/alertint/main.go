@@ -1318,6 +1318,7 @@ func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model s
 		APIKey:          apiKey,
 		Model:           model,
 		MaxTokens:       maxTokens,
+		OutputCaps:      cfg.LLM.OutputCaps,
 		ResponseFormat:  cfg.LLM.ResponseFormat,
 		Thinking:        cfg.LLM.Thinking,
 		ReasoningEffort: cfg.LLM.ReasoningEffort,
@@ -1376,6 +1377,7 @@ func llmanthropicCfg(cfg *config.Config, budget ...*llm.Budget) llmanthropic.Con
 		APIKey:         key,
 		Model:          cfg.LLM.Model,
 		MaxTokens:      cfg.LLM.MaxTokens,
+		OutputCaps:     cfg.LLM.OutputCaps,
 		TimeoutSeconds: cfg.LLM.TimeoutSeconds,
 	}
 }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `llm.output_caps` overrides the built-in output cap of the three small,
+  bounded calls: `assessment` (800 tokens), `semantic_profile` (600) and
+  `verification_repair` (512). An absent kind keeps its cap; `0` turns it off,
+  leaving `llm.max_tokens` as the only ceiling. A model that thinks before it
+  answers spends the fixed cap on thinking and truncates; the truncation error
+  now names the cap and the key that moves it. Defaults are unchanged. See
+  Configuration: `llm`.
+
 ## [0.16.0] - 2026-10-26
 
 ### Added

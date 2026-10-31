@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -543,6 +545,15 @@ type LLMConfig struct {
 	// and the whole triage fails. Defaults to 4096; raise it for very large
 	// correlations.
 	MaxTokens int `yaml:"max_tokens"`
+	// OutputCaps overrides the built-in per-call output caps, keyed by call kind
+	// (assessment, semantic_profile, verification_repair). A few small, bounded
+	// calls carry their own cap (800, 600 and 512 tokens) because their JSON
+	// reply is small and fixed; a reasoning model that thinks before it answers
+	// spends that cap on thinking and is cut off. A kind that is absent keeps
+	// its built-in cap; 0 turns it off, leaving llm.max_tokens as the only
+	// ceiling. A per-call cap can only lower llm.max_tokens, never raise it, so
+	// give a thinking model room by raising llm.max_tokens too.
+	OutputCaps llm.OutputCaps `yaml:"output_caps"`
 	// BaseURL is the root URL of an OpenAI-compatible endpoint (SGLang, vLLM,
 	// Ollama, LM Studio). Required for provider "openai-compatible", rejected
 	// for "anthropic". A trailing /v1 is accepted and stripped at load — both
@@ -1102,6 +1113,35 @@ func (c *Config) validateLLM() []string {
 	}
 	if c.LLM.TimeoutSeconds <= 0 {
 		errs = append(errs, "llm.timeout_seconds must be > 0")
+	}
+	errs = append(errs, c.validateLLMOutputCaps()...)
+	return errs
+}
+
+// validateLLMOutputCaps checks llm.output_caps: only known call kinds, and no
+// negative value (0 turns that call's cap off). An unknown kind would silently
+// tune nothing, so it fails at startup like any other misspelled key.
+func (c *Config) validateLLMOutputCaps() []string {
+	known := llm.CallKinds()
+	names := make([]string, len(known))
+	for i, k := range known {
+		names[i] = string(k)
+	}
+	kinds := make([]string, 0, len(c.LLM.OutputCaps))
+	for k := range c.LLM.OutputCaps {
+		kinds = append(kinds, string(k))
+	}
+	sort.Strings(kinds)
+
+	var errs []string
+	for _, k := range kinds {
+		if !slices.Contains(names, k) {
+			errs = append(errs, fmt.Sprintf("llm.output_caps: unknown call kind %q (use %s)", k, strings.Join(names, ", ")))
+			continue
+		}
+		if v := c.LLM.OutputCaps[llm.CallKind(k)]; v < 0 {
+			errs = append(errs, fmt.Sprintf("llm.output_caps.%s (%d) must be >= 0 (0 turns the per-call cap off)", k, v))
+		}
 	}
 	return errs
 }

@@ -36,6 +36,26 @@ func TestBuildLLMClient_ProviderSelectsConcreteType(t *testing.T) {
 	}
 }
 
+// TestLLMClientConfigs_CarryOutputCaps pins that llm.output_caps reaches both
+// provider clients: a config key that never leaves the loaded Config would
+// validate cleanly yet tune nothing.
+func TestLLMClientConfigs_CarryOutputCaps(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.LLM.OutputCaps = llm.OutputCaps{llm.CallAssessment: 0, llm.CallSemanticProfile: 1200}
+
+	for name, got := range map[string]llm.OutputCaps{
+		"openai-compatible": llmopenaiCfg(&cfg, "", cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens).OutputCaps,
+		"anthropic":         llmanthropicCfg(&cfg).OutputCaps,
+	} {
+		if v, ok := got[llm.CallAssessment]; !ok || v != 0 {
+			t.Errorf("%s: assessment cap = (%d, %v), want an explicit 0", name, v, ok)
+		}
+		if got[llm.CallSemanticProfile] != 1200 {
+			t.Errorf("%s: semantic_profile cap = %d, want 1200", name, got[llm.CallSemanticProfile])
+		}
+	}
+}
+
 // TestBuildClassifierClient_OpenAICompatibleReusesLLMModel pins the exact
 // regression this branch exists to prevent (see buildClassifierClient's own
 // comment): on openai-compatible, the classifier must request cfg.LLM.Model,
