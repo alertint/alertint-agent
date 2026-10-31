@@ -26,21 +26,80 @@ type Prompt struct {
 	Suffix          string
 	CachePrefix     bool
 	MaxOutputTokens int // zero = provider-configured limit; positive may only lower it
+	// Kind names the call site for llm.output_caps. Empty means the call has no
+	// operator-tunable cap: its MaxOutputTokens, if any, is fixed.
+	Kind CallKind
 }
+
+// CallKind names a call site that ships with its own built-in output cap
+// (Prompt.MaxOutputTokens). llm.output_caps keys on it, so an operator can move
+// or lift one cap without touching llm.max_tokens.
+type CallKind string
+
+const (
+	// CallAssessment is the Situation assessment call.
+	CallAssessment CallKind = "assessment"
+	// CallSemanticProfile is the semantic-profile inference call.
+	CallSemanticProfile CallKind = "semantic_profile"
+	// CallVerificationRepair is the bounded verification query-repair call.
+	CallVerificationRepair CallKind = "verification_repair"
+)
+
+// CallKinds lists every CallKind in a stable order. internal/config validates
+// llm.output_caps keys against it.
+func CallKinds() []CallKind {
+	return []CallKind{CallAssessment, CallSemanticProfile, CallVerificationRepair}
+}
+
+// OutputCaps overrides the built-in per-call output caps, keyed by CallKind. A
+// kind that is absent keeps its built-in cap; a value of 0 turns that call's cap
+// off, leaving it bounded by llm.max_tokens alone. The nil map (the default)
+// changes nothing.
+type OutputCaps map[CallKind]int
 
 // Text is the full user-turn text, prefix and suffix joined.
 func (p Prompt) Text() string { return p.Prefix + p.Suffix }
+
+// OutputLimit returns the effective output-token ceiling for this call and
+// whether a per-call cap, rather than the configured ceiling, set it. A cap in
+// caps for the call's Kind replaces the built-in MaxOutputTokens (0 turns it
+// off). A per-call cap may only lower the configured ceiling, never raise it:
+// to give a call more room, raise llm.max_tokens as well.
+func (p Prompt) OutputLimit(configured int, caps OutputCaps) (limit int, perCall bool) {
+	ceiling := p.MaxOutputTokens
+	if v, ok := caps[p.Kind]; ok && p.Kind != "" {
+		ceiling = v
+	}
+	if ceiling > 0 && ceiling < configured {
+		return ceiling, true
+	}
+	return configured, false
+}
 
 // OutputTokenLimit returns the effective output-token ceiling for this call:
 // the operator's configured value, unless MaxOutputTokens is set and lower —
 // an explicit per-call value may only lower the configured ceiling, never
 // raise it. Used by callers (e.g. a bounded repair call) that need a tighter
-// cap on a single request without touching llm.max_tokens.
+// cap on a single request without touching llm.max_tokens. It ignores
+// llm.output_caps; clients call OutputLimit.
 func (p Prompt) OutputTokenLimit(configured int) int {
-	if p.MaxOutputTokens > 0 && p.MaxOutputTokens < configured {
-		return p.MaxOutputTokens
+	limit, _ := p.OutputLimit(configured, nil)
+	return limit
+}
+
+// TruncationHint is the remedy appended to ErrResponseTruncated. When a per-call
+// cap set the ceiling, the operator's llm.max_tokens is not the cause, so the
+// hint names the per-call cap (and, for a tunable call, the key that moves it)
+// instead of misdirecting to llm.max_tokens.
+func (p Prompt) TruncationHint(perCall bool) string {
+	switch {
+	case !perCall:
+		return "raise llm.max_tokens"
+	case p.Kind != "":
+		return "per-call max_output_tokens; raise or zero llm.output_caps." + string(p.Kind)
+	default:
+		return "per-call max_output_tokens"
 	}
-	return configured
 }
 
 // Completion is the result of a Complete call: the validated raw JSON plus

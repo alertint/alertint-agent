@@ -187,10 +187,13 @@ its behavior against it is undefined.
 | `api_key_env` | string | — | Env var name holding the API key. **Required** for `anthropic`; optional for `openai-compatible` (unauthenticated local endpoints omit it) |
 | `model` | string | `claude-sonnet-5` | Model ID (Anthropic) or the model name your endpoint serves (`openai-compatible`) |
 | `max_tokens` | int | `4096` | Output-token ceiling for the triage reply. Raise it if a very large correlated incident truncates (the finding JSON carries one entry per member alert) |
+| `output_caps` | map | — | Overrides the built-in output cap of three small, bounded calls, keyed by call kind: `assessment` (800 tokens), `semantic_profile` (600) and `verification_repair` (512). An absent kind keeps its built-in cap; `0` turns that cap off, leaving `max_tokens` as the only ceiling. A per-call cap can only lower `max_tokens`, so raise `max_tokens` too when you lift one. See below |
 | `base_url` | string | — | `openai-compatible` only, required there: endpoint root URL. A trailing `/v1` is accepted and stripped |
 | `response_format` | string | — | `openai-compatible` only: `json_object` (the default when unset) or `off` |
-| `thinking` | bool | `false` | `openai-compatible` only: opt a hybrid-reasoning model into thinking. Requires `max_tokens` 8000–16000 or triage fails with the truncation error |
+| `thinking` | bool | `false` | `openai-compatible` only: opt a hybrid-reasoning model into thinking. Requires `max_tokens` 8000–16000 or triage fails with the truncation error; the three bounded calls under `output_caps` need their caps lifted too |
 | `reasoning_effort` | string | — | `openai-compatible` only, requires `thinking: true`: sent as `chat_template_kwargs.reasoning_effort` alongside `enable_thinking`. Model-specific values (e.g. Qwen3.8: `xhigh`/`medium`/`low`), passed through unvalidated; empty omits the field and leaves the model/server default in effect |
+| `reasoning` | map | — | `openai-compatible` only: the gateway-level `reasoning` request object — `effort` (for example `none`, `low`, `high`), `max_tokens`, `enabled`, `exclude` — for endpoints such as OpenRouter that ignore `chat_template_kwargs`. `effort` and `max_tokens` are mutually exclusive. Unset sends nothing. See below |
+| `routing` | map | — | `openai-compatible` only: the gateway's `provider` request object — `order`, `only`, `ignore`, `allow_fallbacks`, `quantizations` — to choose which hosting providers may serve a request on OpenRouter. Unset sends nothing |
 | `timeout_seconds` | int | `120` | Whole-request LLM timeout, either provider. Local endpoints under storm concurrency typically need ~300 |
 | `budget.calls_per_hour` | int | `0` | Shared ceiling on generation HTTP attempts in the preceding rolling 60 minutes, including retries; `0` is unlimited. Reservations commit before dispatch and survive restart in `connector_state` under `llm.budget.v1`. Metadata/health GETs are excluded. |
 | `budget.total_tokens` | int | `0` | Shared cumulative token ceiling with no time reset; `0` is unlimited. Each concurrent request reserves encoded request bytes + output cap + 1024, then settles to reported usage including cache tokens (without double-counting OpenAI detail fields). Unknown usage retains the charge and blocks further token-budgeted calls pending manual reconciliation; crashes retain unresolved allowances. Declined requests (4xx, 503, 529) settle to reported usage or zero and do not block. `llm.budget.v1` records the first unknown cause and time; older latches still need manual reconciliation. Accounting begins when either limit is enabled, without historical backfill. This conservative text allowance cannot guarantee an exact cap for arbitrary compatible servers; reported overruns return an error. See `config.example.yaml` for recovery and limit semantics. |
@@ -218,6 +221,55 @@ mid-reply; when that happens the log names it explicitly
 (`response truncated at max_tokens=…; raise llm.max_tokens`) so the fix is a
 one-line bump. It is a ceiling, not a target — small incidents still emit only
 what they need, so raising it costs nothing for normal traffic.
+
+Three smaller calls carry their own cap, because their JSON reply is small and
+fixed: the Situation assessment (800 tokens), the semantic-profile inference
+(600) and the verification query repair (512). A model that thinks before it
+answers spends that cap on thinking and is cut off before the JSON closes. The
+log names the cap that was hit (`response truncated at max_tokens=800
+(per-call max_output_tokens; raise or zero llm.output_caps.assessment)`).
+`output_caps` moves or lifts one cap without touching `max_tokens`:
+
+```yaml
+llm:
+  max_tokens: 16000        # a per-call cap can only lower this, never raise it
+  output_caps:
+    assessment: 0          # 0 turns the 800-token cap off; max_tokens still bounds the call
+    semantic_profile: 2000 # or set a different cap
+```
+
+An unknown call kind or a negative value is rejected at startup.
+
+Prefer a bounded value over `0` for a model that can loop. With a cap, a
+runaway reply is cut off after that many tokens; with none it runs to
+`max_tokens`, which can outlast `timeout_seconds`. A request that times out
+leaves the token budget (`budget.total_tokens`) with unknown usage, and every
+later call is refused until it is reconciled. Keep the largest cap well under
+`max_tokens`, and make sure the slowest plausible reply of that size finishes
+inside `timeout_seconds`.
+
+`thinking` and `reasoning_effort` reach self-hosted runtimes through
+`chat_template_kwargs`, which a gateway such as OpenRouter ignores. Behind a
+gateway, set the depth with `reasoning` instead, and pin the hosting
+providers with `routing`:
+
+```yaml
+llm:
+  provider: openai-compatible
+  base_url: https://openrouter.ai/api
+  model: example-org/example-model
+  reasoning:
+    effort: low            # or max_tokens: 400 for a thinking budget, not both
+  routing:
+    only: [example-provider]
+    allow_fallbacks: false
+```
+
+Both are sent on every request exactly as configured. Unlike
+`chat_template_kwargs`, they are not dropped if the endpoint rejects them, so
+an endpoint that answers HTTP 400 means the option is not supported there;
+remove it. A thinking model that you give room to think also needs
+`max_tokens` and `output_caps` raised.
 
 ## `correlator`
 

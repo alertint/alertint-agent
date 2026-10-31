@@ -254,5 +254,6 @@ func BuildAssessmentPrompt(snap Snapshot) (llm.Prompt, error) {
 		Prefix:          prefix,
 		CachePrefix:     true,
 		MaxOutputTokens: assessmentPromptMaxOutputTokens,
+		Kind:            llm.CallAssessment,
 	}, nil
 }
