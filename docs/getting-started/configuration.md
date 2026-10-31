@@ -240,6 +240,14 @@ llm:
 
 An unknown call kind or a negative value is rejected at startup.
 
+Prefer a bounded value over `0` for a model that can loop. With a cap, a
+runaway reply is cut off after that many tokens; with none it runs to
+`max_tokens`, which can outlast `timeout_seconds`. A request that times out
+leaves the token budget (`budget.total_tokens`) with unknown usage, and every
+later call is refused until it is reconciled. Keep the largest cap well under
+`max_tokens`, and make sure the slowest plausible reply of that size finishes
+inside `timeout_seconds`.
+
 `thinking` and `reasoning_effort` reach self-hosted runtimes through
 `chat_template_kwargs`, which a gateway such as OpenRouter ignores. Behind a
 gateway, set the depth with `reasoning` instead, and pin the hosting
