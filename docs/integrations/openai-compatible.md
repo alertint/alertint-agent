@@ -75,6 +75,39 @@ llm:
   model: qwen3:32b                     # the model name as pulled, e.g. `ollama pull qwen3:32b`
 ```
 
+## OpenRouter and other gateways
+
+A gateway such as OpenRouter fronts many models and hosting providers behind
+one OpenAI-style endpoint. It ignores `chat_template_kwargs`, so `llm.thinking`
+and `llm.reasoning_effort` have no effect there. Two settings send the
+gateway's own request fields instead:
+
+```yaml
+llm:
+  provider: openai-compatible
+  base_url: https://openrouter.ai/api
+  api_key_env: OPENROUTER_API_KEY
+  model: example-org/example-model
+  reasoning:                     # the `reasoning` request object
+    effort: none                 # none, minimal, low, medium, high or xhigh, as the model allows
+    # max_tokens: 400            # a thinking budget instead of an effort; not both
+    # enabled: false             # or switch thinking off outright
+  routing:                       # the `provider` request object
+    only: [example-provider]     # also: order, ignore, allow_fallbacks, quantizations
+    allow_fallbacks: false
+```
+
+- A hosted model is often served by several providers at different
+  quantizations, and by default the gateway picks per request. `routing` pins
+  the run to the providers (or quantizations) you choose.
+- Some models cannot switch thinking off and answer HTTP 400 to
+  `effort: none` or `enabled: false`; use the lowest effort they accept.
+- Both settings are sent on every request as configured. If an endpoint
+  rejects them with HTTP 400, it does not support them: remove the setting.
+- Thinking spends output tokens before the JSON, so a model that thinks also
+  needs `max_tokens` and, for the three small bounded calls,
+  [`output_caps`](../getting-started/configuration.md#llm) raised.
+
 ## Honest quality note
 
 Triage calibration — the verification round's contrast queries, confidence

@@ -88,6 +88,12 @@ llm:
   #   verification_repair: 0                  # built-in 512
   #                                           # A per-call cap can only lower max_tokens: raise max_tokens
   #                                           # too when you lift a cap for a thinking model.
+  # reasoning:                                # behind a gateway (e.g. OpenRouter), which ignores
+  #   effort: low                             # thinking/reasoning_effort: the gateway's `reasoning` object.
+  #                                           # effort OR max_tokens, not both; also enabled, exclude.
+  # routing:                                  # the gateway's `provider` object: which hosting providers
+  #   only: [example-provider]                # may serve a request (also order, ignore, allow_fallbacks,
+  #   allow_fallbacks: false                  # quantizations).
 
 correlator:
   window_seconds: 90       # group alerts arriving within this window

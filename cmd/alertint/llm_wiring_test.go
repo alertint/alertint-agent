@@ -56,6 +56,23 @@ func TestLLMClientConfigs_CarryOutputCaps(t *testing.T) {
 	}
 }
 
+// TestLLMClientConfig_CarriesReasoningAndRouting pins that llm.reasoning and
+// llm.routing reach the openai-compatible client: a key that never leaves the
+// loaded Config would validate cleanly yet send nothing.
+func TestLLMClientConfig_CarriesReasoningAndRouting(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.LLM.Reasoning = &llm.Reasoning{Effort: "low"}
+	cfg.LLM.Routing = &llm.Routing{Only: []string{"deepinfra"}}
+
+	got := llmopenaiCfg(&cfg, "", cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens)
+	if got.Reasoning == nil || got.Reasoning.Effort != "low" {
+		t.Errorf("reasoning = %+v, want effort low", got.Reasoning)
+	}
+	if got.Routing == nil || len(got.Routing.Only) != 1 || got.Routing.Only[0] != "deepinfra" {
+		t.Errorf("routing = %+v, want only [deepinfra]", got.Routing)
+	}
+}
+
 // TestBuildClassifierClient_OpenAICompatibleReusesLLMModel pins the exact
 // regression this branch exists to prevent (see buildClassifierClient's own
 // comment): on openai-compatible, the classifier must request cfg.LLM.Model,

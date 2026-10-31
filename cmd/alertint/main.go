@@ -1322,6 +1322,8 @@ func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model s
 		ResponseFormat:  cfg.LLM.ResponseFormat,
 		Thinking:        cfg.LLM.Thinking,
 		ReasoningEffort: cfg.LLM.ReasoningEffort,
+		Reasoning:       cfg.LLM.Reasoning,
+		Routing:         cfg.LLM.Routing,
 		TimeoutSeconds:  timeoutSeconds,
 	}
 }
