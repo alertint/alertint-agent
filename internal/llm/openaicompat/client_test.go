@@ -542,6 +542,75 @@ func TestPerCallMaxOutputTokens(t *testing.T) {
 	}
 }
 
+// TestOutputCapsOverridePerCallCap verifies llm.output_caps replaces a call's
+// built-in cap for its Kind: a lower value lowers max_tokens, 0 turns the cap
+// off (the configured ceiling applies), and a value above the configured
+// ceiling cannot raise it.
+func TestOutputCapsOverridePerCallCap(t *testing.T) {
+	tests := []struct {
+		name string
+		caps llm.OutputCaps
+		want float64
+	}{
+		{"no override keeps the built-in cap", nil, 800},
+		{"lower override wins", llm.OutputCaps{llm.CallAssessment: 300}, 300},
+		{"zero turns the cap off", llm.OutputCaps{llm.CallAssessment: 0}, 4096},
+		{"override cannot raise the configured ceiling", llm.OutputCaps{llm.CallAssessment: 9000}, 4096},
+		{"another kind is untouched", llm.OutputCaps{llm.CallSemanticProfile: 0}, 800},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				_, _ = w.Write([]byte(chatBody(`{"queries":[]}`, 1, 1)))
+			}))
+			defer srv.Close()
+
+			client := newClient(srv, func(c *openaicompat.Config) { c.OutputCaps = tc.caps })
+			_, err := client.Complete(context.Background(), "sys",
+				llm.Prompt{Prefix: "p", MaxOutputTokens: 800, Kind: llm.CallAssessment}, []string{"queries"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := body["max_tokens"]; got != tc.want {
+				t.Fatalf("max_tokens = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFinishReasonLengthOutputCapHint verifies a truncation at a tunable
+// per-call cap names llm.output_caps.<kind>, while a call whose cap was turned
+// off and is cut at llm.max_tokens points at llm.max_tokens instead.
+func TestFinishReasonLengthOutputCapHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBodyFull(`{"queries":[{"query":"up{job=`, "", "length")))
+	}))
+	defer srv.Close()
+	prompt := llm.Prompt{Prefix: "p", MaxOutputTokens: 800, Kind: llm.CallAssessment}
+
+	c := newClient(srv, nil)
+	_, err := c.Complete(context.Background(), "s", prompt, []string{"queries"})
+	if !errors.Is(err, llm.ErrResponseTruncated) {
+		t.Fatalf("want ErrResponseTruncated, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "llm.output_caps.assessment") {
+		t.Errorf("a tunable per-call cap must name its config key, got: %v", err)
+	}
+
+	lifted := newClient(srv, func(c *openaicompat.Config) { c.OutputCaps = llm.OutputCaps{llm.CallAssessment: 0} })
+	_, err = lifted.Complete(context.Background(), "s", prompt, []string{"queries"})
+	if !errors.Is(err, llm.ErrResponseTruncated) {
+		t.Fatalf("want ErrResponseTruncated, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "raise llm.max_tokens") || strings.Contains(err.Error(), "output_caps") {
+		t.Errorf("a lifted cap truncates at llm.max_tokens and must say so, got: %v", err)
+	}
+}
+
 // TestConfigDefaultsApplied locks the fallback branches in Config.defaults():
 // a Config that leaves MaxTokens/TimeoutSeconds unset (the zero value) must
 // still get the documented 1024/120 defaults. cmd/alertint's

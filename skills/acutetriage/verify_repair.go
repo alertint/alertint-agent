@@ -183,6 +183,7 @@ func (s *Skill) repairModelPromQL(ctx context.Context, incidentID string, querie
 	comp, callErr := completeWithAnalysisUsage(ctx, s.llm, verificationRepairSystem, llm.Prompt{
 		Prefix:          repairPrompt(issues),
 		MaxOutputTokens: verificationRepairMaxOutputTokens,
+		Kind:            llm.CallVerificationRepair,
 	}, []string{"queries"})
 	healthErr := llmhealth.MarkLLMOrigin(callErr)
 

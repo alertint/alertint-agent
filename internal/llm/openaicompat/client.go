@@ -74,6 +74,17 @@ type Config struct {
 	Model string
 	// MaxTokens is the completion-token ceiling. Defaults to 1024.
 	MaxTokens int
+	// OutputCaps overrides the built-in per-call output caps (llm.output_caps).
+	// A per-call cap may only lower MaxTokens. Nil keeps every built-in cap.
+	OutputCaps llm.OutputCaps
+	// Reasoning, when set, is sent as the request's `reasoning` object (the
+	// gateway-level way to set thinking depth, e.g. OpenRouter's). It is sent
+	// as configured on every request and, unlike chat_template_kwargs, is not
+	// dropped if the endpoint rejects it: the operator opted in.
+	Reasoning *llm.Reasoning
+	// Routing, when set, is sent as the request's `provider` object (which
+	// hosting providers may serve it). Sent like Reasoning.
+	Routing *llm.Routing
 	// ResponseFormat is "json_object" (send response_format) or "off" (omit).
 	ResponseFormat string
 	// Thinking is the value sent as chat_template_kwargs.enable_thinking.
@@ -283,6 +294,8 @@ type chatRequest struct {
 	Messages           []chatMessage   `json:"messages"`
 	ResponseFormat     *responseFormat `json:"response_format,omitempty"`
 	ChatTemplateKwargs map[string]any  `json:"chat_template_kwargs,omitempty"`
+	Reasoning          *llm.Reasoning  `json:"reasoning,omitempty"`
+	Provider           *llm.Routing    `json:"provider,omitempty"`
 }
 
 type chatMessage struct {
@@ -372,7 +385,7 @@ func (c *Client) observedRequest(ctx context.Context, system string, prompt llm.
 // doRequest performs a single HTTP call to the chat-completions API;
 // templateKwargs sends the chat_template_kwargs pin.
 func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt, templateKwargs bool) (json.RawMessage, tokenUsage, error) {
-	maxTokens := prompt.OutputTokenLimit(c.cfg.MaxTokens)
+	maxTokens, perCall := prompt.OutputLimit(c.cfg.MaxTokens, c.cfg.OutputCaps)
 	body := chatRequest{
 		Model:     c.cfg.Model,
 		MaxTokens: maxTokens,
@@ -387,6 +400,8 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 			body.ChatTemplateKwargs["reasoning_effort"] = c.cfg.ReasoningEffort
 		}
 	}
+	body.Reasoning = c.cfg.Reasoning
+	body.Provider = c.cfg.Routing
 	if c.cfg.ResponseFormat != "off" {
 		body.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
@@ -443,16 +458,12 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	// ceiling: the text is incomplete JSON. Surface it as an actionable
 	// truncation error rather than the misleading "not valid JSON" — the fix
 	// is to raise llm.max_tokens (or disable llm.thinking), not to retry. When
-	// the ceiling came from an explicit per-call Prompt.MaxOutputTokens (e.g. a
-	// deliberately bounded repair call), the operator's configured
-	// llm.max_tokens is not the cause — report the per-call cap instead so the
-	// truncation is not misdiagnosed as an operator misconfiguration.
+	// the ceiling came from a per-call cap (e.g. a deliberately bounded repair
+	// call), the operator's configured llm.max_tokens is not the cause — report
+	// the per-call cap instead so the truncation is not misdiagnosed as an
+	// operator misconfiguration.
 	if choice.FinishReason == "length" {
-		hint := "raise llm.max_tokens"
-		if prompt.MaxOutputTokens != 0 {
-			hint = "per-call max_output_tokens"
-		}
-		return nil, usage, fmt.Errorf("%w=%d (%s)", llm.ErrResponseTruncated, maxTokens, hint)
+		return nil, usage, fmt.Errorf("%w=%d (%s)", llm.ErrResponseTruncated, maxTokens, prompt.TruncationHint(perCall))
 	}
 
 	text := stripLeadingThink(choice.Message.Content)

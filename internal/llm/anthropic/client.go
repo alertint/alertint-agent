@@ -61,6 +61,9 @@ type Config struct {
 	Model string
 	// MaxTokens is the ceiling passed to the API. Defaults to 1024.
 	MaxTokens int
+	// OutputCaps overrides the built-in per-call output caps (llm.output_caps).
+	// A per-call cap may only lower MaxTokens. Nil keeps every built-in cap.
+	OutputCaps llm.OutputCaps
 	// BaseRetryDelay is the initial backoff before the first retry.
 	// Defaults to 1 second. Tests may set this much smaller.
 	BaseRetryDelay time.Duration
@@ -363,7 +366,7 @@ func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Pr
 
 // doRequest performs a single HTTP call to the Messages API.
 func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
-	maxTokens := prompt.OutputTokenLimit(c.cfg.MaxTokens)
+	maxTokens, perCall := prompt.OutputLimit(c.cfg.MaxTokens, c.cfg.OutputCaps)
 	thinkingType := "disabled"
 	if c.cfg.Model == "claude-sonnet-5-5" {
 		thinkingType = "between_tools"
@@ -428,16 +431,12 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	// rather than the raw, misleading "not valid JSON" the parse below would
 	// give — the fix is to raise llm.max_tokens, not to retry (which truncates
 	// identically), so this is returned immediately, not as a RetryableError.
-	// When the ceiling came from an explicit per-call Prompt.MaxOutputTokens
-	// (e.g. a deliberately bounded repair call), the operator's configured
-	// llm.max_tokens is not the cause — report the per-call cap instead so the
-	// truncation is not misdiagnosed as an operator misconfiguration.
+	// When the ceiling came from a per-call cap (e.g. a deliberately bounded
+	// repair call), the operator's configured llm.max_tokens is not the cause —
+	// report the per-call cap instead so the truncation is not misdiagnosed as an
+	// operator misconfiguration.
 	if parsed.StopReason == "max_tokens" {
-		hint := "raise llm.max_tokens"
-		if prompt.MaxOutputTokens != 0 {
-			hint = "per-call max_output_tokens"
-		}
-		return nil, usage, fmt.Errorf("%w=%d (%s)", llm.ErrResponseTruncated, maxTokens, hint)
+		return nil, usage, fmt.Errorf("%w=%d (%s)", llm.ErrResponseTruncated, maxTokens, prompt.TruncationHint(perCall))
 	}
 
 	// A refusal stop means the provider's safety classifier declined the
