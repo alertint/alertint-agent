@@ -58,7 +58,7 @@ jobs:
             runner: ubuntu-latest
           - os: darwin
             goarch: arm64
-            runner: macos-14
+            runner: macos-15
     env:
       GOOS: ${{ matrix.os }}
       GOARCH: ${{ matrix.goarch }}
