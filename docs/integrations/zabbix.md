@@ -19,7 +19,39 @@ option to hand the LLM the same operator knowledge a human on-call would reach
 for.
 
 **Version target:** Zabbix 7.0.x LTS; the contract below is verified against
-the 7.0 macro and JSON-RPC API documentation.
+the 7.0 macro and JSON-RPC API documentation. Also tested on 7.4.
+
+## Quick setup: the AlertINT module
+
+On Zabbix 7.0 or later, the [AlertINT module](https://github.com/alertint/alertint-zabbix)
+does the Zabbix side for you and adds **Situations**, **Status** and
+**Settings** pages to the Zabbix menu.
+
+1. **Install** the agent and the module, on the Zabbix frontend host (Linux
+   with systemd):
+
+   ```bash
+   curl -fsSL https://alertint.com/zabbix/install.sh | ALERTINT_TRIAL_KEY=YOUR_KEY sh
+   ```
+
+   `ALERTINT_TRIAL_KEY` is your Anthropic API key. The script prints the agent
+   address and two tokens; they are also in `/etc/alertint/alertint.env`.
+   Agent on another host? Run the installer there and
+   [install the module by hand](https://github.com/alertint/alertint-zabbix#install).
+2. **Enable** it: **Administration → General → Modules** → **Scan
+   directory** → enable **AlertINT**.
+3. **Set up** in **AlertINT → Settings**, as a Super admin:
+
+   | Section | Does |
+   |---|---|
+   | **Agent** | Saves the agent's MCP address and `ALERTINT_MCP_TOKEN` |
+   | **Connect Zabbix** | With `ALERTINT_ZABBIX_WEBHOOK_TOKEN`: creates the media type below, the service user `alertint-svc` (group `AlertINT service`, read on every host group, no frontend login), the trigger action `Send to AlertINT` and a test host, then checks the webhook from the Zabbix server |
+   | **Send a test problem** | Follows one problem from Zabbix to a finding, then resolves it |
+   | **Let AlertINT read Zabbix** (optional) | Turns on the [Pull](#pull-the-zabbix-context-zabbixapi) side: see [Read-only API identity](#read-only-api-identity) |
+
+Run **Connect** again after you add host groups, so the service group can read
+them. Without the module, or on Zabbix older than 7.0, follow the manual steps
+below.
 
 ## Push: the alert source (`zabbix.ingress`)
 
@@ -55,6 +87,8 @@ under the previous fingerprint. AlertINT does not rewrite open alerts across
 installation identities.
 
 ## Zabbix media type (copy-paste)
+
+Used the module's **Connect**? Skip this section and the trigger action.
 
 Prefer importing? [`examples/zabbix-media-type.yaml`](https://github.com/alertint/alertint-agent/blob/main/examples/zabbix-media-type.yaml)
 is this media type as a Zabbix 7.0 import file — **Alerts → Media types →
@@ -228,15 +262,32 @@ full field table.
 
 ### Read-only API identity
 
-Create a dedicated service user for AlertINT rather than reusing a human
-account:
+**With the module:** **AlertINT → Settings → Let AlertINT read Zabbix →
+Create read access** does all of the steps below for `alertint-svc` (role
+`AlertINT read-only API`, token of the same name) and prints the command that
+gives the token to an agent installed with `install.sh`:
+
+```bash
+curl -fsSL https://alertint.com/zabbix/install.sh | ZABBIX_URL='https://zbx.example.com' ZABBIX_API_TOKEN='...' sh
+```
+
+Run again, the installer keeps the agent and its tokens, stores the token in
+`/etc/alertint/alertint.env`, turns on `zabbix.api` in `config.yaml` (the old
+file stays as `config.yaml.bak`), and checks that the token can read hosts.
+**Check** on the Settings page then makes the agent read Zabbix with it.
+
+**By hand:** create a dedicated service user for AlertINT rather than reusing
+a human account:
 
 1. **User roles → Create role.** Set **API access** to a dedicated role whose
    API methods are an **Allow list** containing only:
-   `host.get, trigger.get, problem.get, event.get, item.get, history.get, trend.get`.
+   `host.get, hostgroup.get, trigger.get, problem.get, event.get, item.get, history.get, trend.get`.
    This is the read-only contract, enforced on the Zabbix side, not just
-   documented — the client only ever calls these methods, and the token
-   cannot do anything else even if it leaked.
+   documented — the client only ever calls these methods (plus the
+   unauthenticated `apiinfo.version`), and the token cannot do anything else
+   even if it leaked. `hostgroup.get` is for the
+   [verification](#verification) check of other open problems in the host's
+   groups; without it that check is reported unavailable.
 2. **Users → User groups → Create user group.** Grant **Read** permission on
    the host groups you want AlertINT to see context for (not Deny-by-default
    on everything — an unlisted host group returns empty results, not an
@@ -250,6 +301,10 @@ account:
 ```bash
 export ZABBIX_API_TOKEN="<the generated token>"
 ```
+
+Installed with `install.sh`? Run it again with
+`ZABBIX_URL=https://zbx.example.com ZABBIX_API_TOKEN=<the token>` before `sh`
+instead.
 
 Auth is the `Authorization: Bearer` header — never the legacy `auth` request
 parameter, which Zabbix removed in 7.2.
